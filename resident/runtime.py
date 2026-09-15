@@ -126,7 +126,10 @@ class ResidentRuntime:
             self.store.finish_run(run_id, status, duration, calls)
             schedule_id = event.payload.get("schedule_id") if event.source == "scheduler" else None
             if schedule_id:
-                self.store.complete_schedule(schedule_id)
+                if status == "completed":
+                    self.store.complete_schedule(schedule_id)
+                else:
+                    self.store.release_schedule(schedule_id)
             self._active_run_id, self._active_event = None, None
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
