@@ -5,8 +5,10 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from resident.__main__ import TerminalDiagnostics
 from resident.config import Config
@@ -14,7 +16,8 @@ from resident.domain import ModelTurn
 from resident.runtime import ResidentRuntime
 from resident.store import Store
 from resident.telegram import (
-    TelegramTransport, TelegramTransportError, TelegramWebhookConflictError,
+    TelegramAuthenticationError, TelegramTransport, TelegramTransportError,
+    TelegramWebhookConflictError,
 )
 
 
@@ -323,6 +326,45 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
                 await transport.send_text("hello")
         self.assertNotIn("super-secret", str(raised.exception))
 
+    async def test_invalid_credentials_are_a_safe_permanent_failure(self):
+        token = "123:super-secret"
+        response = HTTPError(
+            f"https://api.telegram.org/bot{token}/getWebhookInfo",
+            401,
+            f"Unauthorized: revoked {token}",
+            {},
+            BytesIO(f'{{"description":"revoked {token}"}}'.encode()),
+        )
+        transport = TelegramTransport(token, 101, 202)
+
+        with patch("resident.telegram.urlopen", side_effect=response):
+            with self.assertRaises(TelegramAuthenticationError) as raised:
+                await transport._check_webhook()
+
+        diagnostic = str(raised.exception)
+        self.assertIn("check RESIDENT_TELEGRAM_BOT_TOKEN", diagnostic)
+        self.assertNotIn(token, diagnostic)
+        self.assertNotIn("super-secret", diagnostic)
+        self.assertNotIn("revoked 123", diagnostic)
+
+    async def test_authentication_failure_stops_polling_without_retry(self):
+        diagnostics = []
+        transport = FakeTelegramTransport([
+            TelegramAuthenticationError(
+                "Telegram bot authentication failed; check RESIDENT_TELEGRAM_BOT_TOKEN "
+                "and replace it if the token was revoked"),
+        ], bot_token="123:super-secret")
+        transport.diagnostic_output = diagnostics.append
+
+        await transport.run(asyncio.Queue(), asyncio.Event())
+
+        self.assertEqual([("getWebhookInfo", {})], transport.requests)
+        self.assertEqual(1, len(diagnostics))
+        self.assertIn("permanent failure", diagnostics[0])
+        self.assertIn("check RESIDENT_TELEGRAM_BOT_TOKEN", diagnostics[0])
+        self.assertNotIn("123:super-secret", diagnostics[0])
+        self.assertNotIn("Unauthorized", diagnostics[0])
+
     async def test_configured_webhook_prevents_long_polling(self):
         transport = FakeTelegramTransport([{"ok": True, "result": {"url": "https://example.invalid/hook"}}])
 
@@ -390,6 +432,15 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
 
         output.assert_called_once_with(
             "[telegram] permanent failure: Telegram long polling is unavailable while a webhook is configured")
+
+    def test_permanent_authentication_failure_is_visible_without_verbose_diagnostics(self):
+        message = (
+            "permanent failure: Telegram bot authentication failed; "
+            "check RESIDENT_TELEGRAM_BOT_TOKEN and replace it if the token was revoked")
+        with patch("builtins.print") as output:
+            TerminalDiagnostics(verbose=False).telegram(message)
+
+        output.assert_called_once_with(f"[telegram] {message}")
 
     def test_bot_scoped_offsets_are_independent_and_secret_safe(self):
         with tempfile.TemporaryDirectory() as temporary:

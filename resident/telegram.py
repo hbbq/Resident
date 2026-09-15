@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from typing import Any, Callable
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -14,7 +15,15 @@ class TelegramTransportError(RuntimeError):
     """A credential-safe Telegram transport failure."""
 
 
-class TelegramWebhookConflictError(TelegramTransportError):
+class TelegramPermanentTransportError(TelegramTransportError):
+    """A Telegram transport failure that will not be fixed by retrying."""
+
+
+class TelegramAuthenticationError(TelegramPermanentTransportError):
+    """The configured Telegram bot credentials were rejected."""
+
+
+class TelegramWebhookConflictError(TelegramPermanentTransportError):
     """Telegram long polling is permanently blocked by a configured webhook."""
 
 
@@ -63,9 +72,19 @@ class TelegramTransport:
         try:
             with urlopen(request, timeout=self.request_timeout_seconds) as response:
                 payload = json.load(response)
+        except HTTPError as exc:
+            if exc.code in (401, 404):
+                raise TelegramAuthenticationError(
+                    "Telegram bot authentication failed; check RESIDENT_TELEGRAM_BOT_TOKEN "
+                    "and replace it if the token was revoked") from None
+            raise TelegramTransportError(f"Telegram {method} request failed") from None
         except Exception:
             raise TelegramTransportError(f"Telegram {method} request failed") from None
         if not isinstance(payload, dict) or payload.get("ok") is not True:
+            if isinstance(payload, dict) and payload.get("error_code") in (401, 404):
+                raise TelegramAuthenticationError(
+                    "Telegram bot authentication failed; check RESIDENT_TELEGRAM_BOT_TOKEN "
+                    "and replace it if the token was revoked")
             raise TelegramTransportError(f"Telegram {method} request was rejected")
         return payload
 
@@ -135,7 +154,7 @@ class TelegramTransport:
                 backoff = 1.0
             except asyncio.CancelledError:
                 raise
-            except TelegramWebhookConflictError as exc:
+            except TelegramPermanentTransportError as exc:
                 self.diagnostic_output(f"permanent failure: {exc}")
                 return
             except Exception as exc:
