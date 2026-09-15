@@ -88,12 +88,24 @@ class ResidentRuntime:
             self._emit("communication.rejected", result)
         return result
 
+    def _discard_continuation(self, continuation_id: str | None) -> None:
+        if not continuation_id:
+            return
+        discard = getattr(self.provider, "discard_continuation", None)
+        if discard is None:
+            return
+        try:
+            discard(continuation_id)
+        except Exception:
+            pass
+
     async def process(self, event: WakeEvent) -> str:
         started = time.monotonic()
         run_id = self.store.start_run(event)
         self._active_run_id, self._active_event = run_id, event
         calls = 0
         status = "failed"
+        continuation_id: str | None = None
         try:
             self._emit("wake.started", {
                 "event_id": event.id, "source": event.source, "reason": event.reason,
@@ -108,10 +120,9 @@ class ResidentRuntime:
             })
             registry = ToolRegistry(self.store, self.capabilities, self._send_owner_message, self._emit)
             results: list[ToolResult] = []
-            previous_id: str | None = None
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
-                turn = await self.provider.respond(context, registry.specs, results, previous_id)
+                turn = await self.provider.respond(context, registry.specs, results, continuation_id)
                 self._emit("model.responded", {
                     "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
@@ -120,25 +131,35 @@ class ResidentRuntime:
                 if turn.message:
                     self._emit("model.message", {"content": turn.message})
                 if not turn.tool_calls:
+                    continuation_id = None
                     break
+                continuation_id = turn.response_id
                 if round_number >= self.config.max_tool_rounds:
+                    self._discard_continuation(continuation_id)
                     raise RuntimeError("Model exceeded the configured tool-round limit")
                 results = []
                 for call in turn.tool_calls:
                     self._emit("tool.called", {"call_id": call.id, "name": call.name, "arguments": call.arguments})
-                    output = await registry.execute(call.name, call.arguments)
-                    results.append(ToolResult(call.id, output))
-                    self._emit("tool.completed", {"call_id": call.id, "name": call.name, "result": output})
-                previous_id = turn.response_id
-                if not previous_id:
+                    execution = await registry.execute(call.name, call.arguments)
+                    results.append(ToolResult(call.id, execution.output, execution.attachments))
+                    completion = {"call_id": call.id, "name": call.name, "result": execution.output}
+                    if execution.attachments:
+                        completion["attachments"] = [{
+                            "type": "image", "mime_type": attachment.mime_type,
+                            "byte_count": len(attachment.data), "ephemeral": True,
+                        } for attachment in execution.attachments]
+                    self._emit("tool.completed", completion)
+                if not continuation_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
             return run_id
         except asyncio.CancelledError as exc:
+            self._discard_continuation(continuation_id)
             self._emit("wake.failed", {"error_type": type(exc).__name__, "error": str(exc)})
             raise
         except Exception as exc:
+            self._discard_continuation(continuation_id)
             self._emit("wake.failed", {"error_type": type(exc).__name__, "error": str(exc)})
             raise
         finally:

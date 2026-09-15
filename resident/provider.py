@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import urllib.error
 import urllib.request
@@ -13,20 +14,27 @@ class ModelProvider(Protocol):
     async def respond(self, context: str, tools: Sequence[ToolSpec], results: Sequence[ToolResult],
                       previous_response_id: str | None = None) -> ModelTurn: ...
 
+    def discard_continuation(self, continuation_id: str) -> None: ...
+
 
 class OpenAIResponsesProvider:
     def __init__(self, api_key: str, model: str, base_url: str = "https://api.openai.com/v1"):
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required for the OpenAI provider")
         self.api_key, self.model, self.base_url = api_key, model, base_url.rstrip("/")
+        self._histories: dict[str, list[dict]] = {}
 
     async def respond(self, context: str, tools: Sequence[ToolSpec], results: Sequence[ToolResult],
                       previous_response_id: str | None = None) -> ModelTurn:
         if previous_response_id:
-            input_data = [{"type": "function_call_output", "call_id": r.call_id,
-                           "output": json.dumps(r.output, separators=(",", ":"))} for r in results]
+            try:
+                history = self._histories.pop(previous_response_id)
+            except KeyError as exc:
+                raise RuntimeError("OpenAI continuation state is no longer available") from exc
+            input_data = [*history, *(self._function_output(result) for result in results)]
         else:
             input_data = context
+            history = [{"role": "user", "content": context}]
         body: dict = {
             "model": self.model,
             "instructions": (
@@ -40,9 +48,9 @@ class OpenAIResponsesProvider:
             "input": input_data,
             "tools": [{"type": "function", "name": t.name, "description": t.description,
                        "parameters": t.input_schema} for t in tools],
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
         }
-        if previous_response_id:
-            body["previous_response_id"] = previous_response_id
         raw = await asyncio.to_thread(self._post, body)
         status = raw.get("status")
         if status not in (None, "completed"):
@@ -61,8 +69,29 @@ class OpenAIResponsesProvider:
                     if part.get("type") == "output_text":
                         texts.append(part.get("text", ""))
         usage = raw.get("usage") or {}
+        if calls and raw.get("id"):
+            current_input = input_data if isinstance(input_data, list) else history
+            self._histories[raw["id"]] = [*current_input, *raw.get("output", [])]
         return ModelTurn(raw.get("id"), "\n".join(texts) or None, tuple(calls),
                          usage.get("input_tokens"), usage.get("output_tokens"))
+
+    def discard_continuation(self, continuation_id: str) -> None:
+        self._histories.pop(continuation_id, None)
+
+    @staticmethod
+    def _function_output(result: ToolResult) -> dict:
+        metadata = json.dumps(result.output, separators=(",", ":"))
+        if not result.attachments:
+            output: str | list[dict] = metadata
+        else:
+            output = [{"type": "input_text", "text": metadata}]
+            for attachment in result.attachments:
+                encoded = base64.b64encode(attachment.data).decode("ascii")
+                output.append({
+                    "type": "input_image", "detail": attachment.detail,
+                    "image_url": f"data:{attachment.mime_type};base64,{encoded}",
+                })
+        return {"type": "function_call_output", "call_id": result.call_id, "output": output}
 
     def _post(self, body: dict) -> dict:
         request = urllib.request.Request(

@@ -5,6 +5,7 @@ import sys
 
 from .config import Config
 from .capabilities import diagnostic_capabilities
+from .camera import CameraConnector
 from .homeops import HomeOpsConnector
 from .provider import OpenAIResponsesProvider
 from .runtime import ResidentRuntime
@@ -40,6 +41,14 @@ def main() -> int:
         )
         connectors.append(homeops)
         capabilities.extend(homeops.capabilities)
+    if config.cameras:
+        cameras = CameraConnector(
+            config.cameras, timeout_seconds=config.camera_capture_timeout_seconds,
+            max_width=config.camera_max_width, max_height=config.camera_max_height,
+            max_bytes=config.camera_max_bytes, rtsp_transport=config.camera_rtsp_transport,
+            ffmpeg_executable=config.ffmpeg_executable,
+        )
+        capabilities.extend(cameras.capabilities)
     runtime = ResidentRuntime(
         config, provider, capabilities=capabilities, event_producers=connectors,
         diagnostic_output=terminal_diagnostics.runtime,

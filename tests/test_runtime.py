@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import tempfile
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from resident.config import Config
 from resident.domain import ModelTurn, ToolCall, WakeEvent
-from resident.domain import ToolResult, ToolSpec
+from resident.domain import ImageAttachment, ToolResult, ToolSpec
 from resident.provider import OpenAIResponsesProvider
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
@@ -55,6 +56,23 @@ class MessageOnlyProvider:
 class FailingProvider:
     async def respond(self, context, tools, results, previous_response_id=None):
         raise RuntimeError("provider unavailable")
+
+
+class ContinuationLifecycleProvider:
+    def __init__(self, *, cancel=False):
+        self.cancel = cancel
+        self.discarded: list[str] = []
+        self.release = asyncio.Event()
+
+    async def respond(self, context, tools, results, previous_response_id=None):
+        if previous_response_id is None:
+            return ModelTurn("continuation", tool_calls=(ToolCall("call", "remember", {"content": "work"}),))
+        if self.cancel:
+            await self.release.wait()
+        raise RuntimeError("continuation failed")
+
+    def discard_continuation(self, continuation_id):
+        self.discarded.append(continuation_id)
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -107,6 +125,38 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(1, len(diagnostics))
             self.assertTrue(diagnostics[0].startswith("wake.failed "))
+            runtime.close()
+
+    async def test_failed_continuation_is_discarded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = ContinuationLifecycleProvider()
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider,
+                owner_output=lambda _: None, diagnostic_output=lambda _: None,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "continuation failed"):
+                await runtime.process(WakeEvent("event", "test", "failure", utc_now(), {}))
+
+            self.assertEqual(["continuation"], provider.discarded)
+            runtime.close()
+
+    async def test_cancelled_continuation_is_discarded_and_reraises(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = ContinuationLifecycleProvider(cancel=True)
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider,
+                owner_output=lambda _: None, diagnostic_output=lambda _: None,
+            )
+            processing = asyncio.create_task(runtime.process(
+                WakeEvent("event", "test", "cancellation", utc_now(), {})))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            processing.cancel()
+
+            with self.assertRaises(asyncio.CancelledError):
+                await processing
+            self.assertEqual(["continuation"], provider.discarded)
             runtime.close()
 
     async def test_owner_communication_remains_visible_in_default_mode(self):
@@ -227,7 +277,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             second_provider = LifecycleProvider()
             second = ResidentRuntime(config, second_provider, owner_output=lambda _: None, diagnostic_output=lambda _: None)
-            import asyncio
             queue = asyncio.Queue()
             await second.enqueue_due_wakeups(queue)
             event = await queue.get()
@@ -394,13 +443,70 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("gpt-5.6-luna", requests[0]["model"])
         self.assertEqual("function", requests[0]["tools"][0]["type"])
-        self.assertEqual("resp-1", requests[1]["previous_response_id"])
-        self.assertEqual("function_call_output", requests[1]["input"][0]["type"])
-        self.assertEqual("call-1", requests[1]["input"][0]["call_id"])
+        self.assertNotIn("previous_response_id", requests[1])
+        self.assertEqual("user", requests[1]["input"][0]["role"])
+        self.assertEqual("function_call", requests[1]["input"][1]["type"])
+        self.assertEqual("function_call_output", requests[1]["input"][2]["type"])
+        self.assertEqual("call-1", requests[1]["input"][2]["call_id"])
         self.assertEqual("done", second.message)
+        self.assertFalse(requests[0]["store"])
+        self.assertFalse(requests[1]["store"])
+        self.assertEqual(["reasoning.encrypted_content"], requests[0]["include"])
         self.assertIn("all intentional communication", requests[0]["instructions"])
         self.assertIn("final response message is wake-result diagnostic text only",
                       requests[0]["instructions"])
+
+    async def test_image_tool_result_is_sent_as_multimodal_ephemeral_content(self):
+        provider = OpenAIResponsesProvider("test-key", "vision-model")
+        requests = []
+        responses = iter((
+            {"id": "previous", "status": "completed", "output": [{
+                "type": "function_call", "call_id": "capture", "name": "camera_capture_frame",
+                "arguments": '{"camera_id":"entry"}',
+            }]},
+            {"id": "response", "status": "completed", "output": [{
+                "type": "function_call", "call_id": "follow-up", "name": "clock", "arguments": "{}",
+            }]},
+            {"id": "final", "status": "completed", "output": []},
+        ))
+        provider._post = lambda body: requests.append(body) or next(responses)
+
+        first = await provider.respond("context", [], [])
+        second = await provider.respond("context", [], [ToolResult(
+            "capture", {"status": "captured"},
+            (ImageAttachment(b"\xff\xd8image\xff\xd9", detail="low"),),
+        )], first.response_id)
+        await provider.respond("context", [], [ToolResult("follow-up", {"time": "12:00"})], second.response_id)
+
+        output = requests[1]["input"][-1]["output"]
+        self.assertEqual({"type": "input_text", "text": '{"status":"captured"}'}, output[0])
+        self.assertEqual("input_image", output[1]["type"])
+        self.assertEqual("low", output[1]["detail"])
+        self.assertTrue(output[1]["image_url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual("function_call_output", requests[2]["input"][2]["type"])
+        self.assertEqual("capture", requests[2]["input"][2]["call_id"])
+        self.assertEqual("function_call_output", requests[2]["input"][4]["type"])
+        self.assertEqual("follow-up", requests[2]["input"][4]["call_id"])
+        self.assertEqual(output, requests[2]["input"][2]["output"])
+
+    async def test_discard_removes_image_bearing_continuation_history(self):
+        provider = OpenAIResponsesProvider("test-key", "vision-model")
+        provider._post = lambda body: {
+            "id": "image-continuation", "status": "completed", "output": [{
+                "type": "function_call", "call_id": "capture", "name": "camera_capture_frame",
+                "arguments": "{}",
+            }],
+        }
+
+        await provider.respond("context", [], [])
+        await provider.respond("context", [], [ToolResult(
+            "capture", {"status": "captured"}, (ImageAttachment(b"frame"),),
+        )], "image-continuation")
+
+        self.assertIn("image-continuation", provider._histories)
+        self.assertTrue(any("base64" in json.dumps(item) for item in provider._histories["image-continuation"]))
+        provider.discard_continuation("image-continuation")
+        self.assertNotIn("image-continuation", provider._histories)
 
 
 if __name__ == "__main__":

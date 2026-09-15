@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -17,6 +19,46 @@ def _environment_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class CameraConfig:
+    id: str
+    name: str
+    rtsp_url: str = field(repr=False)
+    description: str | None = None
+
+
+def _cameras_from_environment() -> tuple[CameraConfig, ...]:
+    raw = os.getenv("RESIDENT_CAMERAS", "").strip()
+    if not raw:
+        return ()
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("RESIDENT_CAMERAS must be valid JSON") from exc
+    if not isinstance(items, list):
+        raise ValueError("RESIDENT_CAMERAS must be a JSON array")
+    cameras: list[CameraConfig] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or set(item) - {"id", "name", "url", "description"}:
+            raise ValueError("Each camera must contain only id, name, url, and optional description")
+        camera_id, name, url = item.get("id"), item.get("name"), item.get("url")
+        description = item.get("description")
+        if not isinstance(camera_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", camera_id):
+            raise ValueError("Camera id must be 1-64 safe identifier characters")
+        if camera_id in seen:
+            raise ValueError(f"Duplicate camera id: {camera_id}")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Camera {camera_id} must have a nonempty name")
+        if not isinstance(url, str) or not url.lower().startswith(("rtsp://", "rtsps://")):
+            raise ValueError(f"Camera {camera_id} must have an RTSP URL")
+        if description is not None and not isinstance(description, str):
+            raise ValueError(f"Camera {camera_id} description must be a string")
+        seen.add(camera_id)
+        cameras.append(CameraConfig(camera_id, name.strip(), url, description.strip() if description else None))
+    return tuple(cameras)
 
 
 @dataclass(frozen=True)
@@ -38,6 +80,13 @@ class Config:
     homeops_url: str | None = None
     homeops_poll_seconds: float = 30.0
     homeops_request_timeout_seconds: float = 10.0
+    cameras: tuple[CameraConfig, ...] = ()
+    camera_capture_timeout_seconds: float = 8.0
+    camera_max_width: int = 1280
+    camera_max_height: int = 720
+    camera_max_bytes: int = 2_000_000
+    camera_rtsp_transport: str = "tcp"
+    ffmpeg_executable: str = "ffmpeg"
     verbose: bool = False
 
     @classmethod
@@ -60,6 +109,17 @@ class Config:
                             default=float(os.getenv("RESIDENT_HOMEOPS_POLL_SECONDS", "30")))
         parser.add_argument("--homeops-request-timeout-seconds", type=float,
                             default=float(os.getenv("RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS", "10")))
+        parser.add_argument("--camera-capture-timeout-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_CAMERA_CAPTURE_TIMEOUT_SECONDS", "8")))
+        parser.add_argument("--camera-max-width", type=int,
+                            default=int(os.getenv("RESIDENT_CAMERA_MAX_WIDTH", "1280")))
+        parser.add_argument("--camera-max-height", type=int,
+                            default=int(os.getenv("RESIDENT_CAMERA_MAX_HEIGHT", "720")))
+        parser.add_argument("--camera-max-bytes", type=int,
+                            default=int(os.getenv("RESIDENT_CAMERA_MAX_BYTES", "2000000")))
+        parser.add_argument("--camera-rtsp-transport", choices=("tcp", "udp"),
+                            default=os.getenv("RESIDENT_CAMERA_RTSP_TRANSPORT", "tcp"))
+        parser.add_argument("--ffmpeg-executable", default=os.getenv("RESIDENT_FFMPEG_EXECUTABLE", "ffmpeg"))
         args = parser.parse_args(argv)
         return cls(
             data_dir=Path(args.data_dir).expanduser(), verbose=args.verbose,
@@ -72,4 +132,11 @@ class Config:
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,
             homeops_poll_seconds=max(0.1, args.homeops_poll_seconds),
             homeops_request_timeout_seconds=max(0.1, args.homeops_request_timeout_seconds),
+            cameras=_cameras_from_environment(),
+            camera_capture_timeout_seconds=max(0.1, args.camera_capture_timeout_seconds),
+            camera_max_width=max(1, args.camera_max_width),
+            camera_max_height=max(1, args.camera_max_height),
+            camera_max_bytes=max(1024, args.camera_max_bytes),
+            camera_rtsp_transport=args.camera_rtsp_transport,
+            ffmpeg_executable=args.ffmpeg_executable,
         )
