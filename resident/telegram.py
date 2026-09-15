@@ -14,6 +14,10 @@ class TelegramTransportError(RuntimeError):
     """A credential-safe Telegram transport failure."""
 
 
+class TelegramWebhookConflictError(TelegramTransportError):
+    """Telegram long polling is permanently blocked by a configured webhook."""
+
+
 class TelegramTransport:
     """A text-only Telegram Owner transport using Bot API long polling."""
 
@@ -81,7 +85,8 @@ class TelegramTransport:
         if not isinstance(result, dict):
             raise TelegramTransportError("Telegram getWebhookInfo returned an invalid response")
         if result.get("url"):
-            raise TelegramTransportError("Telegram long polling is unavailable while a webhook is configured")
+            raise TelegramWebhookConflictError(
+                "Telegram long polling is unavailable while a webhook is configured")
 
     async def poll_once(self, queue: asyncio.Queue[WakeEvent], offset: int | None) -> int | None:
         parameters: dict[str, Any] = {
@@ -130,6 +135,9 @@ class TelegramTransport:
                 backoff = 1.0
             except asyncio.CancelledError:
                 raise
+            except TelegramWebhookConflictError as exc:
+                self.diagnostic_output(f"permanent failure: {exc}")
+                return
             except Exception as exc:
                 self.diagnostic_output(f"poll failed: {type(exc).__name__}: {exc}")
                 try:

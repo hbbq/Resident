@@ -25,7 +25,7 @@ class TerminalDiagnostics:
             print(f"[homeops] {message}")
 
     def telegram(self, message: str) -> None:
-        if self.verbose:
+        if self.verbose or message.startswith("permanent failure:"):
             print(f"[telegram] {message}")
 
 

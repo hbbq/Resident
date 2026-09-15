@@ -8,11 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from resident.__main__ import TerminalDiagnostics
 from resident.config import Config
 from resident.domain import ModelTurn
 from resident.runtime import ResidentRuntime
 from resident.store import Store
-from resident.telegram import TelegramTransport, TelegramTransportError
+from resident.telegram import (
+    TelegramTransport, TelegramTransportError, TelegramWebhookConflictError,
+)
 
 
 class FakeTelegramTransport(TelegramTransport):
@@ -323,8 +326,70 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_configured_webhook_prevents_long_polling(self):
         transport = FakeTelegramTransport([{"ok": True, "result": {"url": "https://example.invalid/hook"}}])
 
-        with self.assertRaisesRegex(TelegramTransportError, "webhook is configured"):
+        with self.assertRaisesRegex(TelegramWebhookConflictError, "webhook is configured"):
             await transport._check_webhook()
+
+    async def test_webhook_conflict_stops_polling_without_retry_and_redacts_credentials(self):
+        token = "123:super-secret"
+        diagnostics = []
+        transport = FakeTelegramTransport(
+            [{"ok": True, "result": {"url": f"https://example.invalid/{token}"}}],
+            bot_token=token,
+        )
+        transport.diagnostic_output = diagnostics.append
+
+        await transport.run(asyncio.Queue(), asyncio.Event())
+
+        self.assertEqual([("getWebhookInfo", {})], transport.requests)
+        self.assertEqual(1, len(diagnostics))
+        self.assertIn("permanent failure", diagnostics[0])
+        self.assertIn("webhook is configured", diagnostics[0])
+        self.assertNotIn(token, diagnostics[0])
+        self.assertNotIn("super-secret", diagnostics[0])
+
+    async def test_transient_polling_failure_still_retries(self):
+        stop = asyncio.Event()
+
+        class RetryTransport(TelegramTransport):
+            def __init__(self):
+                super().__init__("secret-token", 101, 202, diagnostic_output=diagnostics.append)
+                self.webhook_checks = 0
+                self.polls = 0
+
+            async def _check_webhook(self):
+                self.webhook_checks += 1
+
+            async def poll_once(self, queue, offset):
+                self.polls += 1
+                if self.polls == 1:
+                    raise TelegramTransportError("Telegram getUpdates request failed")
+                stop.set()
+                return offset
+
+        diagnostics = []
+        transport = RetryTransport()
+
+        async def immediate_timeout(awaitable, *, timeout):
+            awaitable.close()
+            raise TimeoutError
+
+        with patch("resident.telegram.asyncio.wait_for", new=immediate_timeout):
+            await transport.run(asyncio.Queue(), stop)
+
+        self.assertEqual(1, transport.webhook_checks)
+        self.assertEqual(2, transport.polls)
+        self.assertEqual(
+            ["poll failed: TelegramTransportError: Telegram getUpdates request failed"],
+            diagnostics,
+        )
+
+    def test_permanent_webhook_failure_is_visible_without_verbose_diagnostics(self):
+        with patch("builtins.print") as output:
+            TerminalDiagnostics(verbose=False).telegram(
+                "permanent failure: Telegram long polling is unavailable while a webhook is configured")
+
+        output.assert_called_once_with(
+            "[telegram] permanent failure: Telegram long polling is unavailable while a webhook is configured")
 
     def test_bot_scoped_offsets_are_independent_and_secret_safe(self):
         with tempfile.TemporaryDirectory() as temporary:
