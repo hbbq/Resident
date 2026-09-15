@@ -13,6 +13,7 @@ Resident
 ├── Identity / personality
 ├── Runtime
 ├── Persistent memory
+├── Pending intentions
 ├── Journal
 ├── Model provider(s)
 └── Connectors
@@ -26,9 +27,11 @@ The list of connectors is illustrative, not a fixed set.
 
 ## Runtime
 
+Resident runs as a long-lived service/process. Sleeping does not mean terminating the process: runtime, connector subscriptions, event handling, and scheduling remain alive while no AI inference is taking place.
+
 Resident uses a hybrid event-driven runtime rather than requiring a permanent reasoning loop.
 
-Typical wake sources include:
+All reasons for Resident to begin thinking are normalized into the same internal concept: a `WakeEvent`. Sources may include:
 
 - connector events;
 - capability availability changes, such as a robot coming online;
@@ -36,9 +39,53 @@ Typical wake sources include:
 - scheduled wakeups;
 - wakeups previously requested by Resident itself.
 
+A wake event should remain deliberately small and general, conceptually containing a source, timestamp, reason/type, and source-specific payload. The detailed schema should be driven by implementation needs rather than designed exhaustively up front.
+
 During a wakeup Resident receives an appropriate working context, reasons and possibly acts, persists anything it wants its future self to retain, and may then sleep again.
 
 Scheduling is a mechanism, not a collection of hard-coded behaviors. Resident should be able to request a future wakeup with a reason/context rather than requiring dedicated classes such as `TemperatureMonitor` or `RobotExplorationBehavior`.
+
+### Runtime versus Resident
+
+Runtime is responsible for deterministic mechanisms such as wake/sleep, event routing, persistence, attention limits, permissions and hard safety boundaries, model invocation, tool execution, scheduling, and logging.
+
+Resident decides what observations mean, what is interesting, what it wants to do, which available capabilities to use, what it wants to remember, whether to ask its owner, and whether it wants to revisit something later.
+
+> Runtime enables Resident's life; it should not live it on Resident's behalf.
+
+## Pending intentions
+
+Pending intentions are persistent first-class state separate from ordinary memory.
+
+A memory describes something Resident wants its future self to know. An intention describes something Resident may want its future self to continue, revisit, or do when circumstances permit.
+
+For example:
+
+```text
+When the robot becomes available, inspect behind the sofa.
+```
+
+The initial representation should be deliberately small, conceptually containing an id, free-form content, creation time, and status. It must not grow into a conventional planner/task-management system unless actual Resident behavior demonstrates a need for one.
+
+Pending questions to the owner have similar asynchronous characteristics, but their exact relationship to intentions and communication state can be decided during implementation.
+
+## Observability
+
+An emergent system must be inspectable enough to understand what happened when its behavior is surprising.
+
+The runtime/journal should make it possible to reconstruct the externally relevant lifecycle of a wakeup, including approximately:
+
+```text
+wake event
+→ context supplied
+→ model interaction
+→ tool calls and results
+→ persisted state changes
+→ outgoing communication / scheduled work
+→ sleep
+```
+
+Observability should capture inputs, outputs, events, tool interactions, and state transitions needed for debugging and analysis. It does not require storing or exposing a model's private/internal reasoning process.
 
 ## Models
 
