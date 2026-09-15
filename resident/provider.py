@@ -14,6 +14,8 @@ class ModelProvider(Protocol):
     async def respond(self, context: str, tools: Sequence[ToolSpec], results: Sequence[ToolResult],
                       previous_response_id: str | None = None) -> ModelTurn: ...
 
+    def discard_continuation(self, continuation_id: str) -> None: ...
+
 
 class OpenAIResponsesProvider:
     def __init__(self, api_key: str, model: str, base_url: str = "https://api.openai.com/v1"):
@@ -72,6 +74,9 @@ class OpenAIResponsesProvider:
             self._histories[raw["id"]] = [*current_input, *raw.get("output", [])]
         return ModelTurn(raw.get("id"), "\n".join(texts) or None, tuple(calls),
                          usage.get("input_tokens"), usage.get("output_tokens"))
+
+    def discard_continuation(self, continuation_id: str) -> None:
+        self._histories.pop(continuation_id, None)
 
     @staticmethod
     def _function_output(result: ToolResult) -> dict:

@@ -72,6 +72,9 @@ class CameraConnector:
         except TimeoutError:
             await self._stop(process)
             return self._outcome(camera, "timeout", started, "No frame was obtained before the capture timeout.")
+        except asyncio.CancelledError:
+            await asyncio.shield(self._stop(process))
+            raise
         except Exception:
             await self._stop(process)
             return self._outcome(camera, "error", started, "Frame capture failed locally.")

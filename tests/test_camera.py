@@ -28,6 +28,12 @@ class FakeStream:
         return data
 
 
+class BlockingStream:
+    async def read(self, _: int) -> bytes:
+        await asyncio.Event().wait()
+        return b""
+
+
 class FakeProcess:
     def __init__(self, data: bytes, returncode: int = 0, *, waits: bool = False):
         self.stdout = FakeStream(data)
@@ -105,6 +111,19 @@ class CameraConnectorTests(unittest.IsolatedAsyncioTestCase):
         result = await connector.capture_frame({"camera_id": "entry"})
 
         self.assertEqual("timeout", result.output["status"])
+        self.assertTrue(process.killed)
+
+    async def test_cancellation_kills_ffmpeg_and_reraises(self):
+        process = FakeProcess(b"")
+        process.stdout = BlockingStream()
+        connector, _ = self.connector(process)
+
+        capture = asyncio.create_task(connector.capture_frame({"camera_id": "entry"}))
+        await asyncio.sleep(0)
+        capture.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await capture
         self.assertTrue(process.killed)
 
     async def test_oversized_frame_is_rejected(self):
