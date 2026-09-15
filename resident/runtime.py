@@ -35,7 +35,18 @@ class ResidentRuntime:
         self.resident, self.owner = self.store.provision(
             config.resident_name, config.owner_name, config.personality)
         self._event_queue: asyncio.Queue[WakeEvent | None] | None = None
-        self._pending_capability_event = self._record_capability_change(self._capabilities)
+        self._capability_event_states: dict[
+            str, tuple[tuple[Capability, ...], dict[str, dict]]
+        ] = {}
+        current_snapshot = self._capability_snapshot(self._capabilities)
+        persisted_snapshot = self.store.observed_snapshot("runtime.capabilities")
+        if persisted_snapshot is None:
+            self.store.save_observed_snapshot("runtime.capabilities", current_snapshot)
+            self._observed_capability_snapshot = current_snapshot
+            self._pending_capability_event = None
+        else:
+            self._observed_capability_snapshot = persisted_snapshot
+            self._pending_capability_event = self._record_capability_change(self._capabilities)
         self.event_producers = event_producers or []
         self.owner_output = owner_output or (lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}"))
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
@@ -67,10 +78,10 @@ class ResidentRuntime:
         return {capability.name: capability.public_descriptor() for capability in capabilities}
 
     def _record_capability_change(self, capabilities: Sequence[Capability]) -> WakeEvent | None:
-        current = self._capability_snapshot(capabilities)
-        previous = self.store.observed_snapshot("runtime.capabilities")
-        self.store.save_observed_snapshot("runtime.capabilities", current)
-        if previous is None or previous == current:
+        capability_view = tuple(capabilities)
+        current = self._capability_snapshot(capability_view)
+        previous = self._observed_capability_snapshot
+        if previous == current:
             return None
         previous_names, current_names = set(previous), set(current)
         payload = {
@@ -81,7 +92,10 @@ class ResidentRuntime:
                 if previous[name] != current[name]
             ),
         }
-        return WakeEvent(str(uuid.uuid4()), "runtime", "capabilities_changed", utc_now(), payload)
+        event = WakeEvent(str(uuid.uuid4()), "runtime", "capabilities_changed", utc_now(), payload)
+        self._observed_capability_snapshot = current
+        self._capability_event_states[event.id] = (capability_view, current)
+        return event
 
     def replace_capabilities(self, capabilities: Sequence[Capability]) -> WakeEvent | None:
         """Atomically replace visible capabilities and notify a running Resident."""
@@ -170,12 +184,13 @@ class ResidentRuntime:
         calls = 0
         status = "failed"
         continuation_id: str | None = None
+        capability_event_state = self._capability_event_states.get(event.id)
         try:
             self._emit("wake.started", {
                 "event_id": event.id, "source": event.source, "reason": event.reason,
                 "occurred_at": event.occurred_at, "payload": event.payload,
             })
-            capabilities = self._capabilities
+            capabilities = capability_event_state[0] if capability_event_state else self._capabilities
             context = self.context_builder.build(self.resident, self.owner, event, capabilities)
             self._emit("context.assembled", {
                 "characters": len(context), "memories": len(self.store.recall(
@@ -216,6 +231,9 @@ class ResidentRuntime:
                     self._emit("tool.completed", completion)
                 if not continuation_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")
+            if capability_event_state is not None:
+                self.store.save_observed_snapshot("runtime.capabilities", capability_event_state[1])
+                self._capability_event_states.pop(event.id, None)
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
             return run_id
