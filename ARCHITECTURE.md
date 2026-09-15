@@ -152,6 +152,8 @@ When Resident is run interactively in a terminal, the console observer should ma
 
 Messages that Resident intentionally sends to its owner are communication, not merely diagnostic output. The terminal transport must therefore render them in a clearly distinguishable format so they cannot easily be confused with runtime logs, model diagnostics, or tool output. The exact visual style is an implementation detail, but the distinction should be obvious at a glance.
 
+A model turn's returned text is a wake/model result, not communication. It remains available to the structured journal and verbose/debug observers, but normal terminal presentation and future Owner transports must not interpret it as an Owner-facing message.
+
 The goal is to provide a useful window into Resident's behavior during development and experimentation. This does not require storing or exposing a model's private/internal chain-of-thought. Observable decisions, rationale supplied for actions, model outputs, tool interactions, and state changes are sufficient for debugging and analysis.
 
 ## Models
@@ -273,7 +275,7 @@ Conceptually, a persisted message needs only general communication metadata such
 
 Incoming owner messages wake Resident and are delivered as part of the corresponding `WakeEvent`. Relevant/recent communication may also be selected by the context builder. Communication history should be persisted independently of whether Resident chooses to store a message's content in its autobiographical memory.
 
-Outgoing Resident messages are persisted and delivered through the currently configured transport. Resident may send a question and go back to sleep without waiting for an answer. A later owner message is simply another message and wake event; Resident is responsible for understanding whether it answers something earlier.
+All intentional outgoing Resident communication, including replies during Owner-initiated wakes, uses the communication capability. That path persists the message and delivers it through the currently configured transport. Model-returned result text is not a fallback transport: if communication is rejected by attention policy or fails in transport, the failure is journaled and the result text is not delivered in its place. Resident may send a question and go back to sleep without waiting for an answer. A later owner message is simply another message and wake event; Resident is responsible for understanding whether it answers something earlier.
 
 If Resident considers an unresolved exchange important enough to revisit, it can create a normal memory or pending intention. Runtime should not manufacture a pending-question record on Resident's behalf.
 

@@ -110,6 +110,11 @@ class Store:
                 message_id, direction, sender_id, content, int(spontaneous), delivery_status, utc_now()))
         return message_id
 
+    def update_message_delivery_status(self, message_id: str, delivery_status: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE messages SET delivery_status=? WHERE id=?", (delivery_status, message_id))
+
     def recent_messages(self, limit: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT id,direction,content,delivery_status,created_at FROM messages ORDER BY created_at DESC LIMIT ?", (limit,)

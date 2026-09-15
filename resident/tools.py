@@ -38,7 +38,9 @@ class ToolRegistry:
             "update_intention": Tool(ToolSpec("update_intention", "Change an intention's content or status.",
                 _schema(("id",), id={"type": "string"}, content={"type": ["string", "null"]},
                         status={"type": ["string", "null"], "enum": ["pending", "completed", "cancelled", None]})), self._update_intention),
-            "send_owner_message": Tool(ToolSpec("send_owner_message", "Send an intentional message to your owner.",
+            "send_owner_message": Tool(ToolSpec("send_owner_message",
+                "Send intentional communication to your owner. This is the only Owner-facing output path, "
+                "including for replies to Owner-initiated wakes.",
                 _schema(("content",), content={"type": "string"})), lambda a: send_message(a["content"])),
             "schedule_wakeup": Tool(ToolSpec("schedule_wakeup", "Request a persistent future wakeup after a delay.",
                 _schema(("delay_seconds", "reason"), delay_seconds={"type": "integer", "minimum": 1, "maximum": 31536000},

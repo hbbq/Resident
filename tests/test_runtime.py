@@ -125,6 +125,66 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], diagnostics)
             runtime.close()
 
+    async def test_final_model_message_does_not_duplicate_owner_communication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            delivered: list[str] = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary)),
+                SingleToolProvider("send_owner_message", {"content": "The intentional reply"}),
+                owner_output=delivered.append, diagnostic_output=lambda _: None,
+            )
+
+            await runtime.process(runtime.owner_message_event("Please reply"))
+
+            self.assertEqual(["The intentional reply"], delivered)
+            model_messages = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='model.message'").fetchall()
+            self.assertEqual([{"content": "done"}], [json.loads(row[0]) for row in model_messages])
+            runtime.close()
+
+    async def test_final_model_message_alone_is_not_owner_communication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            delivered: list[str] = []
+            diagnostics: list[str] = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(),
+                owner_output=delivered.append, diagnostic_output=diagnostics.append,
+            )
+
+            await runtime.process(runtime.owner_message_event("Are you there?"))
+
+            self.assertEqual([], delivered)
+            self.assertEqual([], diagnostics)
+            self.assertEqual(0, runtime.store.connection.execute(
+                "SELECT count(*) FROM messages WHERE direction='outbound'").fetchone()[0])
+            runtime.close()
+
+    async def test_transport_failure_is_persisted_without_model_message_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            diagnostics: list[str] = []
+
+            def failed_transport(_: str) -> None:
+                raise RuntimeError("transport offline")
+
+            runtime = ResidentRuntime(
+                Config(Path(temporary)),
+                SingleToolProvider("send_owner_message", {"content": "The intended reply"}),
+                owner_output=failed_transport, diagnostic_output=diagnostics.append,
+            )
+
+            await runtime.process(runtime.owner_message_event("Please reply"))
+
+            message = runtime.store.connection.execute(
+                "SELECT content,delivery_status FROM messages WHERE direction='outbound'").fetchone()
+            self.assertEqual(("The intended reply", "transport_failed"), tuple(message))
+            self.assertEqual(1, len(diagnostics))
+            self.assertTrue(diagnostics[0].startswith("communication.failed "))
+            event_types = [row[0] for row in runtime.store.connection.execute(
+                "SELECT event_type FROM journal")]
+            self.assertIn("communication.failed", event_types)
+            self.assertIn("model.message", event_types)
+            runtime.close()
+
     async def test_full_lifecycle_retains_identity_and_memory_across_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))
@@ -338,6 +398,9 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("function_call_output", requests[1]["input"][0]["type"])
         self.assertEqual("call-1", requests[1]["input"][0]["call_id"])
         self.assertEqual("done", second.message)
+        self.assertIn("all intentional communication", requests[0]["instructions"])
+        self.assertIn("final response message is wake-result diagnostic text only",
+                      requests[0]["instructions"])
 
 
 if __name__ == "__main__":
