@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import time
 from typing import Awaitable, Callable, Sequence
 
@@ -57,7 +58,7 @@ class CameraConnector:
         started = time.monotonic()
         process = None
 
-        async def launch_and_read() -> tuple[bytes, int]:
+        async def launch_and_read() -> tuple[bytes, int, bytes]:
             nonlocal process
             process = await self._process_factory(
                 self.ffmpeg_executable, "-hide_banner", "-loglevel", "error",
@@ -65,12 +66,12 @@ class CameraConnector:
                 "-frames:v", "1", "-vf",
                 f"scale={self.max_width}:{self.max_height}:force_original_aspect_ratio=decrease",
                 "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             return await self._read_frame(process)
 
         try:
-            data, return_code = await asyncio.wait_for(launch_and_read(), self.timeout_seconds)
+            data, return_code, diagnostics = await asyncio.wait_for(launch_and_read(), self.timeout_seconds)
         except TimeoutError:
             if process is not None:
                 await self._stop(process)
@@ -87,20 +88,41 @@ class CameraConnector:
 
         if len(data) > self.max_bytes:
             return self._outcome(camera, "error", started, "The captured frame exceeded the configured size limit.")
-        if return_code != 0 or not self._is_jpeg(data):
+        if return_code != 0:
+            status = "error" if self._is_local_ffmpeg_failure(diagnostics) else "unavailable"
+            description = "Frame capture failed locally." if status == "error" else "No usable frame was available."
+            return self._outcome(camera, status, started, description)
+        if not self._is_jpeg(data):
             return self._outcome(camera, "unavailable", started, "No usable frame was available.")
         output = self._outcome(camera, "captured", started, "A current frame was captured.")
         return ToolOutput(output.output, (ImageAttachment(data),))
 
-    async def _read_frame(self, process: asyncio.subprocess.Process) -> tuple[bytes, int]:
+    async def _read_frame(self, process: asyncio.subprocess.Process) -> tuple[bytes, int, bytes]:
         data = bytearray()
         assert process.stdout is not None
-        while chunk := await process.stdout.read(64 * 1024):
-            data.extend(chunk)
-            if len(data) > self.max_bytes:
-                await self._stop(process)
-                return bytes(data), process.returncode if process.returncode is not None else -1
-        return bytes(data), await process.wait()
+        stderr = getattr(process, "stderr", None)
+        diagnostics_task = asyncio.create_task(stderr.read(64 * 1024)) if stderr is not None else None
+        try:
+            while chunk := await process.stdout.read(64 * 1024):
+                data.extend(chunk)
+                if len(data) > self.max_bytes:
+                    await self._stop(process)
+                    diagnostics = await diagnostics_task if diagnostics_task is not None else b""
+                    return bytes(data), process.returncode if process.returncode is not None else -1, diagnostics
+            return bytes(data), await process.wait(), await diagnostics_task if diagnostics_task is not None else b""
+        finally:
+            if diagnostics_task is not None and not diagnostics_task.done():
+                diagnostics_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await diagnostics_task
+
+    @staticmethod
+    def _is_local_ffmpeg_failure(diagnostics: bytes) -> bool:
+        text = diagnostics.decode("utf-8", errors="replace").lower()
+        return any(marker in text for marker in (
+            "unknown encoder", "no such filter", "error opening output",
+            "invalid argument", "unrecognized option", "option not found",
+        ))
 
     @staticmethod
     async def _stop(process: asyncio.subprocess.Process) -> None:

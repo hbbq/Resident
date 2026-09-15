@@ -35,8 +35,9 @@ class BlockingStream:
 
 
 class FakeProcess:
-    def __init__(self, data: bytes, returncode: int = 0, *, waits: bool = False):
+    def __init__(self, data: bytes, returncode: int = 0, *, stderr: bytes = b"", waits: bool = False):
         self.stdout = FakeStream(data)
+        self.stderr = FakeStream(stderr)
         self.returncode = None
         self._exit_code = returncode
         self.waits = waits
@@ -83,14 +84,25 @@ class CameraConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(SECRET_URL, calls[0][0])
         self.assertNotIn(SECRET_URL, json.dumps(result.output))
 
-    async def test_no_usable_frame_is_an_unavailable_outcome(self):
-        connector, _ = self.connector(FakeProcess(b"diagnostic text", returncode=1))
+    async def test_camera_stream_failure_is_unavailable(self):
+        connector, _ = self.connector(FakeProcess(
+            b"diagnostic text", returncode=1, stderr=b"Connection refused"))
 
         result = await connector.capture_frame({"camera_id": "entry"})
 
         self.assertEqual("unavailable", result.output["status"])
         self.assertEqual((), result.attachments)
         self.assertNotIn("secret", json.dumps(result.output))
+
+    async def test_local_ffmpeg_configuration_failure_is_error(self):
+        connector, _ = self.connector(FakeProcess(
+            b"diagnostic text", returncode=1, stderr=b"Unknown encoder 'mjpeg'"))
+
+        result = await connector.capture_frame({"camera_id": "entry"})
+
+        self.assertEqual("error", result.output["status"])
+        self.assertEqual("Frame capture failed locally.", result.output["description"])
+        self.assertNotIn("mjpeg", json.dumps(result.output))
 
     async def test_process_start_failure_is_sanitized(self):
         async def failed_factory(*args, **kwargs):
