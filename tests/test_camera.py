@@ -113,6 +113,20 @@ class CameraConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("timeout", result.output["status"])
         self.assertTrue(process.killed)
 
+    async def test_launch_timeout_is_a_normal_outcome(self):
+        async def stalled_factory(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        connector = CameraConnector(
+            [CameraConfig("entry", "Entry", SECRET_URL)],
+            process_factory=stalled_factory,
+            timeout_seconds=0.01,
+        )
+
+        result = await connector.capture_frame({"camera_id": "entry"})
+
+        self.assertEqual("timeout", result.output["status"])
+
     async def test_cancellation_kills_ffmpeg_and_reraises(self):
         process = FakeProcess(b"")
         process.stdout = BlockingStream()

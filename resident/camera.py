@@ -55,7 +55,10 @@ class CameraConnector:
                 "description": "No configured camera has that ID.",
             })
         started = time.monotonic()
-        try:
+        process = None
+
+        async def launch_and_read() -> tuple[bytes, int]:
+            nonlocal process
             process = await self._process_factory(
                 self.ffmpeg_executable, "-hide_banner", "-loglevel", "error",
                 "-rtsp_transport", self.rtsp_transport, "-i", camera.rtsp_url,
@@ -64,18 +67,21 @@ class CameraConnector:
                 "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             )
-        except Exception:
-            return self._outcome(camera, "error", started, "Frame capture is not available on this host.")
+            return await self._read_frame(process)
 
         try:
-            data, return_code = await asyncio.wait_for(self._read_frame(process), self.timeout_seconds)
+            data, return_code = await asyncio.wait_for(launch_and_read(), self.timeout_seconds)
         except TimeoutError:
-            await self._stop(process)
+            if process is not None:
+                await self._stop(process)
             return self._outcome(camera, "timeout", started, "No frame was obtained before the capture timeout.")
         except asyncio.CancelledError:
-            await asyncio.shield(self._stop(process))
+            if process is not None:
+                await asyncio.shield(self._stop(process))
             raise
         except Exception:
+            if process is None:
+                return self._outcome(camera, "error", started, "Frame capture is not available on this host.")
             await self._stop(process)
             return self._outcome(camera, "error", started, "Frame capture failed locally.")
 
