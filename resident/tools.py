@@ -27,7 +27,8 @@ def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[
 
 
 class ToolRegistry:
-    def __init__(self, store: Store, capabilities: Sequence[Capability], send_message: Callable[[str], dict[str, Any]],
+    def __init__(self, store: Store, capabilities: Sequence[Capability],
+                 send_message: Callable[[str], Awaitable[dict[str, Any]] | dict[str, Any]],
                  emit: Callable[[str, dict[str, Any]], None]):
         self.store, self.emit = store, emit
         self.tools: dict[str, Tool] = {

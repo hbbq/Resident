@@ -9,6 +9,7 @@ from .camera import CameraConnector
 from .homeops import HomeOpsConnector
 from .provider import OpenAIResponsesProvider
 from .runtime import ResidentRuntime
+from .telegram import TelegramTransport
 
 
 class TerminalDiagnostics:
@@ -22,6 +23,10 @@ class TerminalDiagnostics:
     def homeops(self, message: str) -> None:
         if self.verbose:
             print(f"[homeops] {message}")
+
+    def telegram(self, message: str) -> None:
+        if self.verbose or message.startswith("permanent failure:"):
+            print(f"[telegram] {message}")
 
 
 def main() -> int:
@@ -50,10 +55,27 @@ def main() -> int:
         )
         connectors.append(cameras)
         capabilities.extend(cameras.capabilities)
+    telegram = None
+    if config.telegram_bot_token is not None:
+        telegram = TelegramTransport(
+            config.telegram_bot_token, config.telegram_owner_user_id, config.telegram_owner_chat_id,
+            poll_seconds=config.telegram_poll_seconds,
+            request_timeout_seconds=config.telegram_request_timeout_seconds,
+            diagnostic_output=terminal_diagnostics.telegram,
+        )
+        connectors.append(telegram)
     runtime = ResidentRuntime(
         config, provider, capabilities=capabilities, event_producers=connectors,
+        owner_transport=telegram,
         diagnostic_output=terminal_diagnostics.runtime,
     )
+    if telegram is not None:
+        telegram.bind_owner_message(runtime.telegram_owner_message_event)
+        offset_scope = telegram.offset_checkpoint_scope
+        telegram.bind_offset_checkpoint(
+            lambda: runtime.store.observed_snapshot(offset_scope),
+            lambda offset: runtime.store.save_observed_snapshot(offset_scope, offset),
+        )
     try:
         asyncio.run(runtime.run_interactive())
     finally:

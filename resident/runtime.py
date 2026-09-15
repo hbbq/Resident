@@ -20,12 +20,25 @@ class EventProducer(Protocol):
     async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None: ...
 
 
+class OwnerTransport(Protocol):
+    async def send_text(self, content: str) -> None: ...
+
+
+class CallbackOwnerTransport:
+    def __init__(self, callback: Callable[[str], None]):
+        self.callback = callback
+
+    async def send_text(self, content: str) -> None:
+        self.callback(content)
+
+
 class ResidentRuntime:
     _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"communication.failed", "wake.failed"})
 
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: Sequence[Capability] | None = None,
                  event_producers: list[EventProducer] | None = None,
+                 owner_transport: OwnerTransport | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
         self.config, self.provider = config, provider
@@ -48,7 +61,11 @@ class ResidentRuntime:
             self._observed_capability_snapshot = persisted_snapshot
             self._pending_capability_event = self._record_capability_change(self._capabilities)
         self.event_producers = event_producers or []
-        self.owner_output = owner_output or (lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}"))
+        default_output = lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}")
+        self.owner_output = owner_output or default_output
+        self.owner_transport = owner_transport or CallbackOwnerTransport(self.owner_output)
+        self._remote_owner_transport = owner_transport is not None
+        self._mirror_owner_output = self.owner_output if owner_transport is not None else None
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
         self.context_builder = ContextBuilder(
             self.store, memory_limit=config.context_memories, message_limit=config.context_messages)
@@ -115,6 +132,9 @@ class ResidentRuntime:
             tuple(capability for capability in self._capabilities if capability.name not in removed))
 
     async def enqueue_startup_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
+        for message in self.store.pending_owner_messages():
+            await queue.put(self._owner_message_wake(
+                message["id"], message["content"], message["created_at"]))
         if self._pending_capability_event is not None:
             await queue.put(self._pending_capability_event)
             self._pending_capability_event = None
@@ -123,9 +143,22 @@ class ResidentRuntime:
         self.store.close()
 
     def owner_message_event(self, content: str) -> WakeEvent:
-        message_id = self.store.add_message("inbound", self.owner.id, content)
-        return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", utc_now(),
+        message_id = self.store.ingest_owner_message(self.owner.id, content)
+        return self._owner_message_wake(message_id, content)
+
+    @staticmethod
+    def _owner_message_wake(message_id: str, content: str,
+                            occurred_at: str | None = None) -> WakeEvent:
+        return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", occurred_at or utc_now(),
                          {"message_id": message_id, "content": content})
+
+    def telegram_owner_message_event(self, bot_identity: str, update_id: int,
+                                     content: str) -> WakeEvent | None:
+        message_id = self.store.ingest_telegram_owner_message(
+            bot_identity, update_id, self.owner.id, content)
+        if message_id is None:
+            return None
+        return self._owner_message_wake(message_id, content)
 
     def _emit(self, event_type: str, data: dict) -> None:
         self.store.journal(event_type, data, self._active_run_id)
@@ -133,7 +166,7 @@ class ResidentRuntime:
             details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             self.diagnostic_output(f"{event_type} {details}")
 
-    def _send_owner_message(self, content: str) -> dict:
+    async def _send_owner_message(self, content: str) -> dict:
         if not content.strip():
             return {"delivered": False, "reason": "Message content is empty"}
         immediate_response = self._active_event is not None and self._active_event.source == "owner"
@@ -148,8 +181,13 @@ class ResidentRuntime:
             "outbound", self.resident.id, content, spontaneous=spontaneous, delivery_status=status)
         result = {"message_id": message_id, "delivered": False, "spontaneous": spontaneous}
         if allowed:
+            if self._mirror_owner_output is not None:
+                try:
+                    self._mirror_owner_output(content)
+                except Exception:
+                    pass
             try:
-                self.owner_output(content)
+                await self.owner_transport.send_text(content)
             except Exception as exc:
                 self.store.update_message_delivery_status(message_id, "transport_failed")
                 result.update({
@@ -251,7 +289,12 @@ class ResidentRuntime:
                 "status": status, "duration_seconds": duration, "model_calls": calls,
             })
             schedule_id = event.payload.get("schedule_id") if event.source == "scheduler" else None
-            self.store.finish_run(run_id, status, duration, calls, schedule_id)
+            owner_message_id = (
+                event.payload.get("message_id")
+                if event.source == "owner" and event.reason == "owner_message" else None
+            )
+            self.store.finish_run(
+                run_id, status, duration, calls, schedule_id, owner_message_id)
             self._active_run_id, self._active_event = None, None
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
@@ -282,6 +325,8 @@ class ResidentRuntime:
                 try:
                     text = await asyncio.to_thread(input, f"{self.owner.address_name}> ")
                 except (EOFError, KeyboardInterrupt):
+                    if self._remote_owner_transport:
+                        return
                     text = "/quit"
                 if text.strip() == "/quit":
                     stop.set()
