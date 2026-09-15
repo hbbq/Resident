@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Callable
+from typing import Callable, Protocol
 
 from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
@@ -16,9 +16,14 @@ from .store import Store, utc_now
 from .tools import ToolRegistry
 
 
+class EventProducer(Protocol):
+    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None: ...
+
+
 class ResidentRuntime:
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: list[Capability] | None = None,
+                 event_producers: list[EventProducer] | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
         self.config, self.provider = config, provider
@@ -26,6 +31,7 @@ class ResidentRuntime:
         self.resident, self.owner = self.store.provision(
             config.resident_name, config.owner_name, config.personality)
         self.capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
+        self.event_producers = event_producers or []
         self.owner_output = owner_output or (lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}"))
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
         self.context_builder = ContextBuilder(
@@ -149,6 +155,7 @@ class ResidentRuntime:
         queue: asyncio.Queue[WakeEvent | None] = asyncio.Queue()
         stop = asyncio.Event()
         scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
+        producers = [asyncio.create_task(producer.run(queue, stop)) for producer in self.event_producers]
 
         async def terminal_input() -> None:
             while not stop.is_set():
@@ -179,4 +186,6 @@ class ResidentRuntime:
             stop.set()
             scheduler.cancel()
             terminal.cancel()
-            await asyncio.gather(scheduler, terminal, return_exceptions=True)
+            for producer in producers:
+                producer.cancel()
+            await asyncio.gather(scheduler, terminal, *producers, return_exceptions=True)
