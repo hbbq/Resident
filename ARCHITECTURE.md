@@ -67,6 +67,34 @@ Connectors describe what Resident can observe or do and the constraints on those
 
 Agent-core special cases for specific connectors should be avoided where practical.
 
+### Connector ownership and adaptation
+
+Connectors belong on the Resident side of the boundary. External systems do not need to know about Resident or implement the Resident connector contract themselves.
+
+> External systems do not implement the Resident connector protocol. Resident connectors adapt external systems to it.
+
+For example, HomeOps should expose an API that makes sense for HomeOps. A `HomeOpsConnector` can consume that API and translate HomeOps-specific resources, DTOs, events, and operations into the common concepts Resident understands.
+
+Conceptually:
+
+```text
+Resident core
+    |
+Resident connector contract
+    |
+HomeOpsConnector
+    |
+HomeOps API
+```
+
+The same principle applies to other systems. A robot connector may adapt a robot-specific protocol, while a camera connector may adapt an RTSP stream or camera API.
+
+The connector contract is more important than its in-process implementation. Early connectors may simply be classes inside the Resident application. The architecture should not unnecessarily prevent a future connector from running as a separate process, on another machine, or in another language.
+
+Resident-specific endpoints should generally not be added to external systems merely to satisfy the connector contract. An external API may of course evolve in ways that make integration easier when those changes also make sense for that external system independently of Resident.
+
+A future generic connector may allow Resident to use sufficiently self-describing APIs without requiring a custom adapter for every service. This is an extension point rather than a v0 requirement.
+
 Physical co-location does not require logical integration. For example, a camera and microphone mounted on a robot may remain separate connector/device identities. Relationships such as `mounted_on`, `powered_by`, or correlated availability may later be declared or inferred by Resident.
 
 ## Memory
