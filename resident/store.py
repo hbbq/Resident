@@ -180,11 +180,17 @@ class Store:
                 (run_id, event.id, utc_now(), event.reason, event.source))
         return run_id
 
-    def finish_run(self, run_id: str, status: str, duration: float, model_calls: int) -> None:
+    def finish_run(self, run_id: str, status: str, duration: float, model_calls: int,
+                   schedule_id: str | None = None) -> None:
         with self.connection:
             self.connection.execute(
                 "UPDATE wake_runs SET finished_at=?,status=?,duration_seconds=?,model_calls=? WHERE id=?",
                 (utc_now(), status, duration, model_calls, run_id))
+            if schedule_id is not None:
+                schedule_status = "completed" if status == "completed" else "failed"
+                self.connection.execute(
+                    "UPDATE scheduled_wakeups SET status=? WHERE id=? AND status='claimed'",
+                    (schedule_status, schedule_id))
 
     def journal(self, event_type: str, data: dict[str, Any], run_id: str | None = None) -> None:
         with self.connection:
@@ -207,13 +213,3 @@ class Store:
                 self.connection.executemany("UPDATE scheduled_wakeups SET status='claimed' WHERE id=? AND status='pending'", ((r["id"],) for r in rows))
         return [{"id": r["id"], "due_at": r["due_at"], "reason": r["reason"],
                  "context": json.loads(r["context_json"])} for r in rows]
-
-    def complete_schedule(self, schedule_id: str) -> None:
-        with self.connection:
-            self.connection.execute(
-                "UPDATE scheduled_wakeups SET status='completed' WHERE id=? AND status='claimed'", (schedule_id,))
-
-    def fail_schedule(self, schedule_id: str) -> None:
-        with self.connection:
-            self.connection.execute(
-                "UPDATE scheduled_wakeups SET status='failed' WHERE id=? AND status='claimed'", (schedule_id,))

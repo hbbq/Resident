@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from resident.config import Config
-from resident.domain import ModelTurn, ToolCall
+from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.domain import ToolResult, ToolSpec
 from resident.provider import OpenAIResponsesProvider
 from resident.runtime import ResidentRuntime
@@ -160,7 +160,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(2, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
-            store.fail_schedule("schedule")
+            event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
+            run_id = store.start_run(event)
+            store.finish_run(run_id, "failed", 0, 0, "schedule")
             self.assertEqual("failed", store.connection.execute(
                 "SELECT status FROM scheduled_wakeups WHERE id='schedule'").fetchone()[0])
             store.close()
@@ -175,6 +177,61 @@ class StoreTests(unittest.TestCase):
             reopened = Store(path)
             recovered = reopened.claim_due_wakeups(utc_now())
             self.assertEqual(schedule, recovered[0]["id"])
+            reopened.close()
+
+    def test_run_and_schedule_finalization_roll_back_together(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            schedule = store.schedule(utc_now(), "recover interrupted run", {})
+            self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
+            event = WakeEvent("event", "scheduler", "recover interrupted run", utc_now(), {})
+            run_id = store.start_run(event)
+            store.connection.execute("""
+                CREATE TRIGGER interrupt_schedule_finalization
+                BEFORE UPDATE OF status ON scheduled_wakeups
+                WHEN NEW.status IN ('completed', 'failed')
+                BEGIN
+                  SELECT RAISE(ABORT, 'simulated crash');
+                END
+            """)
+
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "simulated crash"):
+                store.finish_run(run_id, "completed", 1.0, 1, schedule)
+
+            run = store.connection.execute(
+                "SELECT status,finished_at FROM wake_runs WHERE id=?", (run_id,)).fetchone()
+            self.assertEqual(("running", None), tuple(run))
+            self.assertEqual("claimed", store.connection.execute(
+                "SELECT status FROM scheduled_wakeups WHERE id=?", (schedule,)).fetchone()[0])
+            store.close()
+
+            reopened = Store(path)
+            self.assertEqual("pending", reopened.connection.execute(
+                "SELECT status FROM scheduled_wakeups WHERE id=?", (schedule,)).fetchone()[0])
+            self.assertEqual(schedule, reopened.claim_due_wakeups(utc_now())[0]["id"])
+            reopened.close()
+
+    def test_startup_recovery_does_not_requeue_terminal_schedules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            schedules = {
+                status: store.schedule(utc_now(), status, {})
+                for status in ("claimed", "completed", "failed")
+            }
+            for status, schedule in schedules.items():
+                store.connection.execute(
+                    "UPDATE scheduled_wakeups SET status=? WHERE id=?", (status, schedule))
+            store.connection.commit()
+            store.close()
+
+            reopened = Store(path)
+            statuses = dict(reopened.connection.execute(
+                "SELECT reason,status FROM scheduled_wakeups"))
+            self.assertEqual({
+                "claimed": "pending", "completed": "completed", "failed": "failed",
+            }, statuses)
             reopened.close()
 
 
