@@ -4,9 +4,11 @@
 
 Resident is a persistent AI entity that inhabits an environment rather than a chatbot session or a robot backend.
 
-Resident should have a continuous sense of identity across wakeups. It can learn about its environment, remember experiences, notice uncertainty and change, ask its owner questions, use available capabilities, and develop an increasingly useful understanding of the world around it.
+Resident should have a continuous sense of identity across wakeups. It can learn about its environment, remember experiences, notice uncertainty and change, communicate with its owner, use available capabilities, and develop an increasingly useful understanding of the world around it.
 
 A mobile robot can be one embodiment of Resident, but it is not Resident itself. When the robot is unavailable, Resident continues to exist. When it becomes available, Resident may use it to explore, investigate, observe, or simply do something interesting or playful.
+
+The architecture should not assume that there can only ever be one Resident instance. Each instance has its own persistent identity and may have a human-friendly name by which it is addressed. `Owner` is likewise a role and authority relationship, not necessarily a particular human; an owner also has an identity and an address name. This leaves room for future arrangements such as one Resident instance owning another without making multi-agent behavior a v0 requirement.
 
 ## Start small
 
@@ -54,17 +56,19 @@ The expected runtime is hybrid: Resident normally sleeps and wakes because somet
 
 A wakeup may lead to observation, reasoning, action, communication, another scheduled wakeup, or simply returning to sleep.
 
-Resident should be able to leave intentions and unresolved questions for its future self. For example, it may want to inspect an area with the robot but have to wait several hours for the robot to become available.
+Resident should be able to leave intentions and unresolved matters for its future self. For example, it may want to inspect an area with the robot but have to wait several hours for the robot to become available.
 
 ## Communication with the owner
 
-Communication is asynchronous, not session-oriented.
+Communication is asynchronous, not session-oriented, and is modeled as general messages rather than a built-in question/answer protocol.
 
-Resident may contact its owner with text, images, audio, or other supported attachments. A response might arrive immediately, several days later, or never. An unanswered question must not block Resident from doing other things or from finding another way to answer it.
+Resident may contact its owner with text, images, audio, or other supported attachments. A later owner message may be an answer, instruction, correction, new topic, or something else; Resident is responsible for understanding its meaning and relationship to earlier communication.
 
-The owner may also initiate communication at any time. An incoming owner message is a wake event.
+The owner may initiate communication at any time. An incoming owner message is a wake event. Communication history persists independently of Resident's chosen autobiographical memory, while only relevant/recent communication should normally be placed in a wake context.
 
-Human attention is a limited resource. Resident may internally have many questions, but runtime-enforced configurable rate limits / attention budgets must prevent it from peppering the owner with messages. Pending questions can wait, be prioritized, become obsolete, be answered independently, or potentially be combined before delivery.
+Human attention is a limited resource. Resident may internally want to communicate more often than is appropriate, but runtime-enforced configurable attention budgets must prevent it from peppering the owner with messages. Runtime need not understand which messages are questions in order to enforce that limit.
+
+Communication transport is replaceable. The interactive terminal is sufficient for v0, with Resident's intentional owner-facing messages rendered clearly differently from runtime logs and diagnostics. Later transports can replace or supplement it without changing Resident's communication model.
 
 ## Owner authority
 
@@ -88,8 +92,8 @@ Important choices are intentionally unresolved, including:
 
 - model providers and exact models;
 - cloud versus local inference;
-- the exact connector protocol;
-- communication transport and UI;
+- the exact connector protocol beyond the deliberately small v0 contract;
+- communication transports beyond the v0 terminal transport;
 - whether and when the world model needs a structured representation;
 - detailed memory retrieval and consolidation mechanisms;
 - exact attention-budget defaults;
