@@ -80,6 +80,11 @@ class Config:
     homeops_url: str | None = None
     homeops_poll_seconds: float = 30.0
     homeops_request_timeout_seconds: float = 10.0
+    telegram_bot_token: str | None = field(default=None, repr=False)
+    telegram_owner_user_id: int | None = field(default=None, repr=False)
+    telegram_owner_chat_id: int | None = field(default=None, repr=False)
+    telegram_poll_seconds: float = 30.0
+    telegram_request_timeout_seconds: float = 40.0
     cameras: tuple[CameraConfig, ...] = ()
     camera_capture_timeout_seconds: float = 8.0
     camera_max_width: int = 1280
@@ -103,12 +108,16 @@ class Config:
         parser.add_argument("--spontaneous-message-limit", type=int,
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_LIMIT", "3")))
         parser.add_argument("--spontaneous-message-window-seconds", type=int,
-                            default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_WINDOW_SECONDS", "180")))
+                            default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_WINDOW_SECONDS", "3600")))
         parser.add_argument("--homeops-url", default=os.getenv("RESIDENT_HOMEOPS_URL"))
         parser.add_argument("--homeops-poll-seconds", type=float,
                             default=float(os.getenv("RESIDENT_HOMEOPS_POLL_SECONDS", "30")))
         parser.add_argument("--homeops-request-timeout-seconds", type=float,
                             default=float(os.getenv("RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS", "10")))
+        parser.add_argument("--telegram-poll-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_TELEGRAM_POLL_SECONDS", "30")))
+        parser.add_argument("--telegram-request-timeout-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_TELEGRAM_REQUEST_TIMEOUT_SECONDS", "40")))
         parser.add_argument("--camera-capture-timeout-seconds", type=float,
                             default=float(os.getenv("RESIDENT_CAMERA_CAPTURE_TIMEOUT_SECONDS", "8")))
         parser.add_argument("--camera-max-width", type=int,
@@ -121,6 +130,21 @@ class Config:
                             default=os.getenv("RESIDENT_CAMERA_RTSP_TRANSPORT", "tcp"))
         parser.add_argument("--ffmpeg-executable", default=os.getenv("RESIDENT_FFMPEG_EXECUTABLE", "ffmpeg"))
         args = parser.parse_args(argv)
+        telegram_token = os.getenv("RESIDENT_TELEGRAM_BOT_TOKEN", "").strip() or None
+        telegram_user = os.getenv("RESIDENT_TELEGRAM_OWNER_USER_ID", "").strip() or None
+        telegram_chat = os.getenv("RESIDENT_TELEGRAM_OWNER_CHAT_ID", "").strip() or None
+        configured_telegram_values = (telegram_token, telegram_user, telegram_chat)
+        if any(configured_telegram_values) and not all(configured_telegram_values):
+            raise ValueError(
+                "Telegram requires RESIDENT_TELEGRAM_BOT_TOKEN, "
+                "RESIDENT_TELEGRAM_OWNER_USER_ID, and RESIDENT_TELEGRAM_OWNER_CHAT_ID")
+        try:
+            telegram_user_id = int(telegram_user) if telegram_user else None
+            telegram_chat_id = int(telegram_chat) if telegram_chat else None
+        except ValueError as exc:
+            raise ValueError("Telegram Owner user and chat IDs must be integers") from exc
+        if telegram_user_id is not None and (telegram_user_id <= 0 or telegram_chat_id <= 0):
+            raise ValueError("Telegram Owner user and private chat IDs must be positive integers")
         return cls(
             data_dir=Path(args.data_dir).expanduser(), verbose=args.verbose,
             resident_name=args.resident_name,
@@ -132,6 +156,11 @@ class Config:
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,
             homeops_poll_seconds=max(0.1, args.homeops_poll_seconds),
             homeops_request_timeout_seconds=max(0.1, args.homeops_request_timeout_seconds),
+            telegram_bot_token=telegram_token,
+            telegram_owner_user_id=telegram_user_id,
+            telegram_owner_chat_id=telegram_chat_id,
+            telegram_poll_seconds=max(1.0, args.telegram_poll_seconds),
+            telegram_request_timeout_seconds=max(1.0, args.telegram_request_timeout_seconds),
             cameras=_cameras_from_environment(),
             camera_capture_timeout_seconds=max(0.1, args.camera_capture_timeout_seconds),
             camera_max_width=max(1, args.camera_max_width),

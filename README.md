@@ -19,6 +19,21 @@ python -m resident --data-dir .resident
 
 Enter an owner message at the prompt. All intentional Resident-to-Owner communication, including direct replies, goes through `send_owner_message` and is rendered as `[Resident -> Owner] ...`. Model-returned text is a wake result for journaling and diagnostics, not a second communication transport; it is hidden by default and shown only with verbose diagnostics. A rejected or failed send never falls back to model-returned text. By default, the terminal otherwise shows only a small startup/shutdown status and actionable runtime failures, keeping routine spontaneous wakes nearly invisible. Pass `--verbose` or set `RESIDENT_VERBOSE=true` to show detailed wake, context, model, tool, memory, connector, and metric diagnostics. Verbosity affects terminal presentation only; the structured journal remains complete. Enter `/quit` to stop. Reusing the data directory reloads the same stable identities and state. Display names and personality can be configured on initial provisioning with `--resident-name`, `--owner-name`, and `--personality`; persisted identity is authoritative on later runs. `RESIDENT_MODEL`, `OPENAI_BASE_URL`, and the equivalent name/data environment variables may also be used.
 
+## Optional Telegram Owner transport
+
+Set all three environment variables below to enable a private, text-only Telegram bot transport:
+
+```powershell
+$env:RESIDENT_TELEGRAM_BOT_TOKEN = "..."
+$env:RESIDENT_TELEGRAM_OWNER_USER_ID = "123456789"
+$env:RESIDENT_TELEGRAM_OWNER_CHAT_ID = "123456789"
+python -m resident --data-dir .resident
+```
+
+The numeric user and private-chat IDs are an explicit Owner binding provisioned outside Resident. Messages from another user, chat, or a group are ignored; there is no first-message auto-binding. Telegram uses long polling, so Resident needs outbound HTTPS access but no public inbound endpoint, and an existing bot webhook must be removed before use. The token and binding IDs are kept out of model context, journal payloads, and normal diagnostics.
+
+When configured, Telegram is authoritative for `send_owner_message` delivery and the terminal mirrors attempted messages for local observability; that rendering is not counted as delivery. A Telegram send failure is recorded as `transport_failed`; it is not retried durably and does not fall back to model output. Messages longer than Telegram's 4,096-character limit are sent in content-preserving chunks. Terminal input remains active in parallel. If standard input is absent or closes, Resident continues running remotely; `/quit` remains available from an attached terminal. Poll and request timeouts can be set with `RESIDENT_TELEGRAM_POLL_SECONDS` and `RESIDENT_TELEGRAM_REQUEST_TIMEOUT_SECONDS`.
+
 Resident can explicitly manage memory and pending intentions, send owner messages, schedule a future wake, and invoke a read-only local time capability. Wake context contains the complete trigger but only a bounded selection of memories and communication. The runtime limits model tool use to eight rounds. Spontaneous messages (those outside an owner-initiated wake) default to three delivered messages per hour; excess messages are persisted as rejected and are never queued. Immediate replies during an owner wake do not consume that budget. Configure this policy with `--spontaneous-message-limit` and `--spontaneous-message-window-seconds` (or their `RESIDENT_...` environment-variable equivalents).
 
 The runtime persists a safe public snapshot of available capabilities. The first snapshot is silent; on later starts, or after an explicit programmatic registration/removal while running, additions, removals, and description/schema changes produce a normal `runtime` / `capabilities_changed` wake. Detection never invokes or tests a capability. Connectors may independently emit source-specific events when their visible world changes; Resident decides whether either kind of change warrants investigation or communication.

@@ -20,12 +20,25 @@ class EventProducer(Protocol):
     async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None: ...
 
 
+class OwnerTransport(Protocol):
+    async def send_text(self, content: str) -> None: ...
+
+
+class CallbackOwnerTransport:
+    def __init__(self, callback: Callable[[str], None]):
+        self.callback = callback
+
+    async def send_text(self, content: str) -> None:
+        self.callback(content)
+
+
 class ResidentRuntime:
     _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"communication.failed", "wake.failed"})
 
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: Sequence[Capability] | None = None,
                  event_producers: list[EventProducer] | None = None,
+                 owner_transport: OwnerTransport | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
         self.config, self.provider = config, provider
@@ -48,7 +61,11 @@ class ResidentRuntime:
             self._observed_capability_snapshot = persisted_snapshot
             self._pending_capability_event = self._record_capability_change(self._capabilities)
         self.event_producers = event_producers or []
-        self.owner_output = owner_output or (lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}"))
+        default_output = lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}")
+        self.owner_output = owner_output or default_output
+        self.owner_transport = owner_transport or CallbackOwnerTransport(self.owner_output)
+        self._remote_owner_transport = owner_transport is not None
+        self._mirror_owner_output = self.owner_output if owner_transport is not None else None
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
         self.context_builder = ContextBuilder(
             self.store, memory_limit=config.context_memories, message_limit=config.context_messages)
@@ -133,7 +150,7 @@ class ResidentRuntime:
             details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             self.diagnostic_output(f"{event_type} {details}")
 
-    def _send_owner_message(self, content: str) -> dict:
+    async def _send_owner_message(self, content: str) -> dict:
         if not content.strip():
             return {"delivered": False, "reason": "Message content is empty"}
         immediate_response = self._active_event is not None and self._active_event.source == "owner"
@@ -148,8 +165,13 @@ class ResidentRuntime:
             "outbound", self.resident.id, content, spontaneous=spontaneous, delivery_status=status)
         result = {"message_id": message_id, "delivered": False, "spontaneous": spontaneous}
         if allowed:
+            if self._mirror_owner_output is not None:
+                try:
+                    self._mirror_owner_output(content)
+                except Exception:
+                    pass
             try:
-                self.owner_output(content)
+                await self.owner_transport.send_text(content)
             except Exception as exc:
                 self.store.update_message_delivery_status(message_id, "transport_failed")
                 result.update({
@@ -282,6 +304,8 @@ class ResidentRuntime:
                 try:
                     text = await asyncio.to_thread(input, f"{self.owner.address_name}> ")
                 except (EOFError, KeyboardInterrupt):
+                    if self._remote_owner_transport:
+                        return
                     text = "/quit"
                 if text.strip() == "/quit":
                     stop.set()
