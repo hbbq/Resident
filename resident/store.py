@@ -29,7 +29,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -52,6 +52,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS scheduled_wakeups(
           id TEXT PRIMARY KEY, due_at TEXT NOT NULL, reason TEXT NOT NULL, context_json TEXT NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('pending','claimed','completed','failed')), created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS observed_snapshots(
+          scope TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
@@ -76,9 +78,23 @@ class Store:
                 self.connection.execute("DROP TABLE scheduled_wakeups_v1")
                 self.connection.execute(
                     "CREATE INDEX idx_schedules_due ON scheduled_wakeups(status, due_at)")
-        self.connection.execute("UPDATE schema_version SET version=2")
+        self.connection.execute("UPDATE schema_version SET version=3")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
+
+    def observed_snapshot(self, scope: str) -> Any | None:
+        row = self.connection.execute(
+            "SELECT data_json FROM observed_snapshots WHERE scope=?", (scope,)).fetchone()
+        return None if row is None else json.loads(row["data_json"])
+
+    def save_observed_snapshot(self, scope: str, data: Any) -> None:
+        encoded = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO observed_snapshots(scope,data_json,updated_at) VALUES(?,?,?)
+                ON CONFLICT(scope) DO UPDATE SET data_json=excluded.data_json,
+                    updated_at=excluded.updated_at
+            """, (scope, encoded, utc_now()))
 
     def provision(self, resident_name: str, owner_name: str, personality: str) -> tuple[Identity, Identity]:
         now = utc_now()

@@ -48,6 +48,7 @@ def main() -> int:
             max_bytes=config.camera_max_bytes, rtsp_transport=config.camera_rtsp_transport,
             ffmpeg_executable=config.ffmpeg_executable,
         )
+        connectors.append(cameras)
         capabilities.extend(cameras.capabilities)
     runtime = ResidentRuntime(
         config, provider, capabilities=capabilities, event_producers=connectors,

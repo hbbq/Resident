@@ -49,6 +49,8 @@ All reasons for Resident to begin thinking are normalized into the same internal
 
 A wake event should remain deliberately small and general, conceptually containing a source, timestamp, reason/type, and source-specific payload. The detailed schema should be driven by implementation needs rather than designed exhaustively up front.
 
+Runtime compares a durable, public capability snapshot at startup and whenever capabilities are explicitly replaced, registered, or removed. A newly provisioned Resident records its first baseline silently. Later additions, removals, and public descriptor changes produce a normal `capabilities_changed` wake; executable handlers and connector secrets are outside the snapshot. Each wake uses one capability snapshot for both context and tool registration. There is no capability polling loop, and detection never exercises a capability.
+
 During a wakeup Resident receives an appropriate working context, reasons and possibly acts, persists anything it wants its future self to retain, and may then sleep again.
 
 Scheduling is a mechanism, not a collection of hard-coded behaviors. Resident should be able to request a future wakeup with a reason/context rather than requiring dedicated classes such as `TemperatureMonitor` or `RobotExplorationBehavior`.
@@ -196,6 +198,8 @@ result
 Capabilities may represent both observation/read operations and actions. v0 does not require separate core abstractions for resources, sensors, devices, actions, or capability hierarchies. Those distinctions can be introduced later if real connectors demonstrate a need for them.
 
 Connector events do not require an exhaustively declared event taxonomy up front. The runtime needs to be able to receive them and preserve enough source-specific information in the resulting wake event for Resident to understand why it woke.
+
+Connector-visible resources remain domain-specific. For example, a refreshable camera connector may emit `cameras_changed` with safe camera metadata, while another connector can use its own vocabulary and observation lifecycle. Such events do not imply a generic resource hierarchy and do not cause runtime to inspect or test the reported resource.
 
 Connectors describe what Resident can observe or do and the constraints on those actions. They should not encode what Resident should want to do.
 

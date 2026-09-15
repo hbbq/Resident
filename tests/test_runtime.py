@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from resident.config import Config
+from resident.capabilities import Capability
 from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.domain import ImageAttachment, ToolResult, ToolSpec
 from resident.provider import OpenAIResponsesProvider
@@ -76,6 +77,84 @@ class ContinuationLifecycleProvider:
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def capability(name: str, *, description: str = "Test capability") -> Capability:
+        async def handler(_):
+            return {}
+        return Capability(
+            "test", "Test connector", name, description,
+            {"type": "object", "properties": {}, "additionalProperties": False}, handler)
+
+    async def test_first_capability_baseline_is_silent_and_restart_change_wakes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Config(Path(temporary))
+            original = [self.capability("one")]
+            first = ResidentRuntime(
+                config, MessageOnlyProvider(), capabilities=original,
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            first_queue = asyncio.Queue()
+            await first.enqueue_startup_wakeups(first_queue)
+            self.assertTrue(first_queue.empty())
+            first.close()
+
+            second = ResidentRuntime(
+                config, MessageOnlyProvider(), capabilities=[*original, self.capability("two")],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            second_queue = asyncio.Queue()
+            await second.enqueue_startup_wakeups(second_queue)
+            event = second_queue.get_nowait()
+            self.assertEqual(("runtime", "capabilities_changed"), (event.source, event.reason))
+            self.assertEqual({"added": ["two"], "removed": [], "changed": []}, event.payload)
+            second.close()
+
+    async def test_explicit_capability_changes_are_classified_and_suppress_noops(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(),
+                capabilities=[self.capability("one"), self.capability("removed")],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            self.assertIsNone(runtime.replace_capabilities(runtime.capabilities))
+            event = runtime.replace_capabilities([
+                self.capability("one", description="Changed"), self.capability("added")])
+
+            self.assertEqual({
+                "added": ["added"], "removed": ["removed"], "changed": ["one"],
+            }, event.payload)
+            runtime.close()
+
+    async def test_capability_wake_context_and_tools_use_same_current_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LifecycleProvider()
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, capabilities=[self.capability("old")],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            event = runtime.replace_capabilities([self.capability("new")])
+
+            await runtime.process(event)
+
+            available = provider.contexts[0]["available_connectors"]
+            self.assertEqual(["new"], [item["capability"]["name"] for item in available])
+            runtime.close()
+
+    async def test_duplicate_dynamic_capabilities_are_rejected_before_exposure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[self.capability("one")],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            with self.assertRaisesRegex(ValueError, "Duplicate capability name: one"):
+                runtime.register_capabilities([self.capability("one")])
+            self.assertEqual(["one"], [capability.name for capability in runtime.capabilities])
+            runtime.close()
+
+    async def test_dynamic_capability_cannot_shadow_core_tool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "conflicts with a core tool: remember"):
+                ResidentRuntime(
+                    Config(Path(temporary)), MessageOnlyProvider(),
+                    capabilities=[self.capability("remember")],
+                    owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
     async def test_default_diagnostics_hide_successful_spontaneous_wake_but_keep_journal(self):
         with tempfile.TemporaryDirectory() as temporary:
             diagnostics: list[str] = []
@@ -448,7 +527,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(2, store.connection.execute(
+            self.assertEqual(3, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
