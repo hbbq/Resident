@@ -71,6 +71,7 @@ class ResidentRuntime:
             self.store, memory_limit=config.context_memories, message_limit=config.context_messages)
         self._active_run_id: str | None = None
         self._active_event: WakeEvent | None = None
+        self._owner_message_processed: Callable[[str, bool], None] | None = None
 
     @property
     def capabilities(self) -> tuple[Capability, ...]:
@@ -143,6 +144,9 @@ class ResidentRuntime:
         message_id = self.store.add_message("inbound", self.owner.id, content)
         return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", utc_now(),
                          {"message_id": message_id, "content": content})
+
+    def bind_owner_message_processed(self, callback: Callable[[str, bool], None]) -> None:
+        self._owner_message_processed = callback
 
     def _emit(self, event_type: str, data: dict) -> None:
         self.store.journal(event_type, data, self._active_run_id)
@@ -275,6 +279,9 @@ class ResidentRuntime:
             schedule_id = event.payload.get("schedule_id") if event.source == "scheduler" else None
             self.store.finish_run(run_id, status, duration, calls, schedule_id)
             self._active_run_id, self._active_event = None, None
+            if (event.source, event.reason) == ("owner", "owner_message"):
+                if self._owner_message_processed is not None:
+                    self._owner_message_processed(event.id, status == "completed")
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
         for scheduled in self.store.claim_due_wakeups(utc_now()):

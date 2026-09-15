@@ -71,6 +71,7 @@ def main() -> int:
     )
     if telegram is not None:
         telegram.bind_owner_message(runtime.owner_message_event)
+        runtime.bind_owner_message_processed(telegram.acknowledge_owner_message)
         telegram.bind_offset_checkpoint(
             lambda: runtime.store.observed_snapshot("telegram.update_offset"),
             lambda offset: runtime.store.save_observed_snapshot("telegram.update_offset", offset),

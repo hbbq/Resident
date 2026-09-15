@@ -43,17 +43,63 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             transport.bind_offset_checkpoint(lambda: None, offsets.append)
             queue = asyncio.Queue()
 
-            offset = await transport.poll_once(queue, None)
+            polling = asyncio.create_task(transport.poll_once(queue, None))
+            event = await queue.get()
 
-            event = queue.get_nowait()
             self.assertEqual(("owner", "owner_message"), (event.source, event.reason))
             self.assertEqual("hello from Telegram", event.payload["content"])
+            transport.acknowledge_owner_message(event.id, True)
+            offset = await polling
             stored = runtime.store.connection.execute(
                 "SELECT direction,content FROM messages").fetchone()
             self.assertEqual(("inbound", "hello from Telegram"), tuple(stored))
             self.assertEqual(8, offset)
             self.assertEqual([8], offsets)
             runtime.close()
+
+    async def test_owner_update_is_replayed_when_process_stops_before_processing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Config(Path(temporary))
+            first_runtime = ResidentRuntime(
+                config, object(), owner_output=lambda _: None,
+                diagnostic_output=lambda _: None,
+            )
+            response = {"ok": True, "result": [{
+                "update_id": 7,
+                "message": {"chat": {"id": 202, "type": "private"},
+                            "from": {"id": 101}, "text": "recover me"},
+            }]}
+            offsets = []
+            first_transport = FakeTelegramTransport([response])
+            first_transport.bind_owner_message(first_runtime.owner_message_event)
+            first_transport.bind_offset_checkpoint(lambda: None, offsets.append)
+            first_queue = asyncio.Queue()
+
+            polling = asyncio.create_task(first_transport.poll_once(first_queue, None))
+            event = await first_queue.get()
+            self.assertEqual("recover me", event.payload["content"])
+            polling.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await polling
+            self.assertEqual([], offsets)
+            first_runtime.close()
+
+            second_runtime = ResidentRuntime(
+                config, object(), owner_output=lambda _: None,
+                diagnostic_output=lambda _: None,
+            )
+            second_transport = FakeTelegramTransport([response])
+            second_transport.bind_owner_message(second_runtime.owner_message_event)
+            second_transport.bind_offset_checkpoint(lambda: offsets[-1] if offsets else None, offsets.append)
+            second_queue = asyncio.Queue()
+
+            replay = asyncio.create_task(second_transport.poll_once(second_queue, None))
+            replayed_event = await second_queue.get()
+            second_transport.acknowledge_owner_message(replayed_event.id, True)
+
+            self.assertEqual(8, await replay)
+            self.assertEqual([8], offsets)
+            second_runtime.close()
 
     async def test_unauthorized_group_and_sender_updates_are_discarded_and_acked(self):
         updates = [

@@ -32,12 +32,18 @@ class TelegramTransport:
         self._load_offset = load_offset or (lambda: None)
         self._save_offset = save_offset or (lambda _: None)
         self._owner_message_event: Callable[[str], WakeEvent] | None = None
+        self._pending_owner_messages: dict[str, asyncio.Future[bool]] = {}
 
     def __repr__(self) -> str:
         return "TelegramTransport(configured=True)"
 
     def bind_owner_message(self, factory: Callable[[str], WakeEvent]) -> None:
         self._owner_message_event = factory
+
+    def acknowledge_owner_message(self, event_id: str, succeeded: bool) -> None:
+        completion = self._pending_owner_messages.pop(event_id, None)
+        if completion is not None and not completion.done():
+            completion.set_result(succeeded)
 
     def bind_offset_checkpoint(self, load: Callable[[], int | None], save: Callable[[int], None]) -> None:
         self._load_offset = load
@@ -103,7 +109,15 @@ class TelegramTransport:
                 if authorized:
                     if self._owner_message_event is None:
                         raise RuntimeError("Telegram Owner message handler is not bound")
-                    await queue.put(self._owner_message_event(text))
+                    event = self._owner_message_event(text)
+                    completion = asyncio.get_running_loop().create_future()
+                    self._pending_owner_messages[event.id] = completion
+                    await queue.put(event)
+                    try:
+                        if not await completion:
+                            raise RuntimeError("Telegram Owner message processing failed")
+                    finally:
+                        self._pending_owner_messages.pop(event.id, None)
             offset = update["update_id"] + 1
             self._save_offset(offset)
         return offset
