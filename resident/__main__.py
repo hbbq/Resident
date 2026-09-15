@@ -10,6 +10,19 @@ from .provider import OpenAIResponsesProvider
 from .runtime import ResidentRuntime
 
 
+class TerminalDiagnostics:
+    def __init__(self, verbose: bool):
+        self.verbose = verbose
+
+    @staticmethod
+    def runtime(message: str) -> None:
+        print(f"[runtime] {message}")
+
+    def homeops(self, message: str) -> None:
+        if self.verbose:
+            print(f"[homeops] {message}")
+
+
 def main() -> int:
     config = Config.from_env_and_args()
     if not config.openai_api_key:
@@ -18,15 +31,19 @@ def main() -> int:
     provider = OpenAIResponsesProvider(config.openai_api_key, config.model, config.openai_base_url)
     connectors = []
     capabilities = diagnostic_capabilities()
+    terminal_diagnostics = TerminalDiagnostics(config.verbose)
     if config.homeops_url:
         homeops = HomeOpsConnector(
             config.homeops_url, poll_seconds=config.homeops_poll_seconds,
             request_timeout_seconds=config.homeops_request_timeout_seconds,
-            diagnostic_output=lambda message: print(f"[homeops] {message}"),
+            diagnostic_output=terminal_diagnostics.homeops,
         )
         connectors.append(homeops)
         capabilities.extend(homeops.capabilities)
-    runtime = ResidentRuntime(config, provider, capabilities=capabilities, event_producers=connectors)
+    runtime = ResidentRuntime(
+        config, provider, capabilities=capabilities, event_producers=connectors,
+        diagnostic_output=terminal_diagnostics.runtime,
+    )
     try:
         asyncio.run(runtime.run_interactive())
     finally:
