@@ -13,6 +13,7 @@ from .store import Store
 CORE_TOOL_NAMES = frozenset({
     "remember", "recall", "update_memory", "forget", "create_intention",
     "update_intention", "send_owner_message", "schedule_wakeup",
+    "search_communication", "list_wake_history",
 })
 
 
@@ -29,8 +30,9 @@ def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[
 class ToolRegistry:
     def __init__(self, store: Store, capabilities: Sequence[Capability],
                  send_message: Callable[[str], Awaitable[dict[str, Any]] | dict[str, Any]],
-                 emit: Callable[[str, dict[str, Any]], None]):
-        self.store, self.emit = store, emit
+                 emit: Callable[[str, dict[str, Any]], None], *,
+                 current_run_id: str | None = None):
+        self.store, self.emit, self.current_run_id = store, emit, current_run_id
         self.tools: dict[str, Tool] = {
             "remember": Tool(ToolSpec("remember", "Persist something for your future self.",
                 _schema(("content",), content={"type": "string"})), self._remember),
@@ -52,6 +54,24 @@ class ToolRegistry:
             "schedule_wakeup": Tool(ToolSpec("schedule_wakeup", "Request a persistent future wakeup after a delay.",
                 _schema(("delay_seconds", "reason"), delay_seconds={"type": "integer", "minimum": 1, "maximum": 31536000},
                         reason={"type": "string"}, context={"type": "object"})), self._schedule),
+            "search_communication": Tool(ToolSpec("search_communication",
+                "Search or page through persisted Owner communication, newest first. This is read-only.",
+                _schema(query={"type": "string"},
+                        direction={"type": ["string", "null"], "enum": ["inbound", "outbound", None]},
+                        from_time={"type": ["string", "null"]}, to_time={"type": ["string", "null"]},
+                        limit={"type": "integer", "minimum": 1, "maximum": 50},
+                        offset={"type": "integer", "minimum": 0, "maximum": 10000})),
+                self._search_communication),
+            "list_wake_history": Tool(ToolSpec("list_wake_history",
+                "Search or page through prior wake runs and safe observable event summaries, newest first. "
+                "Raw payloads, tool arguments and results, model content, and attachments are excluded. This is read-only.",
+                _schema(query={"type": "string"}, source={"type": ["string", "null"]},
+                        status={"type": ["string", "null"],
+                                "enum": ["running", "completed", "failed", None]},
+                        from_time={"type": ["string", "null"]}, to_time={"type": ["string", "null"]},
+                        limit={"type": "integer", "minimum": 1, "maximum": 20},
+                        offset={"type": "integer", "minimum": 0, "maximum": 1000})),
+                self._list_wake_history),
         }
         for capability in capabilities:
             if capability.name in self.tools:
@@ -137,4 +157,32 @@ class ToolRegistry:
         schedule_id = self.store.schedule(due.isoformat(), a["reason"], a.get("context", {}))
         self.emit("wakeup.scheduled", {"schedule_id": schedule_id, "due_at": due.isoformat(), "reason": a["reason"]})
         return {"schedule_id": schedule_id, "due_at": due.isoformat()}
+
+    @staticmethod
+    def _validated_time(value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("History times must include a UTC offset")
+        return parsed.astimezone(UTC).isoformat()
+
+    def _search_communication(self, a: dict[str, Any]) -> dict[str, Any]:
+        messages = self.store.search_messages(
+            query=a.get("query", ""), direction=a.get("direction"),
+            from_time=self._validated_time(a.get("from_time")),
+            to_time=self._validated_time(a.get("to_time")),
+            limit=a.get("limit", 20), offset=a.get("offset", 0),
+        )
+        return {"messages": messages}
+
+    def _list_wake_history(self, a: dict[str, Any]) -> dict[str, Any]:
+        runs = self.store.wake_history(
+            query=a.get("query", ""), source=a.get("source"), status=a.get("status"),
+            from_time=self._validated_time(a.get("from_time")),
+            to_time=self._validated_time(a.get("to_time")),
+            limit=a.get("limit", 10), offset=a.get("offset", 0),
+            exclude_run_id=self.current_run_id,
+        )
+        return {"wake_runs": runs}
 
