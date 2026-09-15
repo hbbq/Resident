@@ -191,3 +191,7 @@ class Store:
         with self.connection:
             self.connection.execute("UPDATE scheduled_wakeups SET status='completed' WHERE id=?", (schedule_id,))
 
+    def release_schedule(self, schedule_id: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE scheduled_wakeups SET status='pending' WHERE id=? AND status='claimed'", (schedule_id,))
