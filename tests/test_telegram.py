@@ -188,6 +188,103 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT count(*) FROM messages WHERE direction='inbound'").fetchone()[0])
             runtime.close()
 
+    async def test_multi_update_retry_reloads_checkpoint_without_duplicate_wakes(self):
+        stop = asyncio.Event()
+        updates = [
+            {
+                "update_id": update_id,
+                "message": {"chat": {"id": 202, "type": "private"},
+                            "from": {"id": 101}, "text": text},
+            }
+            for update_id, text in ((7, "first"), (8, "second"), (9, "recover me"))
+        ]
+
+        class CheckpointAwareTransport(TelegramTransport):
+            def __init__(self):
+                super().__init__("secret-token", 101, 202)
+                self.request_offsets = []
+
+            async def _check_webhook(self):
+                pass
+
+            async def _request(self, method, parameters):
+                self.request_offsets.append(parameters.get("offset"))
+                requested = parameters.get("offset")
+                return {"ok": True, "result": [
+                    update for update in updates
+                    if requested is None or update["update_id"] >= requested
+                ]}
+
+            async def poll_once(self, queue, offset):
+                result = await super().poll_once(queue, offset)
+                stop.set()
+                return result
+
+        class RecordingProvider:
+            def __init__(self):
+                self.calls = 0
+
+            async def respond(self, *_):
+                self.calls += 1
+                return ModelTurn("done")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = RecordingProvider()
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            transport = CheckpointAwareTransport()
+            ingestion_attempts = []
+
+            def owner_message_event(bot_identity, update_id, content):
+                ingestion_attempts.append(update_id)
+                return runtime.telegram_owner_message_event(bot_identity, update_id, content)
+
+            persisted_offset = None
+            failed_checkpoint = False
+
+            def load_offset():
+                return persisted_offset
+
+            def save_offset(offset):
+                nonlocal persisted_offset, failed_checkpoint
+                if offset == 10 and not failed_checkpoint:
+                    failed_checkpoint = True
+                    raise RuntimeError("crash before later checkpoint")
+                persisted_offset = offset
+
+            transport.bind_owner_message(owner_message_event)
+            transport.bind_offset_checkpoint(load_offset, save_offset)
+            queue = asyncio.Queue()
+
+            async def immediate_timeout(awaitable, *, timeout):
+                awaitable.close()
+                raise TimeoutError
+
+            with patch("resident.telegram.asyncio.wait_for", new=immediate_timeout):
+                await transport.run(queue, stop)
+
+            self.assertEqual([None, 9], transport.request_offsets)
+            self.assertEqual([7, 8, 9, 9], ingestion_attempts)
+            self.assertEqual(10, persisted_offset)
+            events = [queue.get_nowait() for _ in range(queue.qsize())]
+            self.assertEqual(["first", "second", "recover me"], [
+                event.payload["content"] for event in events])
+            self.assertEqual(3, len({event.payload["message_id"] for event in events}))
+
+            for event in events:
+                await runtime.process(event)
+
+            self.assertEqual(3, provider.calls)
+            self.assertEqual(3, runtime.store.connection.execute(
+                "SELECT count(*) FROM messages WHERE direction='inbound'").fetchone()[0])
+            self.assertEqual(3, runtime.store.connection.execute(
+                "SELECT count(*) FROM telegram_owner_updates").fetchone()[0])
+            self.assertEqual((3, 3), tuple(runtime.store.connection.execute("""
+                SELECT count(*), sum(status='completed') FROM owner_message_processing
+            """).fetchone()))
+            runtime.close()
+
     async def test_refetched_completed_update_does_not_recreate_wake(self):
         class CompleteProvider:
             async def respond(self, *_):

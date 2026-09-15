@@ -143,10 +143,14 @@ class TelegramTransport:
 
     async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
         offset = self._load_offset()
+        reload_offset = False
         webhook_checked = False
         backoff = 1.0
         while not stop.is_set():
             try:
+                if reload_offset:
+                    offset = self._load_offset()
+                    reload_offset = False
                 if not webhook_checked:
                     await self._check_webhook()
                     webhook_checked = True
@@ -159,6 +163,7 @@ class TelegramTransport:
                 return
             except Exception as exc:
                 self.diagnostic_output(f"poll failed: {type(exc).__name__}: {exc}")
+                reload_offset = True
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=backoff)
                 except TimeoutError:
