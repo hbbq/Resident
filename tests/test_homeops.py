@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from resident.__main__ import TerminalDiagnostics
 from resident.config import Config
 from resident.homeops import HomeOpsConnector
 from resident.runtime import ResidentRuntime
@@ -125,6 +126,23 @@ class HomeOpsConfigTests(unittest.TestCase):
         self.assertEqual("http://homeops.test", enabled.homeops_url)
         self.assertEqual(2.5, enabled.homeops_poll_seconds)
         self.assertEqual(3, enabled.homeops_request_timeout_seconds)
+
+    def test_verbose_can_be_enabled_by_environment_or_cli(self):
+        with patch.dict(os.environ, {"RESIDENT_VERBOSE": "true"}):
+            from_environment = Config.from_env_and_args(["--data-dir", ".resident"])
+        with patch.dict(os.environ, {"RESIDENT_VERBOSE": ""}):
+            from_cli = Config.from_env_and_args(["--data-dir", ".resident", "--verbose"])
+
+        self.assertTrue(from_environment.verbose)
+        self.assertTrue(from_cli.verbose)
+
+    def test_terminal_renderer_suppresses_connector_retries_unless_verbose(self):
+        with patch("builtins.print") as output:
+            TerminalDiagnostics(verbose=False).homeops("poll failed: offline")
+            output.assert_not_called()
+
+            TerminalDiagnostics(verbose=True).homeops("poll failed: offline")
+            output.assert_called_once_with("[homeops] poll failed: offline")
 
 
 class IdleProvider:

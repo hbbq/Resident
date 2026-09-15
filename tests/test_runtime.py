@@ -47,7 +47,84 @@ class SingleToolProvider:
         return ModelTurn("done", message="done")
 
 
+class MessageOnlyProvider:
+    async def respond(self, context, tools, results, previous_response_id=None):
+        return ModelTurn("done", message="No owner communication is needed.")
+
+
+class FailingProvider:
+    async def respond(self, context, tools, results, previous_response_id=None):
+        raise RuntimeError("provider unavailable")
+
+
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_diagnostics_hide_successful_spontaneous_wake_but_keep_journal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            diagnostics: list[str] = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(),
+                owner_output=lambda _: self.fail("Resident should not contact the owner"),
+                diagnostic_output=diagnostics.append,
+            )
+            event = WakeEvent("event", "homeops", "measurement_changed", utc_now(), {})
+
+            await runtime.process(event)
+
+            self.assertEqual([], diagnostics)
+            journal = {row[0] for row in runtime.store.connection.execute(
+                "SELECT event_type FROM journal")}
+            self.assertIn("wake.started", journal)
+            self.assertIn("model.message", journal)
+            self.assertIn("wake.finished", journal)
+            runtime.close()
+
+    async def test_verbose_diagnostics_include_lifecycle_and_model_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            diagnostics: list[str] = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary), verbose=True), MessageOnlyProvider(),
+                owner_output=lambda _: None, diagnostic_output=diagnostics.append,
+            )
+
+            await runtime.process(WakeEvent(
+                "event", "homeops", "measurement_changed", utc_now(), {}))
+
+            self.assertTrue(any(line.startswith("wake.started ") for line in diagnostics))
+            self.assertTrue(any(line.startswith("model.message ") for line in diagnostics))
+            self.assertTrue(any(line.startswith("wake.finished ") for line in diagnostics))
+            runtime.close()
+
+    async def test_default_diagnostics_show_actionable_runtime_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            diagnostics: list[str] = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), FailingProvider(),
+                owner_output=lambda _: None, diagnostic_output=diagnostics.append,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+                await runtime.process(WakeEvent("event", "scheduler", "scheduled", utc_now(), {}))
+
+            self.assertEqual(1, len(diagnostics))
+            self.assertTrue(diagnostics[0].startswith("wake.failed "))
+            runtime.close()
+
+    async def test_owner_communication_remains_visible_in_default_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            delivered: list[str] = []
+            diagnostics: list[str] = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary)),
+                SingleToolProvider("send_owner_message", {"content": "Worth your attention"}),
+                owner_output=delivered.append, diagnostic_output=diagnostics.append,
+            )
+
+            await runtime.process(runtime.owner_message_event("Any news?"))
+
+            self.assertEqual(["Worth your attention"], delivered)
+            self.assertEqual([], diagnostics)
+            runtime.close()
+
     async def test_full_lifecycle_retains_identity_and_memory_across_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))

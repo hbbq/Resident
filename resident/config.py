@@ -12,6 +12,13 @@ DEFAULT_PERSONALITY = (
 )
 
 
+def _environment_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Config:
     data_dir: Path
@@ -31,11 +38,14 @@ class Config:
     homeops_url: str | None = None
     homeops_poll_seconds: float = 30.0
     homeops_request_timeout_seconds: float = 10.0
+    verbose: bool = False
 
     @classmethod
     def from_env_and_args(cls, argv: list[str] | None = None) -> "Config":
         parser = argparse.ArgumentParser(description="Run a persistent Resident instance")
         parser.add_argument("--data-dir", default=os.getenv("RESIDENT_DATA_DIR", ".resident"))
+        parser.add_argument("--verbose", action="store_true", default=_environment_flag("RESIDENT_VERBOSE"),
+                            help="show detailed runtime and connector diagnostics")
         parser.add_argument("--resident-name", default=os.getenv("RESIDENT_NAME", "Resident"))
         parser.add_argument("--owner-name", default=os.getenv("RESIDENT_OWNER_NAME", "Owner"))
         parser.add_argument("--personality", default=os.getenv("RESIDENT_PERSONALITY", DEFAULT_PERSONALITY))
@@ -52,7 +62,8 @@ class Config:
                             default=float(os.getenv("RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS", "10")))
         args = parser.parse_args(argv)
         return cls(
-            data_dir=Path(args.data_dir).expanduser(), resident_name=args.resident_name,
+            data_dir=Path(args.data_dir).expanduser(), verbose=args.verbose,
+            resident_name=args.resident_name,
             owner_name=args.owner_name, personality=args.personality, provider=args.provider,
             model=args.model, openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),

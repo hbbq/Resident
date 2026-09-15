@@ -21,6 +21,8 @@ class EventProducer(Protocol):
 
 
 class ResidentRuntime:
+    _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"wake.failed"})
+
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: list[Capability] | None = None,
                  event_producers: list[EventProducer] | None = None,
@@ -49,8 +51,9 @@ class ResidentRuntime:
 
     def _emit(self, event_type: str, data: dict) -> None:
         self.store.journal(event_type, data, self._active_run_id)
-        details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        self.diagnostic_output(f"{event_type} {details}")
+        if self.config.verbose or event_type in self._NORMAL_DIAGNOSTIC_EVENTS:
+            details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            self.diagnostic_output(f"{event_type} {details}")
 
     def _send_owner_message(self, content: str) -> dict:
         if not content.strip():
@@ -189,3 +192,4 @@ class ResidentRuntime:
             for producer in producers:
                 producer.cancel()
             await asyncio.gather(scheduler, terminal, *producers, return_exceptions=True)
+            self.diagnostic_output(f"Resident {self.resident.address_name} stopped")
