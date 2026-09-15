@@ -103,7 +103,7 @@ class Config:
         parser.add_argument("--spontaneous-message-limit", type=int,
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_LIMIT", "3")))
         parser.add_argument("--spontaneous-message-window-seconds", type=int,
-                            default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_WINDOW_SECONDS", "3600")))
+                            default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_WINDOW_SECONDS", "180")))
         parser.add_argument("--homeops-url", default=os.getenv("RESIDENT_HOMEOPS_URL"))
         parser.add_argument("--homeops-poll-seconds", type=float,
                             default=float(os.getenv("RESIDENT_HOMEOPS_POLL_SECONDS", "30")))

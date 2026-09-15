@@ -322,6 +322,111 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime.close()
 
 
+class AttentionBudgetTests(unittest.TestCase):
+    def test_spontaneous_limit_counts_delivered_messages_and_rejects_next(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), spontaneous_message_limit=2),
+                MessageOnlyProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            first = runtime._send_owner_message("first")
+            second = runtime._send_owner_message("second")
+            third = runtime._send_owner_message("third")
+
+            self.assertTrue(first["delivered"])
+            self.assertTrue(second["delivered"])
+            self.assertEqual("Spontaneous owner-message attention budget exceeded", third["reason"])
+            self.assertEqual(2, runtime.store.spontaneous_count_since(
+                (datetime.now(UTC) - timedelta(seconds=60)).isoformat()))
+            runtime.close()
+
+    def test_rejected_attempt_does_not_consume_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), spontaneous_message_limit=1),
+                MessageOnlyProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            delivered = runtime._send_owner_message("first")
+            rejected = runtime._send_owner_message("rejected")
+            count = runtime.store.spontaneous_count_since(
+                (datetime.now(UTC) - timedelta(seconds=60)).isoformat())
+
+            self.assertTrue(delivered["delivered"])
+            self.assertFalse(rejected["delivered"])
+            self.assertEqual(1, count)
+            self.assertEqual(1, runtime.store.connection.execute(
+                "SELECT count(*) FROM messages WHERE delivery_status='rejected_attention_budget'").fetchone()[0])
+            runtime.close()
+
+    def test_owner_reply_bypasses_spontaneous_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), spontaneous_message_limit=0),
+                MessageOnlyProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime._active_event = WakeEvent("event", "owner", "owner_message", utc_now(), {})
+
+            result = runtime._send_owner_message("direct reply")
+
+            self.assertTrue(result["delivered"])
+            self.assertFalse(result["spontaneous"])
+            self.assertEqual(0, runtime.store.spontaneous_count_since(
+                (datetime.now(UTC) - timedelta(seconds=60)).isoformat()))
+            runtime.close()
+
+    def test_delivered_spontaneous_messages_survive_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            first = ResidentRuntime(
+                Config(path, spontaneous_message_limit=1),
+                MessageOnlyProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            self.assertTrue(first._send_owner_message("before restart")["delivered"])
+            first.close()
+
+            second = ResidentRuntime(
+                Config(path, spontaneous_message_limit=1),
+                MessageOnlyProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            result = second._send_owner_message("after restart")
+
+            self.assertEqual("Spontaneous owner-message attention budget exceeded", result["reason"])
+            second.close()
+
+    def test_messages_older_than_window_leave_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), spontaneous_message_limit=1, spontaneous_message_window_seconds=60),
+                MessageOnlyProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime._send_owner_message("old")
+            old_timestamp = (datetime.now(UTC) - timedelta(seconds=61)).isoformat()
+            runtime.store.connection.execute(
+                "UPDATE messages SET created_at=? WHERE direction='outbound'", (old_timestamp,))
+            runtime.store.connection.commit()
+
+            result = runtime._send_owner_message("new")
+
+            self.assertTrue(result["delivered"])
+            runtime.close()
+
+    def test_window_boundary_is_inclusive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            resident, _ = store.provision("Resident", "Owner", "")
+            boundary = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+            store.connection.execute(
+                "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
+                ("boundary", "outbound", resident.id, "boundary", 1, "delivered", boundary))
+            store.connection.commit()
+
+            self.assertEqual(1, store.spontaneous_count_since(boundary))
+            store.close()
+
+    def test_direct_config_default_window_differs_from_cli_default(self):
+        direct = Config(Path("."))
+        parsed = Config.from_env_and_args(["--data-dir", "."])
+
+        self.assertEqual(180, direct.spontaneous_message_window_seconds)
+        self.assertEqual(3600, parsed.spontaneous_message_window_seconds)
+
+
 class StoreTests(unittest.TestCase):
     def test_existing_schedule_table_is_migrated_to_support_failed_state(self):
         with tempfile.TemporaryDirectory() as temporary:
