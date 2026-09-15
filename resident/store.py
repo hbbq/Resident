@@ -29,7 +29,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -54,6 +54,8 @@ class Store:
           status TEXT NOT NULL CHECK(status IN ('pending','claimed','completed','failed')), created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS observed_snapshots(
           scope TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS telegram_owner_updates(
+          update_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE REFERENCES messages(id));
         CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
@@ -93,7 +95,7 @@ class Store:
                 self.connection.execute("DROP TABLE scheduled_wakeups_v1")
                 self.connection.execute(
                     "CREATE INDEX idx_schedules_due ON scheduled_wakeups(status, due_at)")
-        self.connection.execute("UPDATE schema_version SET version=3")
+        self.connection.execute("UPDATE schema_version SET version=4")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -139,6 +141,23 @@ class Store:
         with self.connection:
             self.connection.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?)", (
                 message_id, direction, sender_id, content, int(spontaneous), delivery_status, utc_now()))
+        return message_id
+
+    def ingest_telegram_owner_message(self, update_id: int, sender_id: str,
+                                      content: str) -> str | None:
+        """Atomically record a Telegram update and its canonical inbound message."""
+        message_id = str(uuid.uuid4())
+        with self.connection:
+            self.connection.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?)", (
+                message_id, "inbound", sender_id, content, 0, "delivered", utc_now()))
+            claimed = self.connection.execute(
+                "INSERT INTO telegram_owner_updates(update_id,message_id) VALUES(?,?) "
+                "ON CONFLICT(update_id) DO NOTHING",
+                (update_id, message_id),
+            )
+            if claimed.rowcount == 0:
+                self.connection.execute("DELETE FROM messages WHERE id=?", (message_id,))
+                return None
         return message_id
 
     def update_message_delivery_status(self, message_id: str, delivery_status: str) -> None:
