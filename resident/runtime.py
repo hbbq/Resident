@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Callable
+
+from .capabilities import Capability, diagnostic_capabilities
+from .config import Config
+from .context import ContextBuilder
+from .domain import ToolResult, WakeEvent
+from .provider import ModelProvider
+from .store import Store, utc_now
+from .tools import ToolRegistry
+
+
+class ResidentRuntime:
+    def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
+                 capabilities: list[Capability] | None = None,
+                 owner_output: Callable[[str], None] | None = None,
+                 diagnostic_output: Callable[[str], None] | None = None):
+        self.config, self.provider = config, provider
+        self.store = store or Store(config.data_dir / "resident.sqlite3")
+        self.resident, self.owner = self.store.provision(
+            config.resident_name, config.owner_name, config.personality)
+        self.capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
+        self.owner_output = owner_output or (lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}"))
+        self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
+        self.context_builder = ContextBuilder(
+            self.store, memory_limit=config.context_memories, message_limit=config.context_messages)
+        self._active_run_id: str | None = None
+        self._active_event: WakeEvent | None = None
+
+    def close(self) -> None:
+        self.store.close()
+
+    def owner_message_event(self, content: str) -> WakeEvent:
+        message_id = self.store.add_message("inbound", self.owner.id, content)
+        return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", utc_now(),
+                         {"message_id": message_id, "content": content})
+
+    def _emit(self, event_type: str, data: dict) -> None:
+        self.store.journal(event_type, data, self._active_run_id)
+        details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        self.diagnostic_output(f"{event_type} {details}")
+
+    def _send_owner_message(self, content: str) -> dict:
+        if not content.strip():
+            return {"delivered": False, "reason": "Message content is empty"}
+        immediate_response = self._active_event is not None and self._active_event.source == "owner"
+        spontaneous = not immediate_response
+        allowed = True
+        if spontaneous:
+            since = (datetime.now(UTC) - timedelta(
+                seconds=self.config.spontaneous_message_window_seconds)).isoformat()
+            allowed = self.store.spontaneous_count_since(since) < self.config.spontaneous_message_limit
+        status = "delivered" if allowed else "rejected_attention_budget"
+        message_id = self.store.add_message(
+            "outbound", self.resident.id, content, spontaneous=spontaneous, delivery_status=status)
+        result = {"message_id": message_id, "delivered": allowed, "spontaneous": spontaneous}
+        if allowed:
+            self.owner_output(content)
+            self._emit("communication.delivered", result)
+        else:
+            result["reason"] = "Spontaneous owner-message attention budget exceeded"
+            self._emit("communication.rejected", result)
+        return result
+
+    async def process(self, event: WakeEvent) -> str:
+        started = time.monotonic()
+        run_id = self.store.start_run(event)
+        self._active_run_id, self._active_event = run_id, event
+        calls = 0
+        status = "completed"
+        try:
+            self._emit("wake.started", {
+                "event_id": event.id, "source": event.source, "reason": event.reason,
+                "occurred_at": event.occurred_at, "payload": event.payload,
+            })
+            context = self.context_builder.build(self.resident, self.owner, event, self.capabilities)
+            self._emit("context.assembled", {
+                "characters": len(context), "memories": len(self.store.recall(
+                    event.reason + " " + str(event.payload), self.config.context_memories)),
+                "pending_intentions": len(self.store.pending_intentions()),
+                "recent_messages": len(self.store.recent_messages(self.config.context_messages)),
+            })
+            registry = ToolRegistry(self.store, self.capabilities, self._send_owner_message, self._emit)
+            results: list[ToolResult] = []
+            previous_id: str | None = None
+            for round_number in range(self.config.max_tool_rounds + 1):
+                calls += 1
+                turn = await self.provider.respond(context, registry.specs, results, previous_id)
+                self._emit("model.responded", {
+                    "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
+                    "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
+                    "output_tokens": turn.output_tokens,
+                })
+                if turn.message:
+                    self._emit("model.message", {"content": turn.message})
+                if not turn.tool_calls:
+                    break
+                if round_number >= self.config.max_tool_rounds:
+                    raise RuntimeError("Model exceeded the configured tool-round limit")
+                results = []
+                for call in turn.tool_calls:
+                    self._emit("tool.called", {"call_id": call.id, "name": call.name, "arguments": call.arguments})
+                    output = await registry.execute(call.name, call.arguments)
+                    results.append(ToolResult(call.id, output))
+                    self._emit("tool.completed", {"call_id": call.id, "name": call.name, "result": output})
+                previous_id = turn.response_id
+                if not previous_id:
+                    raise RuntimeError("Provider did not return a response id for tool continuation")
+            self._emit("wake.sleeping", {"status": "completed"})
+            return run_id
+        except Exception as exc:
+            status = "failed"
+            self._emit("wake.failed", {"error_type": type(exc).__name__, "error": str(exc)})
+            raise
+        finally:
+            duration = time.monotonic() - started
+            self._emit("wake.finished", {
+                "status": status, "duration_seconds": duration, "model_calls": calls,
+            })
+            self.store.finish_run(run_id, status, duration, calls)
+            schedule_id = event.payload.get("schedule_id") if event.source == "scheduler" else None
+            if schedule_id:
+                self.store.complete_schedule(schedule_id)
+            self._active_run_id, self._active_event = None, None
+
+    async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
+        for scheduled in self.store.claim_due_wakeups(utc_now()):
+            await queue.put(WakeEvent(
+                str(uuid.uuid4()), "scheduler", scheduled["reason"], utc_now(),
+                {"schedule_id": scheduled["id"], "scheduled_for": scheduled["due_at"],
+                 "context": scheduled["context"]}))
+
+    async def scheduler_loop(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await self.enqueue_due_wakeups(queue)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.config.scheduler_poll_seconds)
+            except TimeoutError:
+                pass
+
+    async def run_interactive(self) -> None:
+        queue: asyncio.Queue[WakeEvent | None] = asyncio.Queue()
+        stop = asyncio.Event()
+        scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
+
+        async def terminal_input() -> None:
+            while not stop.is_set():
+                try:
+                    text = await asyncio.to_thread(input, f"{self.owner.address_name}> ")
+                except (EOFError, KeyboardInterrupt):
+                    text = "/quit"
+                if text.strip() == "/quit":
+                    stop.set()
+                    await queue.put(None)
+                    return
+                if text.strip():
+                    await queue.put(self.owner_message_event(text))
+
+        terminal = asyncio.create_task(terminal_input())
+        self.diagnostic_output(
+            f"Resident {self.resident.address_name} ({self.resident.id}) is sleeping; /quit stops the process")
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                try:
+                    await self.process(event)
+                except Exception:
+                    pass
+        finally:
+            stop.set()
+            scheduler.cancel()
+            terminal.cancel()
+            await asyncio.gather(scheduler, terminal, return_exceptions=True)
