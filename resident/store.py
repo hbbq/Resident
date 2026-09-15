@@ -58,6 +58,21 @@ class Store:
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
         """)
+        # An already-provisioned Resident predates capability snapshots. Seed an
+        # empty baseline so its first run with this feature sees the currently
+        # available capabilities as additions. A genuinely new database has no
+        # Resident identity yet and will establish its first baseline silently.
+        existing_resident = self.connection.execute(
+            "SELECT 1 FROM identities WHERE role='resident'"
+        ).fetchone()
+        existing_capability_snapshot = self.connection.execute(
+            "SELECT 1 FROM observed_snapshots WHERE scope='runtime.capabilities'"
+        ).fetchone()
+        if existing_resident is not None and existing_capability_snapshot is None:
+            self.connection.execute(
+                "INSERT INTO observed_snapshots(scope,data_json,updated_at) VALUES(?,?,?)",
+                ("runtime.capabilities", "{}", utc_now()),
+            )
         table_sql = self.connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='scheduled_wakeups'"
         ).fetchone()[0]
