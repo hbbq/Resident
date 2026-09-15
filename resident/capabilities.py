@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
 
-from .domain import ToolSpec
+from .domain import ToolOutput, ToolSpec
 
 
-Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | ToolOutput]]
 
 
 @dataclass(frozen=True)

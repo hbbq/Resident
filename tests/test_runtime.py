@@ -9,7 +9,7 @@ from pathlib import Path
 
 from resident.config import Config
 from resident.domain import ModelTurn, ToolCall, WakeEvent
-from resident.domain import ToolResult, ToolSpec
+from resident.domain import ImageAttachment, ToolResult, ToolSpec
 from resident.provider import OpenAIResponsesProvider
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
@@ -394,13 +394,42 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("gpt-5.6-luna", requests[0]["model"])
         self.assertEqual("function", requests[0]["tools"][0]["type"])
-        self.assertEqual("resp-1", requests[1]["previous_response_id"])
-        self.assertEqual("function_call_output", requests[1]["input"][0]["type"])
-        self.assertEqual("call-1", requests[1]["input"][0]["call_id"])
+        self.assertNotIn("previous_response_id", requests[1])
+        self.assertEqual("user", requests[1]["input"][0]["role"])
+        self.assertEqual("function_call", requests[1]["input"][1]["type"])
+        self.assertEqual("function_call_output", requests[1]["input"][2]["type"])
+        self.assertEqual("call-1", requests[1]["input"][2]["call_id"])
         self.assertEqual("done", second.message)
+        self.assertFalse(requests[0]["store"])
+        self.assertFalse(requests[1]["store"])
+        self.assertEqual(["reasoning.encrypted_content"], requests[0]["include"])
         self.assertIn("all intentional communication", requests[0]["instructions"])
         self.assertIn("final response message is wake-result diagnostic text only",
                       requests[0]["instructions"])
+
+    async def test_image_tool_result_is_sent_as_multimodal_ephemeral_content(self):
+        provider = OpenAIResponsesProvider("test-key", "vision-model")
+        requests = []
+        responses = iter((
+            {"id": "previous", "status": "completed", "output": [{
+                "type": "function_call", "call_id": "capture", "name": "camera_capture_frame",
+                "arguments": '{"camera_id":"entry"}',
+            }]},
+            {"id": "response", "status": "completed", "output": []},
+        ))
+        provider._post = lambda body: requests.append(body) or next(responses)
+
+        first = await provider.respond("context", [], [])
+        await provider.respond("context", [], [ToolResult(
+            "capture", {"status": "captured"},
+            (ImageAttachment(b"\xff\xd8image\xff\xd9", detail="low"),),
+        )], first.response_id)
+
+        output = requests[1]["input"][-1]["output"]
+        self.assertEqual({"type": "input_text", "text": '{"status":"captured"}'}, output[0])
+        self.assertEqual("input_image", output[1]["type"])
+        self.assertEqual("low", output[1]["detail"])
+        self.assertTrue(output[1]["image_url"].startswith("data:image/jpeg;base64,"))
 
 
 if __name__ == "__main__":

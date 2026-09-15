@@ -126,9 +126,15 @@ class ResidentRuntime:
                 results = []
                 for call in turn.tool_calls:
                     self._emit("tool.called", {"call_id": call.id, "name": call.name, "arguments": call.arguments})
-                    output = await registry.execute(call.name, call.arguments)
-                    results.append(ToolResult(call.id, output))
-                    self._emit("tool.completed", {"call_id": call.id, "name": call.name, "result": output})
+                    execution = await registry.execute(call.name, call.arguments)
+                    results.append(ToolResult(call.id, execution.output, execution.attachments))
+                    completion = {"call_id": call.id, "name": call.name, "result": execution.output}
+                    if execution.attachments:
+                        completion["attachments"] = [{
+                            "type": "image", "mime_type": attachment.mime_type,
+                            "byte_count": len(attachment.data), "ephemeral": True,
+                        } for attachment in execution.attachments]
+                    self._emit("tool.completed", completion)
                 previous_id = turn.response_id
                 if not previous_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")

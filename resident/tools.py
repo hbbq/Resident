@@ -6,14 +6,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable, Sequence
 
 from .capabilities import Capability
-from .domain import ToolSpec
+from .domain import ToolOutput, ToolSpec
 from .store import Store
 
 
 @dataclass(frozen=True)
 class Tool:
     spec: ToolSpec
-    handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]] | dict[str, Any]]
+    handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | ToolOutput] | dict[str, Any] | ToolOutput]
 
 
 def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[str, Any]:
@@ -55,20 +55,22 @@ class ToolRegistry:
     def specs(self) -> list[ToolSpec]:
         return [tool.spec for tool in self.tools.values()]
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def execute(self, name: str, arguments: dict[str, Any]) -> ToolOutput:
         tool = self.tools.get(name)
         if tool is None:
-            return {"ok": False, "error": f"Unknown or unavailable tool: {name}"}
+            return ToolOutput({"ok": False, "error": f"Unknown or unavailable tool: {name}"})
         error = self._validate(tool.spec.input_schema, arguments)
         if error:
-            return {"ok": False, "error": error}
+            return ToolOutput({"ok": False, "error": error})
         try:
             result = tool.handler(arguments)
             if inspect.isawaitable(result):
                 result = await result
-            return {"ok": True, **result}
+            if isinstance(result, ToolOutput):
+                return ToolOutput({"ok": True, **result.output}, result.attachments)
+            return ToolOutput({"ok": True, **result})
         except Exception as exc:
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            return ToolOutput({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @staticmethod
     def _validate(schema: dict[str, Any], arguments: Any) -> str | None:

@@ -162,6 +162,11 @@ Resident must not depend on a specific AI model or provider.
 
 Intelligence is a runtime capability; identity and continuity belong to Resident.
 
+Capability results may include narrowly typed, ephemeral content such as an image in addition to safe structured
+metadata. Providers translate that content into their own model-input representation. Ephemeral content is available
+only to the active model continuation: it is not written to the journal or another Resident store, which records only
+safe result and attachment metadata.
+
 A future implementation may use local models, cloud models, several capability/cost tiers, or escalation between them. The exact policy is deliberately unspecified for now.
 
 Model calls should eventually be observable enough to measure workload, latency, token usage, and cost. This will allow model choices to be based on actual Resident workloads rather than guesses made before the system exists.

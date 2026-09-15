@@ -31,6 +31,20 @@ class ToolCall:
 class ToolResult:
     call_id: str
     output: dict[str, Any]
+    attachments: tuple[ImageAttachment, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImageAttachment:
+    data: bytes = field(repr=False)
+    mime_type: str = "image/jpeg"
+    detail: str = "auto"
+
+
+@dataclass(frozen=True)
+class ToolOutput:
+    output: dict[str, Any]
+    attachments: tuple[ImageAttachment, ...] = ()
 
 
 @dataclass(frozen=True)
