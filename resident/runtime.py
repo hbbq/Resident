@@ -132,6 +132,9 @@ class ResidentRuntime:
             tuple(capability for capability in self._capabilities if capability.name not in removed))
 
     async def enqueue_startup_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
+        for message in self.store.pending_owner_messages():
+            await queue.put(self._owner_message_wake(
+                message["id"], message["content"], message["created_at"]))
         if self._pending_capability_event is not None:
             await queue.put(self._pending_capability_event)
             self._pending_capability_event = None
@@ -140,16 +143,22 @@ class ResidentRuntime:
         self.store.close()
 
     def owner_message_event(self, content: str) -> WakeEvent:
-        message_id = self.store.add_message("inbound", self.owner.id, content)
-        return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", utc_now(),
+        message_id = self.store.ingest_owner_message(self.owner.id, content)
+        return self._owner_message_wake(message_id, content)
+
+    @staticmethod
+    def _owner_message_wake(message_id: str, content: str,
+                            occurred_at: str | None = None) -> WakeEvent:
+        return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", occurred_at or utc_now(),
                          {"message_id": message_id, "content": content})
 
-    def telegram_owner_message_event(self, update_id: int, content: str) -> WakeEvent | None:
-        message_id = self.store.ingest_telegram_owner_message(update_id, self.owner.id, content)
+    def telegram_owner_message_event(self, bot_identity: str, update_id: int,
+                                     content: str) -> WakeEvent | None:
+        message_id = self.store.ingest_telegram_owner_message(
+            bot_identity, update_id, self.owner.id, content)
         if message_id is None:
             return None
-        return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", utc_now(),
-                         {"message_id": message_id, "content": content})
+        return self._owner_message_wake(message_id, content)
 
     def _emit(self, event_type: str, data: dict) -> None:
         self.store.journal(event_type, data, self._active_run_id)
@@ -280,7 +289,12 @@ class ResidentRuntime:
                 "status": status, "duration_seconds": duration, "model_calls": calls,
             })
             schedule_id = event.payload.get("schedule_id") if event.source == "scheduler" else None
-            self.store.finish_run(run_id, status, duration, calls, schedule_id)
+            owner_message_id = (
+                event.payload.get("message_id")
+                if event.source == "owner" and event.reason == "owner_message" else None
+            )
+            self.store.finish_run(
+                run_id, status, duration, calls, schedule_id, owner_message_id)
             self._active_run_id, self._active_event = None, None
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:

@@ -71,9 +71,10 @@ def main() -> int:
     )
     if telegram is not None:
         telegram.bind_owner_message(runtime.telegram_owner_message_event)
+        offset_scope = telegram.offset_checkpoint_scope
         telegram.bind_offset_checkpoint(
-            lambda: runtime.store.observed_snapshot("telegram.update_offset"),
-            lambda offset: runtime.store.save_observed_snapshot("telegram.update_offset", offset),
+            lambda: runtime.store.observed_snapshot(offset_scope),
+            lambda offset: runtime.store.save_observed_snapshot(offset_scope, offset),
         )
     try:
         asyncio.run(runtime.run_interactive())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -24,6 +25,7 @@ class TelegramTransport:
                  load_offset: Callable[[], int | None] | None = None,
                  save_offset: Callable[[int], None] | None = None):
         self._bot_token = bot_token
+        self._bot_identity = hashlib.sha256(bot_token.encode("utf-8")).hexdigest()
         self._owner_user_id = owner_user_id
         self._owner_chat_id = owner_chat_id
         self.poll_seconds = poll_seconds
@@ -31,12 +33,16 @@ class TelegramTransport:
         self.diagnostic_output = diagnostic_output or (lambda _: None)
         self._load_offset = load_offset or (lambda: None)
         self._save_offset = save_offset or (lambda _: None)
-        self._owner_message_event: Callable[[int, str], WakeEvent | None] | None = None
+        self._owner_message_event: Callable[[str, int, str], WakeEvent | None] | None = None
 
     def __repr__(self) -> str:
         return "TelegramTransport(configured=True)"
 
-    def bind_owner_message(self, factory: Callable[[int, str], WakeEvent | None]) -> None:
+    @property
+    def offset_checkpoint_scope(self) -> str:
+        return f"telegram.bot.{self._bot_identity}.update_offset"
+
+    def bind_owner_message(self, factory: Callable[[str, int, str], WakeEvent | None]) -> None:
         self._owner_message_event = factory
 
     def bind_offset_checkpoint(self, load: Callable[[], int | None], save: Callable[[int], None]) -> None:
@@ -104,7 +110,7 @@ class TelegramTransport:
                 if authorized:
                     if self._owner_message_event is None:
                         raise RuntimeError("Telegram Owner message handler is not bound")
-                    event = self._owner_message_event(update["update_id"], text)
+                    event = self._owner_message_event(self._bot_identity, update["update_id"], text)
             offset = update["update_id"] + 1
             self._save_offset(offset)
             if event is not None:

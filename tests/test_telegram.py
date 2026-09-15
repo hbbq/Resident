@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from resident.config import Config
+from resident.domain import ModelTurn
 from resident.runtime import ResidentRuntime
+from resident.store import Store
 from resident.telegram import TelegramTransport, TelegramTransportError
 
 
 class FakeTelegramTransport(TelegramTransport):
-    def __init__(self, responses=()):
-        super().__init__("secret-token", 101, 202)
+    def __init__(self, responses=(), *, bot_token="secret-token"):
+        super().__init__(bot_token, 101, 202)
         self.responses = iter(responses)
         self.requests = []
 
@@ -159,6 +162,128 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT count(*) FROM messages WHERE direction='inbound'").fetchone()[0])
             second_runtime.close()
 
+    async def test_restart_after_ack_before_processing_recreates_owner_wake(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Config(Path(temporary))
+            first_runtime = ResidentRuntime(
+                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            transport = FakeTelegramTransport([{"ok": True, "result": [{
+                "update_id": 7,
+                "message": {"chat": {"id": 202, "type": "private"},
+                            "from": {"id": 101}, "text": "recover after ack"},
+            }]}])
+            offsets = []
+            transport.bind_owner_message(first_runtime.telegram_owner_message_event)
+            transport.bind_offset_checkpoint(lambda: None, offsets.append)
+
+            await transport.poll_once(asyncio.Queue(), None)
+            self.assertEqual([8], offsets)
+            first_runtime.close()
+
+            restarted = ResidentRuntime(
+                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            queue = asyncio.Queue()
+            await restarted.enqueue_startup_wakeups(queue)
+
+            event = queue.get_nowait()
+            self.assertEqual(("owner", "owner_message"), (event.source, event.reason))
+            self.assertEqual("recover after ack", event.payload["content"])
+            self.assertNotIn("update_id", event.payload)
+            restarted.close()
+
+    async def test_successful_owner_wake_is_not_recreated_after_restart(self):
+        class CompleteProvider:
+            async def respond(self, *_):
+                return ModelTurn("done")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Config(Path(temporary))
+            runtime = ResidentRuntime(
+                config, CompleteProvider(), owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            await runtime.process(runtime.owner_message_event("completed"))
+            runtime.close()
+
+            restarted = ResidentRuntime(
+                config, CompleteProvider(), owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            queue = asyncio.Queue()
+            await restarted.enqueue_startup_wakeups(queue)
+
+            self.assertTrue(queue.empty())
+            restarted.close()
+
+    async def test_failed_owner_wake_is_recoverable_after_restart(self):
+        class FailingProvider:
+            async def respond(self, *_):
+                raise RuntimeError("interrupted")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Config(Path(temporary))
+            runtime = ResidentRuntime(
+                config, FailingProvider(), owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            event = runtime.owner_message_event("try again")
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                await runtime.process(event)
+            runtime.close()
+
+            restarted = ResidentRuntime(
+                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            queue = asyncio.Queue()
+            await restarted.enqueue_startup_wakeups(queue)
+
+            recovered = queue.get_nowait()
+            self.assertEqual(event.payload["message_id"], recovered.payload["message_id"])
+            self.assertEqual("try again", recovered.payload["content"])
+            restarted.close()
+
+    async def test_interrupted_owner_wake_is_recoverable_after_restart(self):
+        class InterruptedProvider:
+            async def respond(self, *_):
+                raise asyncio.CancelledError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Config(Path(temporary))
+            runtime = ResidentRuntime(
+                config, InterruptedProvider(), owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            event = runtime.owner_message_event("resume me")
+            with self.assertRaises(asyncio.CancelledError):
+                await runtime.process(event)
+            runtime.close()
+
+            restarted = ResidentRuntime(
+                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            queue = asyncio.Queue()
+            await restarted.enqueue_startup_wakeups(queue)
+            self.assertEqual("resume me", queue.get_nowait().payload["content"])
+            restarted.close()
+
+    async def test_same_update_id_from_different_bots_is_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), object(), owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            update = {"ok": True, "result": [{
+                "update_id": 7,
+                "message": {"chat": {"id": 202, "type": "private"},
+                            "from": {"id": 101}, "text": "bot message"},
+            }]}
+            first = FakeTelegramTransport([update])
+            second = FakeTelegramTransport([update], bot_token="different-secret-token")
+            first.bind_owner_message(runtime.telegram_owner_message_event)
+            second.bind_owner_message(runtime.telegram_owner_message_event)
+            queue = asyncio.Queue()
+
+            await first.poll_once(queue, None)
+            await second.poll_once(queue, None)
+
+            self.assertEqual(2, queue.qsize())
+            self.assertEqual(2, runtime.store.connection.execute(
+                "SELECT count(*) FROM messages WHERE direction='inbound'").fetchone()[0])
+            runtime.close()
+
     async def test_unauthorized_group_and_sender_updates_are_discarded_and_acked(self):
         updates = [
             {"update_id": 1, "message": {"chat": {"id": 202, "type": "group"},
@@ -200,6 +325,55 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(TelegramTransportError, "webhook is configured"):
             await transport._check_webhook()
+
+    def test_bot_scoped_offsets_are_independent_and_secret_safe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            first = TelegramTransport("123:first-super-secret", 101, 202)
+            second = TelegramTransport("456:second-super-secret", 101, 202)
+
+            self.assertNotEqual(first.offset_checkpoint_scope, second.offset_checkpoint_scope)
+            store.save_observed_snapshot(first.offset_checkpoint_scope, 8)
+            store.save_observed_snapshot(second.offset_checkpoint_scope, 42)
+
+            self.assertEqual(8, store.observed_snapshot(first.offset_checkpoint_scope))
+            self.assertEqual(42, store.observed_snapshot(second.offset_checkpoint_scope))
+            dump = "\n".join(store.connection.iterdump())
+            self.assertNotIn("first-super-secret", dump)
+            self.assertNotIn("second-super-secret", dump)
+            self.assertNotIn("123:first-super-secret", first.offset_checkpoint_scope)
+            self.assertNotIn("456:second-super-secret", second.offset_checkpoint_scope)
+            store.close()
+
+    def test_legacy_global_update_mapping_migrates_without_cross_bot_collision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript("""
+                CREATE TABLE schema_version(version INTEGER NOT NULL);
+                INSERT INTO schema_version VALUES(4);
+                CREATE TABLE messages(
+                  id TEXT PRIMARY KEY, direction TEXT NOT NULL,
+                  sender_id TEXT NOT NULL, content TEXT NOT NULL,
+                  spontaneous INTEGER NOT NULL DEFAULT 0,
+                  delivery_status TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE telegram_owner_updates(
+                  update_id INTEGER PRIMARY KEY,
+                  message_id TEXT NOT NULL UNIQUE REFERENCES messages(id));
+                INSERT INTO messages VALUES(
+                  'old-message','inbound','owner','old',0,'delivered','2026-01-01T00:00:00+00:00');
+                INSERT INTO telegram_owner_updates VALUES(7,'old-message');
+            """)
+            connection.close()
+
+            store = Store(path)
+            new_message = store.ingest_telegram_owner_message(
+                "new-bot-identity", 7, "owner", "new")
+
+            self.assertIsNotNone(new_message)
+            self.assertEqual(2, store.connection.execute(
+                "SELECT count(*) FROM telegram_owner_updates WHERE update_id=7").fetchone()[0])
+            store.close()
 
 
 class TelegramRuntimeTests(unittest.IsolatedAsyncioTestCase):
