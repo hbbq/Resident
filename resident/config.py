@@ -28,6 +28,9 @@ class Config:
     spontaneous_message_limit: int = 3
     spontaneous_message_window_seconds: int = 3600
     scheduler_poll_seconds: float = 1.0
+    homeops_url: str | None = None
+    homeops_poll_seconds: float = 30.0
+    homeops_request_timeout_seconds: float = 10.0
 
     @classmethod
     def from_env_and_args(cls, argv: list[str] | None = None) -> "Config":
@@ -42,6 +45,11 @@ class Config:
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_LIMIT", "3")))
         parser.add_argument("--spontaneous-message-window-seconds", type=int,
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_WINDOW_SECONDS", "3600")))
+        parser.add_argument("--homeops-url", default=os.getenv("RESIDENT_HOMEOPS_URL"))
+        parser.add_argument("--homeops-poll-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_HOMEOPS_POLL_SECONDS", "30")))
+        parser.add_argument("--homeops-request-timeout-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS", "10")))
         args = parser.parse_args(argv)
         return cls(
             data_dir=Path(args.data_dir).expanduser(), resident_name=args.resident_name,
@@ -50,4 +58,7 @@ class Config:
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
             spontaneous_message_limit=max(0, args.spontaneous_message_limit),
             spontaneous_message_window_seconds=max(1, args.spontaneous_message_window_seconds),
+            homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,
+            homeops_poll_seconds=max(0.1, args.homeops_poll_seconds),
+            homeops_request_timeout_seconds=max(0.1, args.homeops_request_timeout_seconds),
         )
