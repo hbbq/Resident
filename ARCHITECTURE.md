@@ -96,7 +96,25 @@ Pending questions to the owner have similar asynchronous characteristics, but th
 
 An emergent system must be inspectable enough to understand what happened when its behavior is surprising.
 
-The runtime/journal should make it possible to reconstruct the externally relevant lifecycle of a wakeup, including approximately:
+### Wake runs
+
+A `WakeRun` is the observable unit of Resident activity from one wakeup until Resident returns to sleep or the run otherwise terminates.
+
+Each run should have a persistent identity and initially record at least:
+
+```text
+id
+started_at
+finished_at
+wake_reason
+wake_source
+status
+duration
+```
+
+Metrics should be extensible. v0 only needs to require elapsed runtime, but future model-provider information may add metrics such as model-call count, input/output tokens, cost, latency, or other useful usage measurements.
+
+The runtime/journal should make it possible to reconstruct the externally relevant lifecycle of a wake run, including approximately:
 
 ```text
 wake event
@@ -108,7 +126,22 @@ wake event
 → sleep
 ```
 
-Observability should capture inputs, outputs, events, tool interactions, and state transitions needed for debugging and analysis. It does not require storing or exposing a model's private/internal reasoning process.
+### Structured observable events
+
+Runtime activity should be emitted as structured observable events. Interactive console output, persistent journal storage, and future observability interfaces should consume the same event stream rather than implement separate views of Resident activity.
+
+Conceptually:
+
+```text
+Runtime event
+    ├── Console observer
+    ├── Journal observer
+    └── future observers (web UI, metrics, etc.)
+```
+
+When Resident is run interactively in a terminal, the console observer should make its activity visible as it happens. Useful output includes wake reason, context assembly, observable Resident decisions/rationale, capability/tool calls and results, memory/intention changes, communication, sleep, and run metrics.
+
+The goal is to provide a useful window into Resident's behavior during development and experimentation. This does not require storing or exposing a model's private/internal chain-of-thought. Observable decisions, rationale supplied for actions, model outputs, tool interactions, and state changes are sufficient for debugging and analysis.
 
 ## Models
 
@@ -242,6 +275,34 @@ Owner identity and authority are explicit system concepts.
 Normal owner instructions outrank Resident's autonomous goals. A future explicit `sudo`/override marker can communicate that an instruction must not be treated as a suggestion or balanced against Resident's own priorities.
 
 Deterministic safety and system constraints remain above both Resident and owner instructions. Physical connectors should enforce hard boundaries that the reasoning model cannot override.
+
+## Technology and deployment
+
+The initial implementation should use Python 3.12+ as a lightweight asynchronous application, with SQLite for persistent state.
+
+The core should avoid adopting an agent framework. Resident is itself an experiment in agent runtime, memory, context, capabilities, and behavior; framework assumptions about those concepts should not define the architecture prematurely. Small conventional libraries may be used where they solve ordinary infrastructure problems.
+
+Resident should be runnable directly as a normal process, conceptually:
+
+```text
+python -m resident
+```
+
+Containerization should be supported without being required. The same application should be able to run interactively on an ordinary always-on computer and, where practical, in a Linux container on common architectures such as amd64 or arm64. Raspberry Pi deployment is a possible target but is not a v0 constraint.
+
+Persistent Resident state must live outside process/container lifetime. Replacing or restarting the process/container must not create a new Resident. A persistent data location may contain the SQLite database, attachments, and other durable state introduced later.
+
+A core continuity test for the initial implementation is therefore:
+
+```text
+start Resident
+→ wake and create persistent state
+→ stop/restart process
+→ wake again
+→ same Resident, with prior persistent state available
+```
+
+OS- or CPU-specific dependencies should be avoided where reasonably practical, but portability should not be allowed to complicate the initial experiment unnecessarily.
 
 ## Evolution principle
 
