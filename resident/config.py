@@ -33,7 +33,7 @@ class Config:
     context_memories: int = 8
     context_messages: int = 8
     spontaneous_message_limit: int = 3
-    spontaneous_message_window_seconds: int = 900
+    spontaneous_message_window_seconds: int = 180
     scheduler_poll_seconds: float = 1.0
     homeops_url: str | None = None
     homeops_poll_seconds: float = 30.0
