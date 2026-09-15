@@ -73,7 +73,7 @@ class ResidentRuntime:
         run_id = self.store.start_run(event)
         self._active_run_id, self._active_event = run_id, event
         calls = 0
-        status = "completed"
+        status = "failed"
         try:
             self._emit("wake.started", {
                 "event_id": event.id, "source": event.source, "reason": event.reason,
@@ -113,9 +113,12 @@ class ResidentRuntime:
                 if not previous_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")
             self._emit("wake.sleeping", {"status": "completed"})
+            status = "completed"
             return run_id
+        except asyncio.CancelledError as exc:
+            self._emit("wake.failed", {"error_type": type(exc).__name__, "error": str(exc)})
+            raise
         except Exception as exc:
-            status = "failed"
             self._emit("wake.failed", {"error_type": type(exc).__name__, "error": str(exc)})
             raise
         finally:
@@ -129,7 +132,7 @@ class ResidentRuntime:
                 if status == "completed":
                     self.store.complete_schedule(schedule_id)
                 else:
-                    self.store.release_schedule(schedule_id)
+                    self.store.fail_schedule(schedule_id)
             self._active_run_id, self._active_event = None, None
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -136,6 +137,34 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_existing_schedule_table_is_migrated_to_support_failed_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript("""
+                CREATE TABLE schema_version(version INTEGER NOT NULL);
+                INSERT INTO schema_version VALUES(1);
+                CREATE TABLE scheduled_wakeups(
+                  id TEXT PRIMARY KEY, due_at TEXT NOT NULL, reason TEXT NOT NULL,
+                  context_json TEXT NOT NULL,
+                  status TEXT NOT NULL CHECK(status IN ('pending','claimed','completed')),
+                  created_at TEXT NOT NULL);
+            """)
+            connection.execute(
+                "INSERT INTO scheduled_wakeups VALUES(?,?,?,?,?,?)",
+                ("schedule", utc_now(), "migrate", "{}", "pending", utc_now()))
+            connection.commit()
+            connection.close()
+
+            store = Store(path)
+            self.assertEqual(2, store.connection.execute(
+                "SELECT version FROM schema_version").fetchone()[0])
+            self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
+            store.fail_schedule("schedule")
+            self.assertEqual("failed", store.connection.execute(
+                "SELECT status FROM scheduled_wakeups WHERE id='schedule'").fetchone()[0])
+            store.close()
+
     def test_claimed_schedule_is_recovered_when_store_reopens(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "resident.sqlite3"

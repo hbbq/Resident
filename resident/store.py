@@ -29,7 +29,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -51,11 +51,32 @@ class Store:
           event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, data_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS scheduled_wakeups(
           id TEXT PRIMARY KEY, due_at TEXT NOT NULL, reason TEXT NOT NULL, context_json TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('pending','claimed','completed')), created_at TEXT NOT NULL);
+          status TEXT NOT NULL CHECK(status IN ('pending','claimed','completed','failed')), created_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
         """)
+        table_sql = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='scheduled_wakeups'"
+        ).fetchone()[0]
+        if "'failed'" not in table_sql:
+            with self.connection:
+                self.connection.execute("DROP INDEX IF EXISTS idx_schedules_due")
+                self.connection.execute("ALTER TABLE scheduled_wakeups RENAME TO scheduled_wakeups_v1")
+                self.connection.execute("""
+                    CREATE TABLE scheduled_wakeups(
+                      id TEXT PRIMARY KEY, due_at TEXT NOT NULL, reason TEXT NOT NULL,
+                      context_json TEXT NOT NULL, status TEXT NOT NULL
+                      CHECK(status IN ('pending','claimed','completed','failed')), created_at TEXT NOT NULL)
+                """)
+                self.connection.execute("""
+                    INSERT INTO scheduled_wakeups(id,due_at,reason,context_json,status,created_at)
+                    SELECT id,due_at,reason,context_json,status,created_at FROM scheduled_wakeups_v1
+                """)
+                self.connection.execute("DROP TABLE scheduled_wakeups_v1")
+                self.connection.execute(
+                    "CREATE INDEX idx_schedules_due ON scheduled_wakeups(status, due_at)")
+        self.connection.execute("UPDATE schema_version SET version=2")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -189,9 +210,10 @@ class Store:
 
     def complete_schedule(self, schedule_id: str) -> None:
         with self.connection:
-            self.connection.execute("UPDATE scheduled_wakeups SET status='completed' WHERE id=?", (schedule_id,))
+            self.connection.execute(
+                "UPDATE scheduled_wakeups SET status='completed' WHERE id=? AND status='claimed'", (schedule_id,))
 
-    def release_schedule(self, schedule_id: str) -> None:
+    def fail_schedule(self, schedule_id: str) -> None:
         with self.connection:
             self.connection.execute(
-                "UPDATE scheduled_wakeups SET status='pending' WHERE id=? AND status='claimed'", (schedule_id,))
+                "UPDATE scheduled_wakeups SET status='failed' WHERE id=? AND status='claimed'", (schedule_id,))
