@@ -64,11 +64,11 @@ It should always contain enough information for Resident to understand the curre
 - the complete relevant `WakeEvent`, including its reason/source and associated payload or attachments;
 - capabilities currently available to Resident.
 
-The context builder may additionally include relevant pending intentions, retrieved memories, and a small amount of recent runtime/journal context when useful.
+The context builder may additionally include relevant pending intentions, retrieved memories, recent/relevant communication, and a small amount of recent runtime/journal context when useful.
 
-It must not automatically include the entire memory store or journal. Memory retrieval should initially be simple and driven by the wake event/context; the retrieval strategy can evolve after observing real behavior. Resident must also be able to explicitly retrieve additional memories during a wakeup when the initial context is insufficient.
+It must not automatically include the entire memory store, communication history, or journal. Memory retrieval should initially be simple and driven by the wake event/context; the retrieval strategy can evolve after observing real behavior. Resident must also be able to explicitly retrieve additional memories during a wakeup when the initial context is insufficient.
 
-Similarly, the journal may later be exposed through a search/read capability so Resident can investigate its own history without automatically receiving that history in every model context.
+Similarly, the journal and communication history may later be exposed through search/read capabilities so Resident can investigate its own history without automatically receiving that history in every model context.
 
 Pending intentions can initially be included generously while their number is small. More selective retrieval should only be introduced when there is evidence that it is needed.
 
@@ -90,7 +90,7 @@ When the robot becomes available, inspect behind the sofa.
 
 The initial representation should be deliberately small, conceptually containing an id, free-form content, creation time, and status. It must not grow into a conventional planner/task-management system unless actual Resident behavior demonstrates a need for one.
 
-Pending questions to the owner have similar asynchronous characteristics, but their exact relationship to intentions and communication state can be decided during implementation.
+Communication does not introduce a separate `PendingQuestion` system concept. If Resident wants to remember that it is waiting for information from its owner, it may use an ordinary pending intention or memory. Runtime does not need to decide which messages are questions or which later messages are answers.
 
 ## Observability
 
@@ -140,6 +140,8 @@ Runtime event
 ```
 
 When Resident is run interactively in a terminal, the console observer should make its activity visible as it happens. Useful output includes wake reason, context assembly, observable Resident decisions/rationale, capability/tool calls and results, memory/intention changes, communication, sleep, and run metrics.
+
+Messages that Resident intentionally sends to its owner are communication, not merely diagnostic output. The terminal transport must therefore render them in a clearly distinguishable format so they cannot easily be confused with runtime logs, model diagnostics, or tool output. The exact visual style is an implementation detail, but the distinction should be obvious at a glance.
 
 The goal is to provide a useful window into Resident's behavior during development and experimentation. This does not require storing or exposing a model's private/internal chain-of-thought. Observable decisions, rationale supplied for actions, model outputs, tool interactions, and state changes are sufficient for debugging and analysis.
 
@@ -256,15 +258,25 @@ Resident may begin by storing ordinary memories such as relationships, observati
 
 Communication should be transport-independent and asynchronous.
 
-Conceptually, a message may contain text and/or attachments such as images and audio. v0 does not need to implement every modality, but the interface should not unnecessarily assume text-only communication.
+The runtime treats communication as messages between Resident and its owner, not as a built-in question/answer protocol. A message may be a question, answer, instruction, observation, correction, small talk, or something else; interpreting its meaning and relationship to previous communication belongs to Resident.
 
-Incoming owner messages wake Resident. Outgoing questions can remain pending indefinitely; a response may arrive immediately, much later, or not at all.
+Conceptually, a persisted message needs only general communication metadata such as an identity, timestamp, direction/sender, content, and optional attachments. The exact schema should remain small until experience demonstrates additional requirements.
+
+Incoming owner messages wake Resident and are delivered as part of the corresponding `WakeEvent`. Relevant/recent communication may also be selected by the context builder. Communication history should be persisted independently of whether Resident chooses to store a message's content in its autobiographical memory.
+
+Outgoing Resident messages are persisted and delivered through the currently configured transport. Resident may send a question and go back to sleep without waiting for an answer. A later owner message is simply another message and wake event; Resident is responsible for understanding whether it answers something earlier.
+
+If Resident considers an unresolved exchange important enough to revisit, it can create a normal memory or pending intention. Runtime should not manufacture a pending-question record on Resident's behalf.
+
+Communication transports are replaceable. v0 may use the interactive terminal for both incoming and outgoing messages; later transports may include a web UI, messaging service, or another mechanism without changing Resident's conceptual communication model.
+
+Conceptually, messages may contain text and/or attachments such as images and audio. v0 may implement text only, but the interface should not unnecessarily make text the permanent assumption.
 
 ### Attention budget
 
-Runtime protects the owner's attention with configurable limits. This is a hard mechanism around communication rather than merely a personality instruction.
+Runtime protects the owner's attention with configurable limits. This is a hard mechanism around outgoing communication rather than merely a personality instruction.
 
-Resident may internally formulate more questions than can be delivered. Questions may wait, be prioritized, become obsolete, be answered by Resident through further investigation, or potentially be combined.
+Resident may internally want to send more messages than can be delivered. Messages may wait, be prioritized, become obsolete, or potentially be combined. The runtime need not understand whether a message is specifically a question in order to enforce an attention budget.
 
 The exact rate limits and urgency scheme remain open. Important/urgent communication may eventually have a separate policy, but the initial design should avoid an elaborate hard-coded priority system.
 
