@@ -53,6 +53,29 @@ Resident decides what observations mean, what is interesting, what it wants to d
 
 > Runtime enables Resident's life; it should not live it on Resident's behalf.
 
+## Wake context
+
+The context supplied at a wakeup is Resident's temporary working context, not a dump of its persistent state.
+
+It should always contain enough information for Resident to understand the current wakeup, including:
+
+- Resident's identity/personality;
+- current time;
+- the complete relevant `WakeEvent`, including its reason/source and associated payload or attachments;
+- capabilities currently available to Resident.
+
+The context builder may additionally include relevant pending intentions, retrieved memories, and a small amount of recent runtime/journal context when useful.
+
+It must not automatically include the entire memory store or journal. Memory retrieval should initially be simple and driven by the wake event/context; the retrieval strategy can evolve after observing real behavior. Resident must also be able to explicitly retrieve additional memories during a wakeup when the initial context is insufficient.
+
+Similarly, the journal may later be exposed through a search/read capability so Resident can investigate its own history without automatically receiving that history in every model context.
+
+Pending intentions can initially be included generously while their number is small. More selective retrieval should only be introduced when there is evidence that it is needed.
+
+A separate persistent `working_state` concept is not required initially; memories and pending intentions should be allowed to demonstrate whether another form of continuity is actually necessary.
+
+> ContextBuilder provides enough context to begin thinking, not everything Resident might possibly need.
+
 ## Pending intentions
 
 Pending intentions are persistent first-class state separate from ordinary memory.
@@ -101,14 +124,27 @@ Model calls should eventually be observable enough to measure workload, latency,
 
 Connectors expose capabilities and observations to Resident and should be independently replaceable and evolvable.
 
-A connector may expose concepts such as:
+### Minimal connector contract
 
-- status and availability;
-- resources;
-- observations/events;
-- actions;
-- capabilities;
-- constraints.
+The v0 connector contract should remain deliberately small. A connector provides:
+
+- an identity and natural-language description sufficient for Resident to understand what the connector represents;
+- current availability/status;
+- a list of self-describing capabilities;
+- a way to emit events into the runtime, which may become `WakeEvent`s.
+
+A capability is the central abstraction in v0. It is conceptually similar to an LLM tool and should provide enough information for Resident to understand and invoke it, such as:
+
+```text
+id / name
+description
+input schema
+result
+```
+
+Capabilities may represent both observation/read operations and actions. v0 does not require separate core abstractions for resources, sensors, devices, actions, or capability hierarchies. Those distinctions can be introduced later if real connectors demonstrate a need for them.
+
+Connector events do not require an exhaustively declared event taxonomy up front. The runtime needs to be able to receive them and preserve enough source-specific information in the resulting wake event for Resident to understand why it woke.
 
 Connectors describe what Resident can observe or do and the constraints on those actions. They should not encode what Resident should want to do.
 
