@@ -4,13 +4,21 @@ This document records architectural principles that have been decided so far. It
 
 ## Core principle
 
-Resident's identity is separate from its models, connectors, embodiments, and communication transports.
+Resident's identity is separate from its models, connectors, embodiments, communication transports, and owner.
+
+The runtime should not assume that there can only ever be one Resident instance or that a Resident's owner must be a human. `Resident` describes the agent/runtime concept; a particular instance has its own persistent identity, personality, state, owner, and human-friendly name by which it can be addressed.
+
+Likewise, `owner` is a role and authority relationship rather than a hard-coded person. An owner has an identity and may have a human-friendly name by which Resident addresses it. The initial Resident instance may be owned by a human, while a future Resident instance embodied as a robot could, for example, have another Resident instance as its owner.
 
 Conceptually:
 
 ```text
-Resident
+Resident instance
 ├── Identity / personality
+│   └── Address name
+├── Owner
+│   ├── Identity
+│   └── Address name
 ├── Runtime
 ├── Persistent memory
 ├── Pending intentions
@@ -59,7 +67,8 @@ The context supplied at a wakeup is Resident's temporary working context, not a 
 
 It should always contain enough information for Resident to understand the current wakeup, including:
 
-- Resident's identity/personality;
+- Resident's identity/personality and address name;
+- its owner's identity and address name;
 - current time;
 - the complete relevant `WakeEvent`, including its reason/source and associated payload or attachments;
 - capabilities currently available to Resident.
@@ -258,7 +267,7 @@ Resident may begin by storing ordinary memories such as relationships, observati
 
 Communication should be transport-independent and asynchronous.
 
-The runtime treats communication as messages between Resident and its owner, not as a built-in question/answer protocol. A message may be a question, answer, instruction, observation, correction, small talk, or something else; interpreting its meaning and relationship to previous communication belongs to Resident.
+The runtime treats communication as messages between a Resident instance and its owner, not as a built-in question/answer protocol. The owner role is not inherently human. A message may be a question, answer, instruction, observation, correction, small talk, or something else; interpreting its meaning and relationship to previous communication belongs to Resident.
 
 Conceptually, a persisted message needs only general communication metadata such as an identity, timestamp, direction/sender, content, and optional attachments. The exact schema should remain small until experience demonstrates additional requirements.
 
@@ -268,7 +277,7 @@ Outgoing Resident messages are persisted and delivered through the currently con
 
 If Resident considers an unresolved exchange important enough to revisit, it can create a normal memory or pending intention. Runtime should not manufacture a pending-question record on Resident's behalf.
 
-Communication transports are replaceable. v0 may use the interactive terminal for both incoming and outgoing messages; later transports may include a web UI, messaging service, or another mechanism without changing Resident's conceptual communication model.
+Communication transports are replaceable. v0 may use the interactive terminal for both incoming and outgoing messages; later transports may include a web UI, messaging service, another Resident instance, or another mechanism without changing Resident's conceptual communication model.
 
 Conceptually, messages may contain text and/or attachments such as images and audio. v0 may implement text only, but the interface should not unnecessarily make text the permanent assumption.
 
@@ -282,11 +291,15 @@ The exact rate limits and urgency scheme remain open. Important/urgent communica
 
 ## Authority and safety
 
-Owner identity and authority are explicit system concepts.
+Owner identity and authority are explicit system concepts. `Owner` is a role, not a synonym for a particular human user.
+
+A Resident instance has an owner identity and an address name for natural communication. The Resident instance likewise has its own persistent identity and address name. These names are presentation/conversation concepts and must not be used as the underlying stable identities.
 
 Normal owner instructions outrank Resident's autonomous goals. A future explicit `sudo`/override marker can communicate that an instruction must not be treated as a suggestion or balanced against Resident's own priorities.
 
 Deterministic safety and system constraints remain above both Resident and owner instructions. Physical connectors should enforce hard boundaries that the reasoning model cannot override.
+
+This deliberately permits future ownership relationships such as one Resident instance owning another without requiring a different agent runtime or authority model.
 
 ## Technology and deployment
 
