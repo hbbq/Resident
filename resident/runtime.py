@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
@@ -13,7 +13,7 @@ from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider
 from .store import Store, utc_now
-from .tools import ToolRegistry
+from .tools import CORE_TOOL_NAMES, ToolRegistry
 
 
 class EventProducer(Protocol):
@@ -24,15 +24,29 @@ class ResidentRuntime:
     _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"communication.failed", "wake.failed"})
 
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
-                 capabilities: list[Capability] | None = None,
+                 capabilities: Sequence[Capability] | None = None,
                  event_producers: list[EventProducer] | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
         self.config, self.provider = config, provider
+        initial_capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
+        self._capabilities = self._validated_capabilities(initial_capabilities)
         self.store = store or Store(config.data_dir / "resident.sqlite3")
         self.resident, self.owner = self.store.provision(
             config.resident_name, config.owner_name, config.personality)
-        self.capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
+        self._event_queue: asyncio.Queue[WakeEvent | None] | None = None
+        self._capability_event_states: dict[
+            str, tuple[tuple[Capability, ...], dict[str, dict]]
+        ] = {}
+        current_snapshot = self._capability_snapshot(self._capabilities)
+        persisted_snapshot = self.store.observed_snapshot("runtime.capabilities")
+        if persisted_snapshot is None:
+            self.store.save_observed_snapshot("runtime.capabilities", current_snapshot)
+            self._observed_capability_snapshot = current_snapshot
+            self._pending_capability_event = None
+        else:
+            self._observed_capability_snapshot = persisted_snapshot
+            self._pending_capability_event = self._record_capability_change(self._capabilities)
         self.event_producers = event_producers or []
         self.owner_output = owner_output or (lambda message: print(f"\n[{self.resident.address_name} -> {self.owner.address_name}] {message}"))
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
@@ -40,6 +54,70 @@ class ResidentRuntime:
             self.store, memory_limit=config.context_memories, message_limit=config.context_messages)
         self._active_run_id: str | None = None
         self._active_event: WakeEvent | None = None
+
+    @property
+    def capabilities(self) -> tuple[Capability, ...]:
+        return self._capabilities
+
+    @staticmethod
+    def _validated_capabilities(capabilities: Sequence[Capability]) -> tuple[Capability, ...]:
+        snapshot = tuple(capabilities)
+        names = [capability.name for capability in snapshot]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate capability name: {', '.join(duplicates)}")
+        reserved = sorted(set(names) & CORE_TOOL_NAMES)
+        if reserved:
+            raise ValueError(f"Capability name conflicts with a core tool: {', '.join(reserved)}")
+        for capability in snapshot:
+            capability.public_descriptor()
+        return snapshot
+
+    @staticmethod
+    def _capability_snapshot(capabilities: Sequence[Capability]) -> dict[str, dict]:
+        return {capability.name: capability.public_descriptor() for capability in capabilities}
+
+    def _record_capability_change(self, capabilities: Sequence[Capability]) -> WakeEvent | None:
+        capability_view = tuple(capabilities)
+        current = self._capability_snapshot(capability_view)
+        previous = self._observed_capability_snapshot
+        if previous == current:
+            return None
+        previous_names, current_names = set(previous), set(current)
+        payload = {
+            "added": sorted(current_names - previous_names),
+            "removed": sorted(previous_names - current_names),
+            "changed": sorted(
+                name for name in previous_names & current_names
+                if previous[name] != current[name]
+            ),
+        }
+        event = WakeEvent(str(uuid.uuid4()), "runtime", "capabilities_changed", utc_now(), payload)
+        self._observed_capability_snapshot = current
+        self._capability_event_states[event.id] = (capability_view, current)
+        return event
+
+    def replace_capabilities(self, capabilities: Sequence[Capability]) -> WakeEvent | None:
+        """Atomically replace visible capabilities and notify a running Resident."""
+        replacement = self._validated_capabilities(capabilities)
+        event = self._record_capability_change(replacement)
+        self._capabilities = replacement
+        if event is not None and self._event_queue is not None:
+            self._event_queue.put_nowait(event)
+        return event
+
+    def register_capabilities(self, capabilities: Sequence[Capability]) -> WakeEvent | None:
+        return self.replace_capabilities((*self._capabilities, *capabilities))
+
+    def unregister_capabilities(self, names: Sequence[str]) -> WakeEvent | None:
+        removed = set(names)
+        return self.replace_capabilities(
+            tuple(capability for capability in self._capabilities if capability.name not in removed))
+
+    async def enqueue_startup_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
+        if self._pending_capability_event is not None:
+            await queue.put(self._pending_capability_event)
+            self._pending_capability_event = None
 
     def close(self) -> None:
         self.store.close()
@@ -106,19 +184,21 @@ class ResidentRuntime:
         calls = 0
         status = "failed"
         continuation_id: str | None = None
+        capability_event_state = self._capability_event_states.get(event.id)
         try:
             self._emit("wake.started", {
                 "event_id": event.id, "source": event.source, "reason": event.reason,
                 "occurred_at": event.occurred_at, "payload": event.payload,
             })
-            context = self.context_builder.build(self.resident, self.owner, event, self.capabilities)
+            capabilities = capability_event_state[0] if capability_event_state else self._capabilities
+            context = self.context_builder.build(self.resident, self.owner, event, capabilities)
             self._emit("context.assembled", {
                 "characters": len(context), "memories": len(self.store.recall(
                     event.reason + " " + str(event.payload), self.config.context_memories)),
                 "pending_intentions": len(self.store.pending_intentions()),
                 "recent_messages": len(self.store.recent_messages(self.config.context_messages)),
             })
-            registry = ToolRegistry(self.store, self.capabilities, self._send_owner_message, self._emit)
+            registry = ToolRegistry(self.store, capabilities, self._send_owner_message, self._emit)
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
@@ -151,6 +231,9 @@ class ResidentRuntime:
                     self._emit("tool.completed", completion)
                 if not continuation_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")
+            if capability_event_state is not None:
+                self.store.save_observed_snapshot("runtime.capabilities", capability_event_state[1])
+                self._capability_event_states.pop(event.id, None)
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
             return run_id
@@ -188,6 +271,8 @@ class ResidentRuntime:
 
     async def run_interactive(self) -> None:
         queue: asyncio.Queue[WakeEvent | None] = asyncio.Queue()
+        self._event_queue = queue
+        await self.enqueue_startup_wakeups(queue)
         stop = asyncio.Event()
         scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
         producers = [asyncio.create_task(producer.run(queue, stop)) for producer in self.event_producers]
@@ -218,6 +303,7 @@ class ResidentRuntime:
                 except Exception:
                     pass
         finally:
+            self._event_queue = None
             stop.set()
             scheduler.cancel()
             terminal.cancel()

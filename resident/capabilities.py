@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
@@ -22,6 +23,19 @@ class Capability:
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(self.name, self.description, self.input_schema)
+
+    def public_descriptor(self) -> dict[str, Any]:
+        """Return the stable, non-executable capability data visible to Resident."""
+        descriptor = {
+            "connector_id": self.connector_id,
+            "connector_description": self.connector_description,
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.input_schema,
+        }
+        # Round-tripping also rejects non-serializable schemas and prevents later
+        # mutation of a schema from changing an already-taken snapshot.
+        return json.loads(json.dumps(descriptor, sort_keys=True, separators=(",", ":")))
 
 
 async def current_time(_: dict[str, Any]) -> dict[str, Any]:

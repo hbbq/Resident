@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import time
+import uuid
 from typing import Awaitable, Callable, Sequence
 
 from .capabilities import Capability
 from .config import CameraConfig
-from .domain import ImageAttachment, ToolOutput
+from .domain import ImageAttachment, ToolOutput, WakeEvent
+from .store import utc_now
 
 
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
@@ -21,10 +23,14 @@ class CameraConnector:
                  rtsp_transport: str = "tcp", ffmpeg_executable: str = "ffmpeg",
                  process_factory: ProcessFactory = asyncio.create_subprocess_exec):
         self._cameras = {camera.id: camera for camera in cameras}
+        if len(self._cameras) != len(cameras):
+            raise ValueError("Duplicate camera id")
         self.timeout_seconds = timeout_seconds
         self.max_width, self.max_height, self.max_bytes = max_width, max_height, max_bytes
         self.rtsp_transport, self.ffmpeg_executable = rtsp_transport, ffmpeg_executable
         self._process_factory = process_factory
+        self._runtime_queue: asyncio.Queue[WakeEvent] | None = None
+        self._pending_events: list[WakeEvent] = []
         self.capabilities = [
             Capability(
                 connector_id="camera", connector_description="Configured read-only cameras",
@@ -43,6 +49,44 @@ class CameraConnector:
                 handler=self.capture_frame,
             ),
         ]
+
+    def replace_cameras(self, cameras: Sequence[CameraConfig]) -> WakeEvent | None:
+        """Replace a refreshable camera source and emit one safe domain wake."""
+        replacement = {camera.id: camera for camera in cameras}
+        if len(replacement) != len(cameras):
+            raise ValueError("Duplicate camera id")
+        previous = self._cameras
+        previous_ids, current_ids = set(previous), set(replacement)
+        changed_ids = sorted(
+            camera_id for camera_id in previous_ids & current_ids
+            if previous[camera_id] != replacement[camera_id]
+        )
+        if previous_ids == current_ids and not changed_ids:
+            return None
+        self._cameras = replacement
+        event = WakeEvent(str(uuid.uuid4()), "camera", "cameras_changed", utc_now(), {
+            "added": [self._safe_metadata(replacement[camera_id])
+                      for camera_id in sorted(current_ids - previous_ids)],
+            "removed": [self._safe_metadata(previous[camera_id])
+                        for camera_id in sorted(previous_ids - current_ids)],
+            "changed": [self._safe_metadata(replacement[camera_id])
+                        for camera_id in changed_ids],
+        })
+        if self._runtime_queue is None:
+            self._pending_events.append(event)
+        else:
+            self._runtime_queue.put_nowait(event)
+        return event
+
+    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
+        self._runtime_queue = queue
+        for event in self._pending_events:
+            queue.put_nowait(event)
+        self._pending_events.clear()
+        try:
+            await stop.wait()
+        finally:
+            self._runtime_queue = None
 
     async def list_cameras(self, _: dict) -> dict:
         return {"cameras": [self._safe_metadata(camera) for camera in self._cameras.values()]}

@@ -160,6 +160,45 @@ class CameraConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("error", result.output["status"])
         self.assertEqual((), result.attachments)
 
+    async def test_refresh_emits_one_safe_batched_camera_change(self):
+        connector, calls = self.connector(FakeProcess(JPEG))
+        queue = asyncio.Queue()
+        stop = asyncio.Event()
+        producer = asyncio.create_task(connector.run(queue, stop))
+        await asyncio.sleep(0)
+        replacement_url = "rtsp://different-secret@camera.test/live"
+
+        event = connector.replace_cameras([
+            CameraConfig("entry", "Renamed", replacement_url, "New description"),
+            CameraConfig("yard", "Yard", "rtsp://yard-secret@camera.test/live"),
+        ])
+
+        self.assertIs(event, queue.get_nowait())
+        self.assertEqual(("camera", "cameras_changed"), (event.source, event.reason))
+        self.assertEqual([{"id": "yard", "name": "Yard"}], event.payload["added"])
+        self.assertEqual([], event.payload["removed"])
+        self.assertEqual([{
+            "id": "entry", "name": "Renamed", "description": "New description",
+        }], event.payload["changed"])
+        self.assertNotIn("rtsp", json.dumps(event.payload))
+        self.assertEqual([], calls)
+        stop.set()
+        await producer
+
+    async def test_camera_refresh_suppresses_noop_and_detects_secret_endpoint_change(self):
+        connector, calls = self.connector(FakeProcess(JPEG))
+        same = CameraConfig("entry", "Entry", SECRET_URL, "Front entry")
+
+        self.assertIsNone(connector.replace_cameras([same]))
+        event = connector.replace_cameras([
+            CameraConfig("entry", "Entry", "rtsp://new-secret@camera.test/live", "Front entry")
+        ])
+
+        self.assertEqual([{"id": "entry", "name": "Entry", "description": "Front entry"}],
+                         event.payload["changed"])
+        self.assertNotIn("new-secret", json.dumps(event.payload))
+        self.assertEqual([], calls)
+
 
 class CameraConfigTests(unittest.TestCase):
     def test_camera_configuration_is_opt_in_and_redacts_repr(self):

@@ -10,6 +10,12 @@ from .domain import ToolOutput, ToolSpec
 from .store import Store
 
 
+CORE_TOOL_NAMES = frozenset({
+    "remember", "recall", "update_memory", "forget", "create_intention",
+    "update_intention", "send_owner_message", "schedule_wakeup",
+})
+
+
 @dataclass(frozen=True)
 class Tool:
     spec: ToolSpec
