@@ -181,7 +181,7 @@ class Store:
 
     def ingest_telegram_owner_message(self, bot_identity: str, update_id: int, sender_id: str,
                                       content: str) -> str | None:
-        """Atomically record a Telegram update and its canonical inbound message."""
+        """Atomically record a Telegram update or recover its pending canonical message."""
         message_id = str(uuid.uuid4())
         with self.connection:
             self.connection.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?)", (
@@ -193,7 +193,16 @@ class Store:
             )
             if claimed.rowcount == 0:
                 self.connection.execute("DELETE FROM messages WHERE id=?", (message_id,))
-                return None
+                pending = self.connection.execute("""
+                    SELECT telegram_owner_updates.message_id
+                    FROM telegram_owner_updates
+                    JOIN owner_message_processing
+                      ON owner_message_processing.message_id=telegram_owner_updates.message_id
+                    WHERE telegram_owner_updates.bot_identity=?
+                      AND telegram_owner_updates.update_id=?
+                      AND owner_message_processing.status='pending'
+                """, (bot_identity, update_id)).fetchone()
+                return None if pending is None else pending["message_id"]
             self.connection.execute(
                 "INSERT INTO owner_message_processing(message_id,status) VALUES(?,'pending')",
                 (message_id,),
