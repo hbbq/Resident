@@ -68,7 +68,8 @@ class OpenAIResponsesProvider:
                         texts.append(part.get("text", ""))
         usage = raw.get("usage") or {}
         if calls and raw.get("id"):
-            self._histories[raw["id"]] = [*history, *raw.get("output", [])]
+            current_input = input_data if isinstance(input_data, list) else history
+            self._histories[raw["id"]] = [*current_input, *raw.get("output", [])]
         return ModelTurn(raw.get("id"), "\n".join(texts) or None, tuple(calls),
                          usage.get("input_tokens"), usage.get("output_tokens"))
 

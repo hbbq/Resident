@@ -415,21 +415,30 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "type": "function_call", "call_id": "capture", "name": "camera_capture_frame",
                 "arguments": '{"camera_id":"entry"}',
             }]},
-            {"id": "response", "status": "completed", "output": []},
+            {"id": "response", "status": "completed", "output": [{
+                "type": "function_call", "call_id": "follow-up", "name": "clock", "arguments": "{}",
+            }]},
+            {"id": "final", "status": "completed", "output": []},
         ))
         provider._post = lambda body: requests.append(body) or next(responses)
 
         first = await provider.respond("context", [], [])
-        await provider.respond("context", [], [ToolResult(
+        second = await provider.respond("context", [], [ToolResult(
             "capture", {"status": "captured"},
             (ImageAttachment(b"\xff\xd8image\xff\xd9", detail="low"),),
         )], first.response_id)
+        await provider.respond("context", [], [ToolResult("follow-up", {"time": "12:00"})], second.response_id)
 
         output = requests[1]["input"][-1]["output"]
         self.assertEqual({"type": "input_text", "text": '{"status":"captured"}'}, output[0])
         self.assertEqual("input_image", output[1]["type"])
         self.assertEqual("low", output[1]["detail"])
         self.assertTrue(output[1]["image_url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual("function_call_output", requests[2]["input"][2]["type"])
+        self.assertEqual("capture", requests[2]["input"][2]["call_id"])
+        self.assertEqual("function_call_output", requests[2]["input"][4]["type"])
+        self.assertEqual("follow-up", requests[2]["input"][4]["call_id"])
+        self.assertEqual(output, requests[2]["input"][2]["output"])
 
 
 if __name__ == "__main__":
