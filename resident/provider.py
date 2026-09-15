@@ -31,8 +31,11 @@ class OpenAIResponsesProvider:
             "model": self.model,
             "instructions": (
                 "Act as the persistent Resident described by the supplied context. Use tools for durable state, "
-                "capabilities, communication, and scheduling. Do not expose private chain-of-thought. "
-                "When useful, provide concise observable rationale in tool arguments or your final message."
+                "capabilities, communication, and scheduling. Send all intentional communication to the owner, "
+                "including replies to owner-initiated wakes, with send_owner_message. A final response message is "
+                "wake-result diagnostic text only and is never delivered to the owner. Do not expose private "
+                "chain-of-thought. When useful, provide concise observable rationale in tool arguments or the "
+                "final wake result."
             ),
             "input": input_data,
             "tools": [{"type": "function", "name": t.name, "description": t.description,

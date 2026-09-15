@@ -21,7 +21,7 @@ class EventProducer(Protocol):
 
 
 class ResidentRuntime:
-    _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"wake.failed"})
+    _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"communication.failed", "wake.failed"})
 
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: list[Capability] | None = None,
@@ -65,12 +65,23 @@ class ResidentRuntime:
             since = (datetime.now(UTC) - timedelta(
                 seconds=self.config.spontaneous_message_window_seconds)).isoformat()
             allowed = self.store.spontaneous_count_since(since) < self.config.spontaneous_message_limit
-        status = "delivered" if allowed else "rejected_attention_budget"
+        status = "pending_delivery" if allowed else "rejected_attention_budget"
         message_id = self.store.add_message(
             "outbound", self.resident.id, content, spontaneous=spontaneous, delivery_status=status)
-        result = {"message_id": message_id, "delivered": allowed, "spontaneous": spontaneous}
+        result = {"message_id": message_id, "delivered": False, "spontaneous": spontaneous}
         if allowed:
-            self.owner_output(content)
+            try:
+                self.owner_output(content)
+            except Exception as exc:
+                self.store.update_message_delivery_status(message_id, "transport_failed")
+                result.update({
+                    "delivered": False,
+                    "reason": f"Owner transport failed: {type(exc).__name__}: {exc}",
+                })
+                self._emit("communication.failed", result)
+                return result
+            self.store.update_message_delivery_status(message_id, "delivered")
+            result["delivered"] = True
             self._emit("communication.delivered", result)
         else:
             result["reason"] = "Spontaneous owner-message attention budget exceeded"
