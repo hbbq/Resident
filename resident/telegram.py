@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .domain import WakeEvent
+from .readiness import ReadinessItem, ReadinessResult
 
 
 class TelegramTransportError(RuntimeError):
@@ -31,6 +32,7 @@ class TelegramTransport:
     """A text-only Telegram Owner transport using Bot API long polling."""
 
     _MAX_TEXT_LENGTH = 4096
+    readiness_items = (ReadinessItem("telegram", "Telegram"),)
 
     def __init__(self, bot_token: str, owner_user_id: int, owner_chat_id: int, *,
                  poll_seconds: float = 30.0, request_timeout_seconds: float = 40.0,
@@ -47,6 +49,7 @@ class TelegramTransport:
         self._load_offset = load_offset or (lambda: None)
         self._save_offset = save_offset or (lambda _: None)
         self._owner_message_event: Callable[[str, int, str], WakeEvent | None] | None = None
+        self._startup_poll = False
 
     def __repr__(self) -> str:
         return "TelegramTransport(configured=True)"
@@ -109,7 +112,7 @@ class TelegramTransport:
 
     async def poll_once(self, queue: asyncio.Queue[WakeEvent], offset: int | None) -> int | None:
         parameters: dict[str, Any] = {
-            "timeout": int(self.poll_seconds),
+            "timeout": 0 if self._startup_poll else int(self.poll_seconds),
             "allowed_updates": json.dumps(["message"]),
         }
         if offset is not None:
@@ -141,11 +144,13 @@ class TelegramTransport:
                 await queue.put(event)
         return offset
 
-    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
+    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,
+                  readiness: asyncio.Queue[ReadinessResult] | None = None) -> None:
         offset = self._load_offset()
         reload_offset = False
         webhook_checked = False
         backoff = 1.0
+        initial = True
         while not stop.is_set():
             try:
                 if reload_offset:
@@ -154,14 +159,21 @@ class TelegramTransport:
                 if not webhook_checked:
                     await self._check_webhook()
                     webhook_checked = True
+                self._startup_poll = initial
                 offset = await self.poll_once(queue, offset)
+                if initial and readiness is not None:
+                    readiness.put_nowait(ReadinessResult("telegram", True))
                 backoff = 1.0
             except asyncio.CancelledError:
                 raise
             except TelegramPermanentTransportError as exc:
+                if initial and readiness is not None:
+                    readiness.put_nowait(ReadinessResult("telegram", False))
                 self.diagnostic_output(f"permanent failure: {exc}")
                 return
             except Exception as exc:
+                if initial and readiness is not None:
+                    readiness.put_nowait(ReadinessResult("telegram", False))
                 self.diagnostic_output(f"poll failed: {type(exc).__name__}: {exc}")
                 reload_offset = True
                 try:
@@ -169,3 +181,6 @@ class TelegramTransport:
                 except TimeoutError:
                     pass
                 backoff = min(backoff * 2, 30.0)
+            finally:
+                self._startup_poll = False
+                initial = False

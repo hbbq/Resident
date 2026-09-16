@@ -11,6 +11,7 @@ from resident.__main__ import TerminalDiagnostics
 from resident.config import Config
 from resident.homeops import HomeOpsConnector
 from resident.runtime import ResidentRuntime
+from resident.readiness import ReadinessItem, ReadinessResult
 
 
 def measurement(point_id: str, value: object, timestamp: str, **extra: object) -> dict:
@@ -112,6 +113,23 @@ class HomeOpsConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("poll failed: RuntimeError: offline", diagnostics)
         self.assertTrue(queue.empty())
 
+    async def test_first_failed_poll_reports_failed_readiness_and_keeps_retrying(self):
+        connector = FakeHomeOpsConnector([
+            RuntimeError("offline"), [measurement("1", 20, "now")],
+        ])
+        connector.poll_seconds = 0.01
+        stop = asyncio.Event()
+        readiness = asyncio.Queue()
+        task = asyncio.create_task(connector.run(asyncio.Queue(), stop, readiness))
+
+        self.assertFalse((await readiness.get()).ok)
+        while connector._snapshot is None:
+            await asyncio.sleep(0)
+        stop.set()
+        await task
+
+        self.assertEqual(2, len(connector.requests))
+
 
 class HomeOpsConfigTests(unittest.TestCase):
     def test_homeops_is_disabled_by_default_and_cli_can_enable_it(self):
@@ -163,6 +181,20 @@ class RecordingProducer:
             self.stopped = True
 
 
+class ReadinessProducer(RecordingProducer):
+    def __init__(self, key, label, result=None):
+        super().__init__()
+        self.readiness_items = (ReadinessItem(key, label),)
+        self.result = result
+
+    async def run(self, queue, stop, readiness):
+        self.started = True
+        if self.result is not None:
+            readiness.put_nowait(ReadinessResult(self.readiness_items[0].key, self.result))
+            await stop.wait()
+        self.stopped = True
+
+
 class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_interactive_runtime_starts_and_stops_event_producers(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -176,6 +208,38 @@ class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(producer.started)
             self.assertTrue(producer.stopped)
+            runtime.close()
+
+    async def test_interactive_runtime_prints_ordered_readiness_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), IdleProvider(), event_producers=[
+                    ReadinessProducer("first", "First", True),
+                    ReadinessProducer("second", "Second", False),
+                ], owner_output=lambda _: None, diagnostic_output=output.append,
+            )
+            with patch("resident.runtime.asyncio.to_thread", AsyncMock(return_value="/quit")):
+                await runtime.run_interactive()
+
+            self.assertEqual("First............... OK", output[0])
+            self.assertEqual("Second.............. FAILED", output[1])
+            self.assertEqual("Startup completed with connector errors.", output[2])
+            self.assertIn("is sleeping", output[3])
+            runtime.close()
+
+    async def test_producer_exit_before_readiness_is_reported_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = []
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), IdleProvider(),
+                event_producers=[ReadinessProducer("early", "Early")],
+                owner_output=lambda _: None, diagnostic_output=output.append,
+            )
+            with patch("resident.runtime.asyncio.to_thread", AsyncMock(return_value="/quit")):
+                await runtime.run_interactive()
+
+            self.assertEqual("Early............... FAILED", output[0])
             runtime.close()
 
 

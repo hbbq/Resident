@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Protocol, Sequence
 
@@ -12,6 +13,7 @@ from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider
+from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, ToolRegistry
 
@@ -315,13 +317,66 @@ class ResidentRuntime:
             except TimeoutError:
                 pass
 
+    async def _collect_startup_readiness(
+            self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,
+    ) -> tuple[list[asyncio.Task[None]], list[tuple[ReadinessItem, ReadinessResult]]]:
+        readiness: asyncio.Queue[ReadinessResult] = asyncio.Queue()
+        ordered: list[ReadinessItem] = []
+        task_items: dict[asyncio.Task[None], tuple[ReadinessItem, ...]] = {}
+        producer_tasks: list[asyncio.Task[None]] = []
+        for producer in self.event_producers:
+            items = tuple(getattr(producer, "readiness_items", ()))
+            ordered.extend(items)
+            if items:
+                task = asyncio.create_task(producer.run(queue, stop, readiness))
+                task_items[task] = items
+            else:
+                task = asyncio.create_task(producer.run(queue, stop))
+            producer_tasks.append(task)
+
+        keys = [item.key for item in ordered]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Duplicate startup readiness key")
+
+        results: dict[str, ReadinessResult] = {}
+        watched = set(task_items)
+        while len(results) < len(ordered):
+            receiver = asyncio.create_task(readiness.get())
+            done, _ = await asyncio.wait(
+                {receiver, *watched}, return_when=asyncio.FIRST_COMPLETED)
+            if receiver in done:
+                result = receiver.result()
+                if result.key in keys and result.key not in results:
+                    results[result.key] = result
+            else:
+                receiver.cancel()
+                with suppress(asyncio.CancelledError):
+                    await receiver
+            for task in done - {receiver}:
+                watched.discard(task)
+                for item in task_items[task]:
+                    results.setdefault(item.key, ReadinessResult(item.key, False))
+
+        return producer_tasks, [(item, results[item.key]) for item in ordered]
+
+    def _render_startup_readiness(
+            self, results: list[tuple[ReadinessItem, ReadinessResult]]) -> None:
+        for item, result in results:
+            status = "OK" if result.ok else "FAILED"
+            detail = f" ({result.detail})" if result.detail else ""
+            self.diagnostic_output(f"{item.label:.<20} {status}{detail}")
+        self.diagnostic_output(
+            "All systems GO" if all(result.ok for _, result in results)
+            else "Startup completed with connector errors.")
+
     async def run_interactive(self) -> None:
         queue: asyncio.Queue[WakeEvent | None] = asyncio.Queue()
         self._event_queue = queue
         await self.enqueue_startup_wakeups(queue)
         stop = asyncio.Event()
         scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
-        producers = [asyncio.create_task(producer.run(queue, stop)) for producer in self.event_producers]
+        producers, readiness = await self._collect_startup_readiness(queue, stop)
+        self._render_startup_readiness(readiness)
 
         async def terminal_input() -> None:
             while not stop.is_set():

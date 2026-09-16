@@ -5,6 +5,7 @@ import json
 import time
 import unittest
 import xml.etree.ElementTree as ET
+from unittest.mock import patch
 
 import httpx
 
@@ -462,6 +463,36 @@ class FakeOnvifClient:
 
 
 class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_readiness_aggregates_partial_subscription_failure(self):
+        class PartialClient(FakeOnvifClient):
+            async def discover(self):
+                if "offline" in self.config.endpoint:
+                    raise TimeoutError("unreachable")
+                return await super().discover()
+
+        cameras = [
+            CameraConfig(
+                camera_id, camera_id.title(), f"rtsp://secret@{camera_id}.test/live", None,
+                OnvifConfig(f"http://{camera_id}.test/onvif", "user", "password"))
+            for camera_id in ("online", "offline")
+        ]
+        connector = CameraConnector(
+            cameras, onvif_client_factory=PartialClient, onvif_retry_seconds=10,
+            ffmpeg_executable="test-ffmpeg")
+        stop, readiness = asyncio.Event(), asyncio.Queue()
+        with patch("resident.camera.shutil.which", return_value="/test/ffmpeg"):
+            task = asyncio.create_task(connector.run(asyncio.Queue(), stop, readiness))
+            camera_result = await readiness.get()
+            onvif_result = await readiness.get()
+            stop.set()
+            await task
+
+        self.assertTrue(camera_result.ok)
+        self.assertEqual("2 cameras", camera_result.detail)
+        self.assertEqual("onvif", onvif_result.key)
+        self.assertFalse(onvif_result.ok)
+        self.assertEqual("1/2 subscriptions", onvif_result.detail)
+
     async def test_property_baseline_duplicates_and_bidirectional_transitions(self):
         stop = asyncio.Event()
 

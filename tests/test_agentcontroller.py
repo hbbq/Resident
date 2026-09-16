@@ -177,6 +177,16 @@ class AgentControllerConnectorTests(unittest.IsolatedAsyncioTestCase):
             diagnostics[0],
         )
 
+    async def test_first_valid_snapshot_reports_ready(self):
+        self.write_snapshot(snapshot(workflow_item(1)))
+        connector = AgentControllerConnector(self.path, poll_seconds=10)
+        stop, readiness = asyncio.Event(), asyncio.Queue()
+        task = asyncio.create_task(connector.run(asyncio.Queue(), stop, readiness))
+
+        self.assertTrue((await readiness.get()).ok)
+        stop.set()
+        await task
+
 
 class AgentControllerConfigTests(unittest.TestCase):
     def test_connector_is_disabled_by_default_and_cli_can_enable_it(self):
