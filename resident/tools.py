@@ -54,7 +54,8 @@ class ToolRegistry:
                         kind={"type": "string", "enum": MEMORY_KINDS},
                         importance={"type": "string", "enum": MEMORY_LEVELS},
                         confidence={"type": "string", "enum": MEMORY_LEVELS},
-                        provenance={"type": "string", "enum": MEMORY_PROVENANCES})), self._update_memory),
+                        provenance={"type": "string", "enum": MEMORY_PROVENANCES}) |
+                {"minProperties": 2}), self._update_memory),
             "forget": Tool(ToolSpec("forget", "Delete a memory by id.",
                 _schema(("id",), id={"type": "string"})), self._forget),
             "create_intention": Tool(ToolSpec("create_intention", "Persist a small pending intention for a future wake.",
@@ -125,6 +126,8 @@ class ToolRegistry:
             return f"Unknown arguments: {', '.join(sorted(unknown))}"
         if missing:
             return f"Missing arguments: {', '.join(sorted(missing))}"
+        if len(arguments) < schema.get("minProperties", 0):
+            return f"At least {schema['minProperties']} arguments are required"
         for key, value in arguments.items():
             allowed = properties[key].get("type")
             allowed = [allowed] if isinstance(allowed, str) else allowed

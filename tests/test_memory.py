@@ -104,12 +104,16 @@ class MemoryToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("hypothesis", memory["kind"])
             self.assertEqual("resident", memory["source"])
 
+            rejected = await registry.execute("update_memory", {"id": memory["id"]})
+            self.assertFalse(rejected.output["ok"])
+            self.assertEqual("At least 2 arguments are required", rejected.output["error"])
+
             updated = await registry.execute("update_memory", {
-                "id": memory["id"], "content": "Transitions are often noisy",
-                "kind": "experience", "confidence": "high",
+                "id": memory["id"], "confidence": "high",
             })
             self.assertTrue(updated.output["updated"])
-            self.assertEqual("experience", updated.output["memory"]["kind"])
+            self.assertEqual("hypothesis", updated.output["memory"]["kind"])
             self.assertEqual("high", updated.output["memory"]["confidence"])
             self.assertEqual("medium", updated.output["memory"]["importance"])
+            self.assertEqual("Transitions may be noisy", updated.output["memory"]["content"])
             store.close()
