@@ -498,12 +498,13 @@ class AttentionBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, store.spontaneous_count_since(boundary))
             store.close()
 
-    def test_direct_config_default_window_differs_from_cli_default(self):
+    def test_direct_config_and_cli_window_defaults_match(self):
         direct = Config(Path("."))
         parsed = Config.from_env_and_args(["--data-dir", "."])
 
         self.assertEqual(180, direct.spontaneous_message_window_seconds)
-        self.assertEqual(3600, parsed.spontaneous_message_window_seconds)
+        self.assertEqual(direct.spontaneous_message_window_seconds,
+                         parsed.spontaneous_message_window_seconds)
 
 
 class StoreTests(unittest.TestCase):

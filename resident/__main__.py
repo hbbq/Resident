@@ -5,6 +5,7 @@ import sys
 
 from .config import Config
 from .capabilities import diagnostic_capabilities
+from .agentcontroller import AgentControllerConnector
 from .camera import CameraConnector
 from .homeops import HomeOpsConnector
 from .provider import OpenAIResponsesProvider
@@ -23,6 +24,10 @@ class TerminalDiagnostics:
     def homeops(self, message: str) -> None:
         if self.verbose:
             print(f"[homeops] {message}")
+
+    def agentcontroller(self, message: str) -> None:
+        if self.verbose:
+            print(f"[agentcontroller] {message}")
 
     def telegram(self, message: str) -> None:
         if self.verbose or message.startswith("permanent failure:"):
@@ -46,6 +51,15 @@ def main() -> int:
         )
         connectors.append(homeops)
         capabilities.extend(homeops.capabilities)
+    agentcontroller = None
+    if config.agentcontroller_snapshot_path is not None:
+        agentcontroller = AgentControllerConnector(
+            config.agentcontroller_snapshot_path,
+            poll_seconds=config.agentcontroller_poll_seconds,
+            diagnostic_output=terminal_diagnostics.agentcontroller,
+        )
+        connectors.append(agentcontroller)
+        capabilities.extend(agentcontroller.capabilities)
     if config.cameras:
         cameras = CameraConnector(
             config.cameras, timeout_seconds=config.camera_capture_timeout_seconds,
@@ -69,6 +83,12 @@ def main() -> int:
         owner_transport=telegram,
         diagnostic_output=terminal_diagnostics.runtime,
     )
+    if agentcontroller is not None:
+        checkpoint_scope = agentcontroller.checkpoint_scope
+        agentcontroller.bind_checkpoint(
+            lambda: runtime.store.observed_snapshot(checkpoint_scope),
+            lambda snapshot: runtime.store.save_observed_snapshot(checkpoint_scope, snapshot),
+        )
     if telegram is not None:
         telegram.bind_owner_message(runtime.telegram_owner_message_event)
         offset_scope = telegram.offset_checkpoint_scope

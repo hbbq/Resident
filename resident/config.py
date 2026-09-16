@@ -80,6 +80,8 @@ class Config:
     homeops_url: str | None = None
     homeops_poll_seconds: float = 30.0
     homeops_request_timeout_seconds: float = 10.0
+    agentcontroller_snapshot_path: Path | None = None
+    agentcontroller_poll_seconds: float = 60.0
     telegram_bot_token: str | None = field(default=None, repr=False)
     telegram_owner_user_id: int | None = field(default=None, repr=False)
     telegram_owner_chat_id: int | None = field(default=None, repr=False)
@@ -114,6 +116,10 @@ class Config:
                             default=float(os.getenv("RESIDENT_HOMEOPS_POLL_SECONDS", "30")))
         parser.add_argument("--homeops-request-timeout-seconds", type=float,
                             default=float(os.getenv("RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS", "10")))
+        parser.add_argument("--agentcontroller-snapshot-path",
+                            default=os.getenv("RESIDENT_AGENTCONTROLLER_SNAPSHOT_PATH"))
+        parser.add_argument("--agentcontroller-poll-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_AGENTCONTROLLER_POLL_SECONDS", "60")))
         parser.add_argument("--telegram-poll-seconds", type=float,
                             default=float(os.getenv("RESIDENT_TELEGRAM_POLL_SECONDS", "30")))
         parser.add_argument("--telegram-request-timeout-seconds", type=float,
@@ -156,6 +162,11 @@ class Config:
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,
             homeops_poll_seconds=max(0.1, args.homeops_poll_seconds),
             homeops_request_timeout_seconds=max(0.1, args.homeops_request_timeout_seconds),
+            agentcontroller_snapshot_path=(
+                Path(args.agentcontroller_snapshot_path).expanduser()
+                if args.agentcontroller_snapshot_path else None
+            ),
+            agentcontroller_poll_seconds=max(0.1, args.agentcontroller_poll_seconds),
             telegram_bot_token=telegram_token,
             telegram_owner_user_id=telegram_user_id,
             telegram_owner_chat_id=telegram_chat_id,
