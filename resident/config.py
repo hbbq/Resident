@@ -38,6 +38,37 @@ class CameraConfig:
     onvif: OnvifConfig | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True)
+class DisplayConfig:
+    id: str
+
+
+def _displays_from_environment() -> tuple[DisplayConfig, ...]:
+    raw = os.getenv("RESIDENT_DISPLAYS", "").strip()
+    if not raw:
+        return ()
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("RESIDENT_DISPLAYS must be valid JSON") from exc
+    if not isinstance(items, list):
+        raise ValueError("RESIDENT_DISPLAYS must be a JSON array")
+    displays: list[DisplayConfig] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"id"}:
+            raise ValueError("Each display must contain only id")
+        display_id = item.get("id")
+        if not isinstance(display_id, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", display_id):
+            raise ValueError("Display id must be 1-64 tool-safe identifier characters")
+        if display_id in seen:
+            raise ValueError(f"Duplicate display id: {display_id}")
+        seen.add(display_id)
+        displays.append(DisplayConfig(display_id))
+    return tuple(displays)
+
+
 def _cameras_from_environment() -> tuple[CameraConfig, ...]:
     raw = os.getenv("RESIDENT_CAMERAS", "").strip()
     if not raw:
@@ -116,6 +147,7 @@ class Config:
     homeops_url: str | None = None
     homeops_poll_seconds: float = 30.0
     homeops_request_timeout_seconds: float = 10.0
+    displays: tuple[DisplayConfig, ...] = ()
     agentcontroller_snapshot_path: Path | None = None
     agentcontroller_poll_seconds: float = 60.0
     telegram_bot_token: str | None = field(default=None, repr=False)
@@ -196,6 +228,9 @@ class Config:
             raise ValueError("Telegram Owner user and chat IDs must be integers") from exc
         if telegram_user_id is not None and (telegram_user_id <= 0 or telegram_chat_id <= 0):
             raise ValueError("Telegram Owner user and private chat IDs must be positive integers")
+        displays = _displays_from_environment()
+        if displays and not args.homeops_url:
+            raise ValueError("RESIDENT_DISPLAYS requires RESIDENT_HOMEOPS_URL or --homeops-url")
         return cls(
             data_dir=Path(args.data_dir).expanduser(), verbose=args.verbose,
             resident_name=args.resident_name,
@@ -207,6 +242,7 @@ class Config:
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,
             homeops_poll_seconds=max(0.1, args.homeops_poll_seconds),
             homeops_request_timeout_seconds=max(0.1, args.homeops_request_timeout_seconds),
+            displays=displays,
             agentcontroller_snapshot_path=(
                 Path(args.agentcontroller_snapshot_path).expanduser()
                 if args.agentcontroller_snapshot_path else None

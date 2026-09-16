@@ -7,6 +7,7 @@ from .config import Config
 from .capabilities import diagnostic_capabilities
 from .agentcontroller import AgentControllerConnector
 from .camera import CameraConnector
+from .display import DisplayConnector
 from .homeops import HomeOpsConnector
 from .provider import OpenAIResponsesProvider
 from .runtime import ResidentRuntime
@@ -55,6 +56,13 @@ def main() -> int:
         )
         connectors.append(homeops)
         capabilities.extend(homeops.capabilities)
+    if config.displays:
+        assert config.homeops_url is not None
+        displays = DisplayConnector(
+            config.homeops_url, config.displays,
+            request_timeout_seconds=config.homeops_request_timeout_seconds,
+        )
+        capabilities.extend(displays.capabilities)
     agentcontroller = None
     if config.agentcontroller_snapshot_path is not None:
         agentcontroller = AgentControllerConnector(

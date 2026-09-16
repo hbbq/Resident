@@ -46,6 +46,17 @@ Set `RESIDENT_HOMEOPS_URL` (or pass `--homeops-url`) to opt into read-only HomeO
 
 Resident can use `homeops_get_current_measurements` and `homeops_get_measurement_history` to investigate. History accepts a measurement `point_id`, optional ISO-8601 `from_time` and `to_time`, and an optional `limit` from 1 to 5,000. Configure polling and HTTP timeout with `--homeops-poll-seconds` / `RESIDENT_HOMEOPS_POLL_SECONDS` and `--homeops-request-timeout-seconds` / `RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS`.
 
+### HomeOps-backed displays
+
+Set `RESIDENT_DISPLAYS` to a JSON array of display IDs to expose action-only text display capabilities. Displays reuse `RESIDENT_HOMEOPS_URL` and its request timeout; no separate display backend URL is configured. For example:
+
+```powershell
+$env:RESIDENT_HOMEOPS_URL = "http://homeops.local"
+$env:RESIDENT_DISPLAYS = '[{"id":"display1"}]'
+```
+
+Each configured display exposes a flat `<id>_show_text` capability, such as `display1_show_text`, which accepts a required `text` string and enqueues it with HomeOps. Display IDs must be unique, 1-64 characters, and contain only letters, digits, underscores, or hyphens. Display output does not poll, emit wakes, retry delivery, or encode any policy about when or what Resident should display. HomeOps queue delivery is in-memory and at-most-once; HTTP and API failures are returned as tool failures.
+
 ## Experimental AgentController connector
 
 Set `RESIDENT_AGENTCONTROLLER_SNAPSHOT_PATH` (or pass `--agentcontroller-snapshot-path`) to AgentController's atomically published `output/dashboard.json` to opt into read-only workflow observation. With no path configured, Resident does not read AgentController data. The connector accepts only schema version 1 and treats AgentController's stable `state` values as authoritative; it does not inspect or derive workflow state from GitHub labels.
