@@ -230,9 +230,10 @@ class ResidentRuntime:
             })
             capabilities = capability_event_state[0] if capability_event_state else self._capabilities
             context = self.context_builder.build(self.resident, self.owner, event, capabilities)
+            context_document = json.loads(context)
             self._emit("context.assembled", {
-                "characters": len(context), "memories": len(self.store.recall(
-                    event.reason + " " + str(event.payload), self.config.context_memories)),
+                "characters": len(context),
+                "memories": len(context_document["retrieved_memories"]),
                 "pending_intentions": len(self.store.pending_intentions()),
                 "recent_messages": len(self.store.recent_messages(self.config.context_messages)),
             })

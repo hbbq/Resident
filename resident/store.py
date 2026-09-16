@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -50,12 +51,21 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 7 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS memories(
-          id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+          id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'unknown'
+            CHECK(kind IN ('fact','preference','rule','hypothesis','experience','unknown')),
+          importance TEXT NOT NULL DEFAULT 'low'
+            CHECK(importance IN ('low','medium','high')),
+          confidence TEXT NOT NULL DEFAULT 'low'
+            CHECK(confidence IN ('low','medium','high')),
+          provenance TEXT NOT NULL DEFAULT 'unknown'
+            CHECK(provenance IN ('owner','resident','connector','unknown')));
         CREATE TABLE IF NOT EXISTS intentions(
           id TEXT PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed','cancelled')),
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -142,7 +152,21 @@ class Store:
                     SELECT 'legacy',update_id,message_id FROM telegram_owner_updates_v1
                 """)
                 self.connection.execute("DROP TABLE telegram_owner_updates_v1")
-        self.connection.execute("UPDATE schema_version SET version=6")
+        memory_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(memories)")
+        }
+        memory_metadata_columns = {
+            "kind": "TEXT NOT NULL DEFAULT 'unknown' CHECK(kind IN ('fact','preference','rule','hypothesis','experience','unknown'))",
+            "importance": "TEXT NOT NULL DEFAULT 'low' CHECK(importance IN ('low','medium','high'))",
+            "confidence": "TEXT NOT NULL DEFAULT 'low' CHECK(confidence IN ('low','medium','high'))",
+            "provenance": "TEXT NOT NULL DEFAULT 'unknown' CHECK(provenance IN ('owner','resident','connector','unknown'))",
+        }
+        with self.connection:
+            for name, declaration in memory_metadata_columns.items():
+                if name not in memory_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE memories ADD COLUMN {name} {declaration}")
+        self.connection.execute("UPDATE schema_version SET version=7")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -284,30 +308,76 @@ class Store:
             "SELECT count(*) FROM messages WHERE direction='outbound' AND spontaneous=1 AND delivery_status='delivered' AND created_at>=?",
             (since,),).fetchone()[0])
 
-    def remember(self, content: str, source: str) -> str:
+    def remember(self, content: str, source: str, *, kind: str = "unknown",
+                 importance: str = "low", confidence: str = "low",
+                 provenance: str = "unknown") -> str:
         item_id, now = str(uuid.uuid4()), utc_now()
         with self.connection:
-            self.connection.execute("INSERT INTO memories VALUES(?,?,?,?,?)", (item_id, content, source, now, now))
+            self.connection.execute("""
+                INSERT INTO memories(
+                  id,content,source,created_at,updated_at,kind,importance,confidence,provenance)
+                VALUES(?,?,?,?,?,?,?,?,?)
+            """, (item_id, content, source, now, now, kind, importance, confidence, provenance))
         return item_id
 
+    def memory(self, item_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT id,content,source,kind,importance,confidence,provenance,created_at,updated_at
+            FROM memories WHERE id=?
+        """, (item_id,)).fetchone()
+        return None if row is None else dict(row)
+
     def recall(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        terms = [t for t in query.lower().split() if len(t) > 2][:8]
+        terms = list(dict.fromkeys(
+            term for term in re.findall(r"\w+", query.lower()) if len(term) > 2
+        ))[:8]
+        importance_rank = "CASE importance WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END"
+        confidence_rank = "CASE confidence WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END"
+        provenance_rank = "CASE provenance WHEN 'owner' THEN 2 WHEN 'resident' THEN 1 WHEN 'connector' THEN 1 ELSE 0 END"
+        kind_rank = "CASE kind WHEN 'preference' THEN 3 WHEN 'rule' THEN 3 WHEN 'fact' THEN 2 WHEN 'experience' THEN 1 ELSE 0 END"
+        columns = "id,content,source,kind,importance,confidence,provenance,created_at,updated_at"
         if terms:
-            clause = " OR ".join("lower(content) LIKE ?" for _ in terms)
-            params: tuple[Any, ...] = (*(f"%{t}%" for t in terms), limit)
+            escaped_terms = [
+                term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                for term in terms
+            ]
+            clause = " OR ".join("lower(content) LIKE ? ESCAPE '\\'" for _ in terms)
+            relevance = " + ".join(
+                "CASE WHEN lower(content) LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
+                for _ in terms
+            )
+            patterns = [f"%{term}%" for term in escaped_terms]
+            params: tuple[Any, ...] = (*patterns, *patterns, limit)
             rows = self.connection.execute(
-                f"SELECT id,content,source,updated_at FROM memories WHERE {clause} ORDER BY updated_at DESC LIMIT ?", params
+                f"""SELECT {columns} FROM memories WHERE {clause}
+                ORDER BY ({relevance}) DESC, {importance_rank} DESC, {confidence_rank} DESC,
+                  {provenance_rank} DESC, {kind_rank} DESC, updated_at DESC, id DESC LIMIT ?""",
+                params,
             ).fetchall()
         else:
             rows = self.connection.execute(
-                "SELECT id,content,source,updated_at FROM memories ORDER BY updated_at DESC LIMIT ?", (limit,)
+                f"""SELECT {columns} FROM memories
+                ORDER BY {importance_rank} DESC, {confidence_rank} DESC, {provenance_rank} DESC,
+                  {kind_rank} DESC, updated_at DESC, id DESC LIMIT ?""", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def update_memory(self, item_id: str, content: str) -> bool:
+    def update_memory(self, item_id: str, *, content: str | None = None,
+                      kind: str | None = None, importance: str | None = None,
+                      confidence: str | None = None, provenance: str | None = None) -> bool:
+        changes = {
+            key: value for key, value in {
+                "content": content, "kind": kind, "importance": importance,
+                "confidence": confidence, "provenance": provenance,
+            }.items() if value is not None
+        }
+        if not changes:
+            raise ValueError("At least one memory field must be supplied")
+        assignments = ",".join(f"{name}=?" for name in changes)
         with self.connection:
             cursor = self.connection.execute(
-                "UPDATE memories SET content=?,updated_at=? WHERE id=?", (content, utc_now(), item_id))
+                f"UPDATE memories SET {assignments},updated_at=? WHERE id=?",
+                (*changes.values(), utc_now(), item_id))
         return cursor.rowcount == 1
 
     def forget(self, item_id: str) -> bool:

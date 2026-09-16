@@ -16,6 +16,10 @@ CORE_TOOL_NAMES = frozenset({
     "search_communication", "list_wake_history",
 })
 
+MEMORY_KINDS = ["fact", "preference", "rule", "hypothesis", "experience", "unknown"]
+MEMORY_LEVELS = ["low", "medium", "high"]
+MEMORY_PROVENANCES = ["owner", "resident", "connector", "unknown"]
+
 
 @dataclass(frozen=True)
 class Tool:
@@ -34,12 +38,24 @@ class ToolRegistry:
                  current_run_id: str | None = None):
         self.store, self.emit, self.current_run_id = store, emit, current_run_id
         self.tools: dict[str, Tool] = {
-            "remember": Tool(ToolSpec("remember", "Persist something for your future self.",
-                _schema(("content",), content={"type": "string"})), self._remember),
-            "recall": Tool(ToolSpec("recall", "Search your persistent memories by words or list recent memories.",
+            "remember": Tool(ToolSpec("remember",
+                "Persist a selective autobiographical memory with your own descriptive assessment. "
+                "Provenance describes the underlying information source; it does not enact policy.",
+                _schema(("content", "kind", "importance", "confidence", "provenance"),
+                        content={"type": "string"}, kind={"type": "string", "enum": MEMORY_KINDS},
+                        importance={"type": "string", "enum": MEMORY_LEVELS},
+                        confidence={"type": "string", "enum": MEMORY_LEVELS},
+                        provenance={"type": "string", "enum": MEMORY_PROVENANCES})), self._remember),
+            "recall": Tool(ToolSpec("recall", "Search persistent memories by words, ranked by relevance and semantic metadata, or list the most durable memories.",
                 _schema(("query",), query={"type": "string"}, limit={"type": "integer", "minimum": 1, "maximum": 20})), self._recall),
-            "update_memory": Tool(ToolSpec("update_memory", "Replace an existing memory's content.",
-                _schema(("id", "content"), id={"type": "string"}, content={"type": "string"})), self._update_memory),
+            "update_memory": Tool(ToolSpec("update_memory",
+                "Refine an existing memory's content or assessment instead of accumulating avoidable contradictions.",
+                _schema(("id",), id={"type": "string"}, content={"type": "string"},
+                        kind={"type": "string", "enum": MEMORY_KINDS},
+                        importance={"type": "string", "enum": MEMORY_LEVELS},
+                        confidence={"type": "string", "enum": MEMORY_LEVELS},
+                        provenance={"type": "string", "enum": MEMORY_PROVENANCES}) |
+                {"minProperties": 2}), self._update_memory),
             "forget": Tool(ToolSpec("forget", "Delete a memory by id.",
                 _schema(("id",), id={"type": "string"})), self._forget),
             "create_intention": Tool(ToolSpec("create_intention", "Persist a small pending intention for a future wake.",
@@ -110,6 +126,8 @@ class ToolRegistry:
             return f"Unknown arguments: {', '.join(sorted(unknown))}"
         if missing:
             return f"Missing arguments: {', '.join(sorted(missing))}"
+        if len(arguments) < schema.get("minProperties", 0):
+            return f"At least {schema['minProperties']} arguments are required"
         for key, value in arguments.items():
             allowed = properties[key].get("type")
             allowed = [allowed] if isinstance(allowed, str) else allowed
@@ -125,17 +143,21 @@ class ToolRegistry:
         return None
 
     def _remember(self, a: dict[str, Any]) -> dict[str, Any]:
-        item_id = self.store.remember(a["content"], "resident")
+        item_id = self.store.remember(
+            a["content"], "resident", kind=a["kind"], importance=a["importance"],
+            confidence=a["confidence"], provenance=a["provenance"])
         self.emit("memory.created", {"memory_id": item_id})
-        return {"memory_id": item_id}
+        return {"memory_id": item_id, "memory": self.store.memory(item_id)}
 
     def _recall(self, a: dict[str, Any]) -> dict[str, Any]:
         return {"memories": self.store.recall(a["query"], a.get("limit", 10))}
 
     def _update_memory(self, a: dict[str, Any]) -> dict[str, Any]:
-        updated = self.store.update_memory(a["id"], a["content"])
+        fields = {name: a[name] for name in (
+            "content", "kind", "importance", "confidence", "provenance") if name in a}
+        updated = self.store.update_memory(a["id"], **fields)
         if updated: self.emit("memory.updated", {"memory_id": a["id"]})
-        return {"updated": updated}
+        return {"updated": updated, "memory": self.store.memory(a["id"]) if updated else None}
 
     def _forget(self, a: dict[str, Any]) -> dict[str, Any]:
         forgotten = self.store.forget(a["id"])

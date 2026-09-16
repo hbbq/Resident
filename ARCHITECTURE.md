@@ -248,13 +248,15 @@ The initial storage implementation can be deliberately simple, with SQLite as a 
 Resident should have a small general memory interface conceptually similar to:
 
 ```text
-remember(content)
+remember(content, kind, importance, confidence, provenance)
 recall(query)
-update_memory(id, content)
+update_memory(id, content?, kind?, importance?, confidence?, provenance?)
 forget(id)
 ```
 
-The exact metadata and retrieval implementation should not be over-specified initially. Timestamps and provenance/source are likely useful; importance scores, confidence, tags, embeddings, and other metadata should be introduced when there is evidence that they are needed.
+Memory uses a small Resident-chosen semantic vocabulary: kind, coarse importance and confidence, and provenance of the underlying information. Provenance is distinct from the persisted write origin. These fields are descriptive rather than policy or authorization, and Resident can revise them as its understanding changes.
+
+Recall first gates and ranks by textual relevance, then uses semantic metadata and recency to order relevant results. Empty-query recall lists the most durable memories. Both explicit recall and automatic context retrieval remain bounded; high importance never causes unrelated memories to be injected into every wake.
 
 ### Journal versus memory
 
