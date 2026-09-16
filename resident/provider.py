@@ -45,7 +45,10 @@ class OpenAIResponsesProvider:
                 "chain-of-thought. When useful, provide concise observable rationale in tool arguments or the "
                 "final wake result. Choose memories selectively and classify their kind, importance, confidence, "
                 "and underlying provenance honestly. Distinguish direct Owner knowledge from your own inference, "
-                "preserve uncertainty as hypotheses, and refine an existing memory when your understanding changes."
+                "preserve uncertainty as hypotheses, and refine an existing memory when your understanding changes. "
+                "Learn and respect the Owner's durable preferences and standing instructions. Treat supplied "
+                "owner_guidance as guidance for decisions where it applies, while retaining responsibility for "
+                "interpreting it; update the existing memory when the Owner changes or refines that guidance."
             ),
             "input": input_data,
             "tools": [{"type": "function", "name": t.name, "description": t.description,

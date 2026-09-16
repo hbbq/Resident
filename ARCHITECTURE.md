@@ -75,7 +75,7 @@ It should always contain enough information for Resident to understand the curre
 - the complete relevant `WakeEvent`, including its reason/source and associated payload or attachments;
 - capabilities currently available to Resident.
 
-The context builder may additionally include relevant pending intentions, retrieved memories, recent/relevant communication, and a small amount of recent runtime/journal context when useful.
+The context builder may additionally include relevant pending intentions, retrieved memories, a small bounded set of standing Owner guidance, recent/relevant communication, and a small amount of recent runtime/journal context when useful.
 
 It must not automatically include the entire memory store, communication history, or journal. Memory retrieval should initially be simple and driven by the wake event/context; the retrieval strategy can evolve after observing real behavior. Resident must also be able to explicitly retrieve additional memories during a wakeup when the initial context is insufficient.
 
@@ -248,15 +248,15 @@ The initial storage implementation can be deliberately simple, with SQLite as a 
 Resident should have a small general memory interface conceptually similar to:
 
 ```text
-remember(content, kind, importance, confidence, provenance)
+remember(content, kind, importance, confidence, provenance, standing)
 recall(query)
-update_memory(id, content?, kind?, importance?, confidence?, provenance?)
+update_memory(id, content?, kind?, importance?, confidence?, provenance?, standing?)
 forget(id)
 ```
 
-Memory uses a small Resident-chosen semantic vocabulary: kind, coarse importance and confidence, and provenance of the underlying information. Provenance is distinct from the persisted write origin. These fields are descriptive rather than policy or authorization, and Resident can revise them as its understanding changes.
+Memory uses a small Resident-chosen semantic vocabulary: kind, coarse importance and confidence, provenance of the underlying information, and whether an Owner-derived preference or rule is standing guidance. Provenance is distinct from the persisted write origin. These fields are descriptive rather than policy or authorization, and Resident can revise them as its understanding changes.
 
-Recall first gates and ranks by textual relevance, then uses semantic metadata and recency to order relevant results. Empty-query recall lists the most durable memories. Both explicit recall and automatic context retrieval remain bounded; high importance never causes unrelated memories to be injected into every wake.
+Recall first gates and ranks by textual relevance, then uses semantic metadata and recency to order relevant results. Empty-query recall lists the most durable memories. Explicit recall and automatic context retrieval remain bounded; high importance alone never causes unrelated memories to be injected into every wake. A separate, smaller context lane supplies memories that Resident explicitly classified as standing Owner preferences or rules without requiring wake-text overlap. This is durable guidance for Resident to interpret, not a runtime action rule or authorization mechanism. When the Owner changes such guidance, Resident should refine the existing memory rather than retain conflicting versions.
 
 ### Journal versus memory
 
