@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from .capabilities import Capability
 from .domain import WakeEvent
+from .readiness import ReadinessItem, ReadinessResult
 from .store import utc_now
 
 
@@ -38,6 +39,7 @@ class AgentControllerConnector:
     """Read-only observation of AgentController's versioned dashboard snapshot."""
 
     checkpoint_scope = "agentcontroller.workflow_items.v1"
+    readiness_items = (ReadinessItem("agentcontroller", "AgentController"),)
 
     def __init__(self, snapshot_path: Path, *, poll_seconds: float = 60.0,
                  diagnostic_output: Callable[[str], None] | None = None):
@@ -271,14 +273,21 @@ class AgentControllerConnector:
                 occurred_at=utc_now(), payload=change,
             ))
 
-    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
+    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,
+                  readiness: asyncio.Queue[ReadinessResult] | None = None) -> None:
+        initial = True
         while not stop.is_set():
             try:
                 await self.poll_once(queue)
+                if initial and readiness is not None:
+                    readiness.put_nowait(ReadinessResult("agentcontroller", True))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if initial and readiness is not None:
+                    readiness.put_nowait(ReadinessResult("agentcontroller", False))
                 self.diagnostic_output(f"poll failed: {type(exc).__name__}: {exc}")
+            initial = False
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.poll_seconds)
             except TimeoutError:

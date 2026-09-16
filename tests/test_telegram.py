@@ -571,6 +571,20 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             diagnostics,
         )
 
+    async def test_startup_preflight_reports_ready_without_long_polling(self):
+        transport = FakeTelegramTransport([
+            {"ok": True, "result": {"url": ""}},
+            {"ok": True, "result": []},
+        ])
+        stop, readiness = asyncio.Event(), asyncio.Queue()
+        task = asyncio.create_task(transport.run(asyncio.Queue(), stop, readiness))
+
+        self.assertTrue((await readiness.get()).ok)
+        self.assertEqual(("getUpdates", 0), (
+            transport.requests[1][0], transport.requests[1][1]["timeout"]))
+        stop.set()
+        await task
+
     def test_permanent_webhook_failure_is_visible_without_verbose_diagnostics(self):
         with patch("builtins.print") as output:
             TerminalDiagnostics(verbose=False).telegram(

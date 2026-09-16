@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import shutil
 import time
 import uuid
 from typing import Awaitable, Callable, Sequence
@@ -10,6 +11,7 @@ from .capabilities import Capability
 from .config import CameraConfig
 from .domain import ImageAttachment, ToolOutput, WakeEvent
 from .onvif import SUBSCRIPTION_SAFETY_MARGIN, OnvifClient
+from .readiness import ReadinessItem, ReadinessResult
 from .store import utc_now
 
 
@@ -63,6 +65,13 @@ class CameraConnector:
             ),
         ]
 
+    @property
+    def readiness_items(self) -> tuple[ReadinessItem, ...]:
+        items = [ReadinessItem("cameras", "Cameras")]
+        if any(camera.onvif is not None for camera in self._cameras.values()):
+            items.append(ReadinessItem("onvif", "ONVIF events"))
+        return tuple(items)
+
     def replace_cameras(self, cameras: Sequence[CameraConfig]) -> WakeEvent | None:
         """Replace a refreshable camera source and emit one safe domain wake."""
         replacement = {camera.id: camera for camera in cameras}
@@ -93,7 +102,8 @@ class CameraConnector:
             self._camera_refresh.set()
         return event
 
-    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
+    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,
+                  readiness: asyncio.Queue[ReadinessResult] | None = None) -> None:
         self._runtime_queue = queue
         self._camera_refresh = asyncio.Event()
         for event in self._pending_events:
@@ -101,7 +111,23 @@ class CameraConnector:
         self._pending_events.clear()
         workers: dict[str, tuple[CameraConfig, asyncio.Task[None]]] = {}
         try:
-            await self._reconcile_onvif_workers(workers, stop)
+            if readiness is not None:
+                readiness.put_nowait(ReadinessResult(
+                    "cameras", shutil.which(self.ffmpeg_executable) is not None,
+                    f"{len(self._cameras)} camera" + ("" if len(self._cameras) == 1 else "s"),
+                ))
+            onvif_startup: asyncio.Queue[bool] | None = (
+                asyncio.Queue() if readiness is not None else None)
+            await self._reconcile_onvif_workers(workers, stop, onvif_startup)
+            if onvif_startup is not None:
+                onvif_count = sum(camera.onvif is not None for camera in self._cameras.values())
+                if onvif_count:
+                    results = [await onvif_startup.get() for _ in range(onvif_count)]
+                    ready_count = sum(results)
+                    readiness.put_nowait(ReadinessResult(
+                        "onvif", ready_count == onvif_count,
+                        f"{ready_count}/{onvif_count} subscriptions",
+                    ))
             while not stop.is_set():
                 stop_waiter = asyncio.create_task(stop.wait())
                 refresh_waiter = asyncio.create_task(self._camera_refresh.wait())
@@ -127,7 +153,7 @@ class CameraConnector:
 
     async def _reconcile_onvif_workers(
             self, workers: dict[str, tuple[CameraConfig, asyncio.Task[None]]],
-            stop: asyncio.Event) -> None:
+            stop: asyncio.Event, startup: asyncio.Queue[bool] | None = None) -> None:
         desired = {
             camera.id: camera for camera in self._cameras.values()
             if camera.onvif is not None
@@ -146,11 +172,14 @@ class CameraConnector:
                 await worker
         for camera_id, camera in desired.items():
             if camera_id not in workers:
-                workers[camera_id] = (camera, asyncio.create_task(self._run_onvif(camera, stop)))
+                workers[camera_id] = (
+                    camera, asyncio.create_task(self._run_onvif(camera, stop, startup)))
 
-    async def _run_onvif(self, camera: CameraConfig, stop: asyncio.Event) -> None:
+    async def _run_onvif(self, camera: CameraConfig, stop: asyncio.Event,
+                         startup: asyncio.Queue[bool] | None = None) -> None:
         assert camera.onvif is not None
         property_state: dict[tuple[object, ...], object] = {}
+        initial = True
         while not stop.is_set():
             pullpoint = None
             client = None
@@ -171,9 +200,15 @@ class CameraConnector:
                     f"{camera.id}: ONVIF property schemas ({len(schemas)}): {schema_text}")
                 pullpoint = await client.subscribe(service)
                 if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
+                    if initial and startup is not None:
+                        startup.put_nowait(False)
+                        initial = False
                     self.diagnostic_output(
                         f"{camera.id}: ONVIF PullPoint subscription lifetime unusable; retrying")
                 else:
+                    if initial and startup is not None:
+                        startup.put_nowait(True)
+                        initial = False
                     self.diagnostic_output(f"{camera.id}: ONVIF PullPoint subscription active")
                     while not stop.is_set():
                         if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
@@ -218,6 +253,9 @@ class CameraConnector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if initial and startup is not None:
+                    startup.put_nowait(False)
+                    initial = False
                 self.diagnostic_output(
                     f"{camera.id}: ONVIF probe/pull failed ({type(exc).__name__}); retrying")
             finally:

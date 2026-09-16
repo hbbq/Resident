@@ -9,11 +9,14 @@ from urllib.request import Request, urlopen
 
 from .capabilities import Capability
 from .domain import WakeEvent
+from .readiness import ReadinessItem, ReadinessResult
 from .store import utc_now
 
 
 class HomeOpsConnector:
     """A small, read-only adapter for the HomeOps measurements API."""
+
+    readiness_items = (ReadinessItem("homeops", "HomeOps"),)
 
     def __init__(self, base_url: str, *, poll_seconds: float = 30.0,
                  request_timeout_seconds: float = 10.0,
@@ -134,14 +137,21 @@ class HomeOpsConnector:
                 occurred_at=utc_now(), payload={"change_count": len(changes), "changes": changes},
             ))
 
-    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
+    async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,
+                  readiness: asyncio.Queue[ReadinessResult] | None = None) -> None:
+        initial = True
         while not stop.is_set():
             try:
                 await self.poll_once(queue)
+                if initial and readiness is not None:
+                    readiness.put_nowait(ReadinessResult("homeops", True))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if initial and readiness is not None:
+                    readiness.put_nowait(ReadinessResult("homeops", False))
                 self.diagnostic_output(f"poll failed: {type(exc).__name__}: {exc}")
+            initial = False
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.poll_seconds)
             except TimeoutError:
