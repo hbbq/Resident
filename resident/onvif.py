@@ -171,7 +171,7 @@ class OnvifClient:
         if not xaddr:
             raise ValueError("ONVIF camera did not advertise an event service")
         properties = await self._post(
-            xaddr, f"{EVENTS}/EventPortType/GetEventProperties",
+            xaddr, f"{EVENTS}/EventPortType/GetEventPropertiesRequest",
             ET.Element(ET.QName(EVENTS, "GetEventProperties")))
         topic_set = next((element for element in properties.iter()
                           if _local_name(element.tag) == "TopicSet"), None)
@@ -195,7 +195,7 @@ class OnvifClient:
 
     async def subscribe(self, event_service: str) -> PullPoint:
         root = await self._post(
-            event_service, f"{EVENTS}/EventPortType/CreatePullPointSubscription",
+            event_service, f"{EVENTS}/EventPortType/CreatePullPointSubscriptionRequest",
             ET.Element(ET.QName(EVENTS, "CreatePullPointSubscription")))
         reference = next((element for element in root.iter()
                           if _local_name(element.tag) == "SubscriptionReference"), None)
@@ -235,7 +235,7 @@ class OnvifClient:
         ET.SubElement(request, ET.QName(EVENTS, "Timeout")).text = f"PT{pull_timeout:g}S"
         ET.SubElement(request, ET.QName(EVENTS, "MessageLimit")).text = "32"
         root = await self._post(
-            pullpoint.address, f"{EVENTS}/PullPointSubscription/PullMessages", request,
+            pullpoint.address, f"{EVENTS}/PullPointSubscription/PullMessagesRequest", request,
             pull_timeout + self.request_timeout, pullpoint.reference_parameters)
         summaries = []
         for notification in (element for element in root.iter()

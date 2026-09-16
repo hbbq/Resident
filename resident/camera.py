@@ -122,21 +122,26 @@ class CameraConnector:
                 self.diagnostic_output(
                     f"{camera.id}: ONVIF event topics ({len(topics)}): {topic_text}")
                 pullpoint = await client.subscribe(service)
-                self.diagnostic_output(f"{camera.id}: ONVIF PullPoint subscription active")
-                while not stop.is_set():
-                    if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
-                        recreate = True
-                        break
-                    notifications = await client.pull(pullpoint)
-                    for notification in notifications:
-                        self.diagnostic_output(
-                            f"{camera.id}: observed ONVIF event shape: "
-                            f"topic={notification['topic']!r}, fields={notification['fields']!r}")
-                    if not notifications:
-                        try:
-                            await asyncio.wait_for(stop.wait(), min(1.0, self.onvif_retry_seconds))
-                        except TimeoutError:
-                            pass
+                if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
+                    self.diagnostic_output(
+                        f"{camera.id}: ONVIF PullPoint subscription lifetime unusable; retrying")
+                else:
+                    self.diagnostic_output(f"{camera.id}: ONVIF PullPoint subscription active")
+                    while not stop.is_set():
+                        if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
+                            recreate = True
+                            break
+                        notifications = await client.pull(pullpoint)
+                        for notification in notifications:
+                            self.diagnostic_output(
+                                f"{camera.id}: observed ONVIF event shape: "
+                                f"topic={notification['topic']!r}, fields={notification['fields']!r}")
+                        if not notifications:
+                            try:
+                                await asyncio.wait_for(
+                                    stop.wait(), min(1.0, self.onvif_retry_seconds))
+                            except TimeoutError:
+                                pass
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

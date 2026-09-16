@@ -49,7 +49,25 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("http://camera.test/events", service)
         self.assertEqual(("RuleEngine/CellMotionDetector",), topics)
         self.assertTrue(client.calls[0][1].endswith("/GetCapabilities"))
-        self.assertTrue(client.calls[1][1].endswith("/GetEventProperties"))
+        self.assertEqual(
+            f"{EVENTS}/EventPortType/GetEventPropertiesRequest", client.calls[1][1])
+
+    async def test_subscription_and_pull_use_complete_request_action_uris(self):
+        client = StubClient([
+            """<Envelope xmlns:wsa='http://www.w3.org/2005/08/addressing'>
+              <SubscriptionReference><wsa:Address>http://camera.test/pull</wsa:Address>
+              </SubscriptionReference></Envelope>""",
+            "<Envelope/>",
+        ])
+
+        pullpoint = await client.subscribe("http://camera.test/events")
+        await client.pull(pullpoint)
+
+        self.assertEqual(
+            f"{EVENTS}/EventPortType/CreatePullPointSubscriptionRequest",
+            client.calls[0][1])
+        self.assertEqual(
+            f"{EVENTS}/PullPointSubscription/PullMessagesRequest", client.calls[1][1])
 
     def test_topic_traversal_includes_topics_nested_below_a_topic(self):
         topic_set = ET.fromstring(f"""
@@ -126,7 +144,7 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         parameter = b"<Identifier>subscription-1</Identifier>"
 
         for action, body in (
-                (f"{EVENTS}/PullPointSubscription/PullMessages",
+                (f"{EVENTS}/PullPointSubscription/PullMessagesRequest",
                  ET.Element(ET.QName(EVENTS, "PullMessages"))),
                 (f"{NOTIFY_WSDL}/SubscriptionManager/UnsubscribeRequest",
                  ET.Element("Unsubscribe"))):
@@ -234,6 +252,36 @@ class FakeOnvifClient:
 
 
 class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_unusable_subscriptions_use_retry_backoff(self):
+        retry_seconds = 0.1
+        stop = asyncio.Event()
+
+        class UnusableSubscriptionClient(FakeOnvifClient):
+            subscription_times = []
+
+            async def subscribe(self, _):
+                self.__class__.subscription_times.append(time.monotonic())
+                if len(self.__class__.subscription_times) == 3:
+                    stop.set()
+                return PullPoint("internal-pullpoint", expires_at=time.monotonic())
+
+        UnusableSubscriptionClient.instances.clear()
+        UnusableSubscriptionClient.subscription_times = []
+        camera = CameraConfig(
+            "entry", "Entry", "rtsp://secret@camera.test/live", None,
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+        connector = CameraConnector(
+            [camera], onvif_client_factory=UnusableSubscriptionClient,
+            onvif_retry_seconds=retry_seconds)
+
+        await asyncio.wait_for(connector.run(asyncio.Queue(), stop), 1)
+
+        times = UnusableSubscriptionClient.subscription_times
+        self.assertEqual(3, len(times))
+        self.assertTrue(all(
+            later - earlier >= retry_seconds * 0.8
+            for earlier, later in zip(times, times[1:])))
+
     async def test_short_subscription_is_pulled_before_expiry(self):
         stop = asyncio.Event()
 
