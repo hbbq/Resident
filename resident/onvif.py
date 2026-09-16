@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import os
-from typing import Callable
+from typing import Callable, Iterable
 import uuid
 from urllib.parse import urlsplit
 from urllib.request import (
@@ -28,6 +28,10 @@ DEVICE = "http://www.onvif.org/ver10/device/wsdl"
 EVENTS = "http://www.onvif.org/ver10/events/wsdl"
 TOPICS = "http://docs.oasis-open.org/wsn/t-1"
 NOTIFY = "http://docs.oasis-open.org/wsn/b-2"
+MAX_TOPIC_PATHS = 100
+MAX_NOTIFICATION_FIELDS = 32
+MAX_DIAGNOSTIC_NAME_LENGTH = 256
+MAX_DIAGNOSTIC_NAMES_LENGTH = 4_096
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,27 @@ class PullPoint:
 
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urlsplit(url)
+    default_port = {"http": 80, "https": 443}.get(parsed.scheme.lower())
+    port = parsed.port if parsed.port is not None else default_port
+    return parsed.scheme.lower(), parsed.hostname.lower() if parsed.hostname else None, port
+
+
+def _bounded_names(names: Iterable[str], count: int) -> tuple[str, ...]:
+    bounded: list[str] = []
+    remaining = MAX_DIAGNOSTIC_NAMES_LENGTH
+    for name in names:
+        if len(bounded) >= count or remaining <= 0:
+            break
+        candidate = name[:min(MAX_DIAGNOSTIC_NAME_LENGTH, remaining)]
+        if not candidate or candidate in bounded:
+            continue
+        bounded.append(candidate)
+        remaining -= len(candidate)
+    return tuple(bounded)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -57,14 +82,14 @@ class OnvifClient:
         self._passwords = HTTPPasswordMgrWithDefaultRealm()
         self._passwords.add_password(None, config.endpoint, config.username, config.password)
         parsed = urlsplit(config.endpoint)
-        self._origin = (parsed.scheme.lower(), parsed.hostname.lower())
+        self._origin = _origin(config.endpoint)
         self._passwords.add_password(
             None, f"{parsed.scheme}://{parsed.netloc}/", config.username, config.password)
         self._opener = opener_factory(HTTPDigestAuthHandler(self._passwords), _NoRedirect())
 
     def _validate_destination(self, destination: str) -> None:
         parsed = urlsplit(destination)
-        candidate = (parsed.scheme.lower(), parsed.hostname.lower() if parsed.hostname else None)
+        candidate = _origin(destination)
         if candidate != self._origin or parsed.username is not None or parsed.password is not None:
             raise ValueError("ONVIF service address is outside the configured camera origin")
         self._passwords.add_password(
@@ -148,12 +173,11 @@ class OnvifClient:
             current = parents + ((_local_name(element.tag),) if element is not topic_set else ())
             if element.attrib.get(f"{{{TOPICS}}}topic", "").lower() == "true":
                 paths.append("/".join(current))
-                return
             for child in children:
                 visit(child, current)
 
         visit(topic_set, ())
-        return tuple(dict.fromkeys(paths))[:100]
+        return _bounded_names(dict.fromkeys(paths), MAX_TOPIC_PATHS)
 
     async def subscribe(self, event_service: str) -> PullPoint:
         root = await self._post(
@@ -182,10 +206,14 @@ class OnvifClient:
                              if _local_name(element.tag) == "NotificationMessage"):
             topic = next((element.text for element in notification.iter()
                           if _local_name(element.tag) == "Topic" and element.text), "unknown")
-            names = sorted({element.attrib["Name"] for element in notification.iter()
+            names = sorted({element.attrib["Name"][:MAX_DIAGNOSTIC_NAME_LENGTH]
+                            for element in notification.iter()
                             if _local_name(element.tag) in ("SimpleItem", "ElementItem")
-                            and "Name" in element.attrib})[:32]
-            summaries.append({"topic": topic[:256], "fields": names})
+                            and "Name" in element.attrib})
+            summaries.append({
+                "topic": topic[:MAX_DIAGNOSTIC_NAME_LENGTH],
+                "fields": list(_bounded_names(names, MAX_NOTIFICATION_FIELDS)),
+            })
         return tuple(summaries[:32])
 
     async def unsubscribe(self, pullpoint: PullPoint) -> None:

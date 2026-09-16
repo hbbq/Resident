@@ -7,7 +7,10 @@ import xml.etree.ElementTree as ET
 
 from resident.camera import CameraConnector
 from resident.config import CameraConfig, OnvifConfig
-from resident.onvif import EVENTS, OnvifClient, PullPoint
+from resident.onvif import (
+    EVENTS, MAX_DIAGNOSTIC_NAMES_LENGTH, MAX_DIAGNOSTIC_NAME_LENGTH, TOPICS, OnvifClient,
+    PullPoint,
+)
 
 
 SECRET_ENDPOINT = "http://camera.test/onvif/device_service"
@@ -47,6 +50,30 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.calls[0][1].endswith("/GetCapabilities"))
         self.assertTrue(client.calls[1][1].endswith("/GetEventProperties"))
 
+    def test_topic_traversal_includes_topics_nested_below_a_topic(self):
+        topic_set = ET.fromstring(f"""
+            <TopicSet xmlns:wstop='{TOPICS}'>
+              <RuleEngine wstop:topic='true'>
+                <Motion wstop:topic='true'/>
+              </RuleEngine>
+            </TopicSet>""")
+
+        self.assertEqual(
+            ("RuleEngine", "RuleEngine/Motion"), OnvifClient._topic_paths(topic_set))
+
+    def test_advertised_topic_diagnostics_have_per_name_and_total_bounds(self):
+        topic_set = ET.fromstring(
+            f"<TopicSet xmlns:wstop='{TOPICS}'>"
+            + "".join(
+                f"<Topic{number}{'x' * 300} wstop:topic='true'/>" for number in range(100)
+            )
+            + "</TopicSet>")
+
+        topics = OnvifClient._topic_paths(topic_set)
+
+        self.assertTrue(all(len(topic) <= MAX_DIAGNOSTIC_NAME_LENGTH for topic in topics))
+        self.assertLessEqual(sum(map(len, topics)), MAX_DIAGNOSTIC_NAMES_LENGTH)
+
     async def test_pull_reports_only_bounded_shape_not_values_or_raw_xml(self):
         client = StubClient(["""
             <Envelope><NotificationMessage><Topic>tns1:RuleEngine/Motion</Topic>
@@ -60,6 +87,21 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         },), notifications)
         self.assertNotIn("top-secret-value", json.dumps(notifications))
         self.assertIn(b"PT2S", client.calls[0][2])
+
+    async def test_notification_field_diagnostics_have_per_name_and_total_bounds(self):
+        fields = "".join(
+            f"<SimpleItem Name='Field{number}{'x' * 300}' Value='secret'/>"
+            for number in range(32))
+        client = StubClient([
+            f"<Envelope><NotificationMessage><Message><Data>{fields}</Data></Message>"
+            "</NotificationMessage></Envelope>",
+        ])
+
+        notifications = await client.pull(PullPoint("http://camera.test/pullpoint"))
+        names = notifications[0]["fields"]
+
+        self.assertTrue(all(len(name) <= MAX_DIAGNOSTIC_NAME_LENGTH for name in names))
+        self.assertLessEqual(sum(map(len, names)), MAX_DIAGNOSTIC_NAMES_LENGTH)
 
     async def test_subscription_reference_parameters_are_replayed(self):
         client = StubClient([
@@ -94,6 +136,18 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "configured camera origin"):
             client._validate_destination("http://attacker.test/collect")
+
+    def test_discovered_service_cannot_send_credentials_to_another_port(self):
+        client = OnvifClient(OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+
+        with self.assertRaisesRegex(ValueError, "configured camera origin"):
+            client._validate_destination("http://camera.test:8080/events")
+
+    def test_default_and_explicit_default_ports_are_the_same_origin(self):
+        client = OnvifClient(OnvifConfig(
+            "https://camera.test:443/onvif/device_service", SECRET_USER, SECRET_PASSWORD))
+
+        client._validate_destination("https://camera.test/events")
 
 
 class FakeOnvifClient:
