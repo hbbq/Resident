@@ -31,7 +31,10 @@ class LifecycleProvider:
             self.round += 1
             content = document["wake_event"]["payload"].get("content", document["wake_event"]["reason"])
             return ModelTurn(f"response-{self.round}", tool_calls=(
-                ToolCall(f"remember-{self.round}", "remember", {"content": f"Wake observed: {content}"}),
+                ToolCall(f"remember-{self.round}", "remember", {
+                    "content": f"Wake observed: {content}", "kind": "experience",
+                    "importance": "low", "confidence": "high", "provenance": "resident",
+                }),
                 ToolCall(f"time-{self.round}", "diagnostics_current_time", {}),
                 ToolCall(f"message-{self.round}", "send_owner_message", {"content": f"I observed {content}"}),
             ))
@@ -67,7 +70,10 @@ class ContinuationLifecycleProvider:
 
     async def respond(self, context, tools, results, previous_response_id=None):
         if previous_response_id is None:
-            return ModelTurn("continuation", tool_calls=(ToolCall("call", "remember", {"content": "work"}),))
+            return ModelTurn("continuation", tool_calls=(ToolCall("call", "remember", {
+                "content": "work", "kind": "experience", "importance": "low",
+                "confidence": "medium", "provenance": "resident",
+            }),))
         if self.cancel:
             await self.release.wait()
         raise RuntimeError("continuation failed")
@@ -528,7 +534,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(6, store.connection.execute(
+            self.assertEqual(7, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})

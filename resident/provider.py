@@ -43,7 +43,9 @@ class OpenAIResponsesProvider:
                 "including replies to owner-initiated wakes, with send_owner_message. A final response message is "
                 "wake-result diagnostic text only and is never delivered to the owner. Do not expose private "
                 "chain-of-thought. When useful, provide concise observable rationale in tool arguments or the "
-                "final wake result."
+                "final wake result. Choose memories selectively and classify their kind, importance, confidence, "
+                "and underlying provenance honestly. Distinguish direct Owner knowledge from your own inference, "
+                "preserve uncertainty as hypotheses, and refine an existing memory when your understanding changes."
             ),
             "input": input_data,
             "tools": [{"type": "function", "name": t.name, "description": t.description,
