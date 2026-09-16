@@ -12,7 +12,7 @@ from resident.camera import CameraConnector
 from resident.config import CameraConfig, OnvifConfig
 from resident.onvif import (
     ADDRESSING, EVENTS, MAX_DIAGNOSTIC_NAMES_LENGTH, MAX_DIAGNOSTIC_NAME_LENGTH,
-    NOTIFY_WSDL, TOPICS, OnvifClient, PullPoint,
+    NOTIFY_WSDL, TOPICS, OnvifClient, PropertyField, PropertySchema, PullPoint,
 )
 
 
@@ -56,29 +56,49 @@ class StubClient(OnvifClient):
         self.config = OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD)
         self.request_timeout = 1
         self.pull_timeout = 2
+        self._origin = ("http", "camera.test", 80)
+        self._trusted_pullpoints = set()
+        self._property_schemas = {}
 
     async def _post(self, destination, action, body, timeout=None, reference_parameters=(),
-                    *, allow_alternate_port=False):
+                    *, trusted_subscription=False):
         self.calls.append((destination, action, ET.tostring(body), timeout, reference_parameters))
         return ET.fromstring(self.responses.pop(0))
 
 
 class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_pull_messages_timeout_is_five_seconds(self):
+        client = OnvifClient(OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+
+        self.assertEqual(5.0, client.pull_timeout)
+
+    async def test_default_short_timeout_is_sent_in_pull_messages(self):
+        client = StubClient(["<Envelope/>"])
+        client.pull_timeout = 5.0
+
+        await client.pull(PullPoint("http://camera.test/pull"))
+
+        self.assertIn(b"PT5S", client.calls[0][2])
+
     async def test_discovers_event_service_and_advertised_topics(self):
         client = StubClient([
             """<Envelope><Events><XAddr>http://camera.test/events</XAddr></Events></Envelope>""",
             """<Envelope xmlns:wstop='http://docs.oasis-open.org/wsn/t-1'>
                  <TopicSet><RuleEngine><CellMotionDetector wstop:topic='true'>
-                   <MessageDescription><Data><SimpleItemDescription Name='IsMotion'/></Data>
+                   <MessageDescription IsProperty='true'><Data>
+                     <SimpleItemDescription Name='IsMotion' Type='xsd:boolean'/></Data>
                    </MessageDescription>
                  </CellMotionDetector></RuleEngine></TopicSet>
                </Envelope>""",
         ])
 
-        service, topics = await client.discover()
+        service, topics, schemas = await client.discover()
 
         self.assertEqual("http://camera.test/events", service)
         self.assertEqual(("RuleEngine/CellMotionDetector",), topics)
+        self.assertEqual((PropertySchema(
+            "RuleEngine/CellMotionDetector", data=(PropertyField("IsMotion", "xsd:boolean"),)),),
+            schemas)
         self.assertTrue(client.calls[0][1].endswith("/GetCapabilities"))
         self.assertEqual(
             f"{EVENTS}/EventPortType/GetEventPropertiesRequest", client.calls[1][1])
@@ -133,10 +153,46 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         notifications = await client.pull(PullPoint("http://camera.test/pullpoint"))
 
         self.assertEqual(({
-            "topic": "tns1:RuleEngine/Motion", "fields": ["IsMotion"],
+            "topic": "RuleEngine/Motion", "fields": ["IsMotion"],
         },), notifications)
         self.assertNotIn("top-secret-value", json.dumps(notifications))
         self.assertIn(b"PT2S", client.calls[0][2])
+
+    async def test_advertised_property_schema_and_boolean_values_are_parsed(self):
+        client = StubClient([
+            "<Envelope><Events><XAddr>http://camera.test/events</XAddr></Events></Envelope>",
+            f"""<Envelope xmlns:wstop='{TOPICS}'><TopicSet><RuleEngine>
+              <CellMotionDetector><Motion wstop:topic='true'>
+                <MessageDescription IsProperty='true'><Source>
+                  <SimpleItemDescription Name='Rule' Type='xsd:string'/>
+                </Source><Data>
+                  <SimpleItemDescription Name='IsMotion' Type='xsd:boolean'/>
+                </Data></MessageDescription>
+              </Motion></CellMotionDetector></RuleEngine></TopicSet></Envelope>""",
+            """<Envelope><NotificationMessage>
+              <Topic>tns1:RuleEngine/CellMotionDetector/Motion</Topic><Message>
+                <Source><SimpleItem Name='Rule' Value='rule-1'/></Source>
+                <Data><SimpleItem Name='IsMotion' Value='true'/></Data>
+              </Message></NotificationMessage></Envelope>""",
+        ])
+
+        _, _, schemas = await client.discover()
+        notifications = await client.pull(PullPoint("http://camera.test/pull"))
+
+        self.assertEqual("RuleEngine/CellMotionDetector/Motion", schemas[0].topic)
+        self.assertEqual((PropertyField("Rule", "xsd:string"),), schemas[0].source)
+        self.assertEqual((PropertyField("IsMotion", "xsd:boolean"),), schemas[0].data)
+        self.assertEqual([{
+            "name": "IsMotion", "type": "xsd:boolean", "value": True,
+            "sources": {"Rule": "rule-1"},
+        }], notifications[0]["properties"])
+
+    def test_boolean_property_lexical_values(self):
+        self.assertIs(True, OnvifClient._parse_property_value("true", "xsd:boolean"))
+        self.assertIs(True, OnvifClient._parse_property_value("1", "xsd:boolean"))
+        self.assertIs(False, OnvifClient._parse_property_value("false", "xsd:boolean"))
+        self.assertIs(False, OnvifClient._parse_property_value("0", "xsd:boolean"))
+        self.assertIsNone(OnvifClient._parse_property_value("secret", "xsd:boolean"))
 
     async def test_notification_field_diagnostics_have_per_name_and_total_bounds(self):
         fields = "".join(
@@ -312,6 +368,14 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "configured camera origin"):
             await client.pull(PullPoint("http://attacker.test:1024/pullpoint"))
 
+    async def test_unadvertised_same_host_pullpoint_is_not_trusted(self):
+        client = OnvifClient(OnvifConfig(
+            "http://camera.test:2020/onvif/device_service",
+            SECRET_USER, SECRET_PASSWORD))
+
+        with self.assertRaisesRegex(ValueError, "configured camera origin"):
+            await client.pull(PullPoint("http://camera.test:1025/not-returned"))
+
     def test_default_and_explicit_default_ports_are_the_same_origin(self):
         client = OnvifClient(OnvifConfig(
             "https://camera.test:443/onvif/device_service", SECRET_USER, SECRET_PASSWORD))
@@ -384,7 +448,7 @@ class FakeOnvifClient:
         self.__class__.instances.append(self)
 
     async def discover(self):
-        return "internal-event-service", ("RuleEngine/Motion",)
+        return "internal-event-service", ("RuleEngine/Motion",), ()
 
     async def subscribe(self, _):
         return PullPoint("internal-pullpoint")
@@ -398,6 +462,59 @@ class FakeOnvifClient:
 
 
 class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_property_baseline_duplicates_and_bidirectional_transitions(self):
+        stop = asyncio.Event()
+
+        class TransitionClient(FakeOnvifClient):
+            values = iter((False, False, True, True, False))
+
+            async def discover(self):
+                return (
+                    "internal-event-service", ("RuleEngine/Motion",),
+                    (PropertySchema(
+                        "RuleEngine/Motion",
+                        source=(PropertyField("Rule", "xsd:string"),),
+                        data=(PropertyField("IsMotion", "xsd:boolean"),)),),
+                )
+
+            async def pull(self, _):
+                value = next(self.__class__.values)
+                if value is False and getattr(self, "pulls", 0) == 4:
+                    stop.set()
+                self.pulls = getattr(self, "pulls", 0) + 1
+                return ({
+                    "topic": "RuleEngine/Motion", "fields": ["IsMotion", "Rule"],
+                    "properties": [{
+                        "name": "IsMotion", "type": "xsd:boolean", "value": value,
+                        "sources": {"Rule": "rule-1"},
+                    }],
+                },)
+
+        TransitionClient.instances.clear()
+        TransitionClient.values = iter((False, False, True, True, False))
+        camera = CameraConfig(
+            "entry", "Entry", "rtsp://secret@camera.test/live", None,
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+        diagnostics = []
+        connector = CameraConnector(
+            [camera], onvif_client_factory=TransitionClient, onvif_retry_seconds=0.01,
+            diagnostic_output=diagnostics.append)
+        queue = asyncio.Queue()
+
+        await asyncio.wait_for(connector.run(queue, stop), 1)
+
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        self.assertEqual(2, len(events))
+        self.assertEqual(
+            [(False, True), (True, False)],
+            [(event.payload["previous"], event.payload["value"]) for event in events])
+        self.assertTrue(all(event.reason == "onvif_property_changed" for event in events))
+        self.assertTrue(all(event.payload["topic"] == "RuleEngine/Motion" for event in events))
+        self.assertTrue(all(event.payload["sources"] == {"Rule": "rule-1"} for event in events))
+        self.assertNotIn("rule-1", "\n".join(diagnostics))
+
     async def test_camera_refresh_reconciles_only_changed_onvif_workers(self):
         FakeOnvifClient.instances.clear()
         original = {

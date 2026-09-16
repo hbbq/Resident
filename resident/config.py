@@ -130,7 +130,7 @@ class Config:
     camera_max_bytes: int = 2_000_000
     camera_rtsp_transport: str = "tcp"
     camera_onvif_request_timeout_seconds: float = 10.0
-    camera_onvif_pull_timeout_seconds: float = 30.0
+    camera_onvif_pull_timeout_seconds: float = 5.0
     camera_onvif_retry_seconds: float = 30.0
     ffmpeg_executable: str = "ffmpeg"
     verbose: bool = False
@@ -176,7 +176,7 @@ class Config:
         parser.add_argument("--camera-onvif-request-timeout-seconds", type=float,
                             default=float(os.getenv("RESIDENT_CAMERA_ONVIF_REQUEST_TIMEOUT_SECONDS", "10")))
         parser.add_argument("--camera-onvif-pull-timeout-seconds", type=float,
-                            default=float(os.getenv("RESIDENT_CAMERA_ONVIF_PULL_TIMEOUT_SECONDS", "30")))
+                            default=float(os.getenv("RESIDENT_CAMERA_ONVIF_PULL_TIMEOUT_SECONDS", "5")))
         parser.add_argument("--camera-onvif-retry-seconds", type=float,
                             default=float(os.getenv("RESIDENT_CAMERA_ONVIF_RETRY_SECONDS", "30")))
         parser.add_argument("--ffmpeg-executable", default=os.getenv("RESIDENT_FFMPEG_EXECUTABLE", "ffmpeg"))

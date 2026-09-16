@@ -50,6 +50,20 @@ class PullPoint:
         return max(0.0, self.expires_at - time.monotonic())
 
 
+@dataclass(frozen=True)
+class PropertyField:
+    name: str
+    type: str
+
+
+@dataclass(frozen=True)
+class PropertySchema:
+    topic: str
+    source: tuple[PropertyField, ...] = ()
+    key: tuple[PropertyField, ...] = ()
+    data: tuple[PropertyField, ...] = ()
+
+
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
@@ -59,6 +73,10 @@ def _origin(url: str) -> tuple[str, str | None, int | None]:
     default_port = {"http": 80, "https": 443}.get(parsed.scheme.lower())
     port = parsed.port if parsed.port is not None else default_port
     return parsed.scheme.lower(), parsed.hostname.lower() if parsed.hostname else None, port
+
+
+def _canonical_topic(topic: str) -> str:
+    return "/".join(part.split(":", 1)[-1] for part in topic.strip().split("/") if part)
 
 
 def _bounded_names(names: Iterable[str], count: int) -> tuple[str, ...]:
@@ -79,22 +97,22 @@ class OnvifClient:
     """Small ONVIF event probe; raw XML and credentials never leave this boundary."""
 
     def __init__(self, config: OnvifConfig, *, request_timeout: float = 10.0,
-                 pull_timeout: float = 30.0,
+                 pull_timeout: float = 5.0,
                  client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient):
         self.config = config
         self.request_timeout = request_timeout
         self.pull_timeout = pull_timeout
         self._origin = _origin(config.endpoint)
+        self._trusted_pullpoints: set[str] = set()
+        self._property_schemas: dict[str, PropertySchema] = {}
         self._client_factory = client_factory
 
     def _validate_destination(self, destination: str, *,
-                              allow_alternate_port: bool = False) -> None:
+                              trusted_subscription: bool = False) -> None:
         parsed = urlsplit(destination)
         candidate = _origin(destination)
-        origin_matches = (
-            candidate[:2] == self._origin[:2]
-            if allow_alternate_port else candidate == self._origin
-        )
+        origin_matches = (destination in self._trusted_pullpoints
+                          if trusted_subscription else candidate == self._origin)
         if not origin_matches or parsed.username is not None or parsed.password is not None:
             raise ValueError("ONVIF service address is outside the configured camera origin")
 
@@ -134,9 +152,9 @@ class OnvifClient:
     async def _post(self, destination: str, action: str, body: ET.Element,
                     timeout: float | None = None,
                     reference_parameters: tuple[bytes, ...] = (), *,
-                    allow_alternate_port: bool = False) -> ET.Element:
+                    trusted_subscription: bool = False) -> ET.Element:
         self._validate_destination(
-            destination, allow_alternate_port=allow_alternate_port)
+            destination, trusted_subscription=trusted_subscription)
         payload = self._envelope(action, destination, body, reference_parameters)
         request_deadline = timeout or self.request_timeout
         async with asyncio.timeout(max(0.1, request_deadline)):
@@ -156,7 +174,8 @@ class OnvifClient:
                             raise ValueError("ONVIF response exceeded size limit")
         return ET.fromstring(document)
 
-    async def discover(self) -> tuple[str, tuple[str, ...]]:
+    async def discover(self) -> tuple[
+            str, tuple[str, ...], tuple[PropertySchema, ...]]:
         request = ET.Element(ET.QName(DEVICE, "GetCapabilities"))
         ET.SubElement(request, ET.QName(DEVICE, "Category")).text = "Events"
         root = await self._post(
@@ -169,36 +188,12 @@ class OnvifClient:
         properties = await self._post(
             xaddr, f"{EVENTS}/EventPortType/GetEventPropertiesRequest",
             ET.Element(ET.QName(EVENTS, "GetEventProperties")))
-
-
-        for desc in properties.iter():
-            if _local_name(desc.tag) != "MessageDescription":
-                continue
-
-            print("DEBUG MessageDescription:",
-                "IsProperty=", desc.attrib.get("IsProperty"))
-
-            for section in desc:
-                section_name = _local_name(section.tag)
-                if section_name not in ("Source", "Key", "Data"):
-                    continue
-
-                print(f"  {section_name}:")
-                for item in section.iter():
-                    if _local_name(item.tag) == "SimpleItemDescription":
-                        print(
-                            "   ",
-                            item.attrib.get("Name"),
-                            "->",
-                            item.attrib.get("Type"),
-                        )
-
-
-        
         topic_set = next((element for element in properties.iter()
                           if _local_name(element.tag) == "TopicSet"), None)
         topics = self._topic_paths(topic_set) if topic_set is not None else ()
-        return xaddr, topics
+        schemas = self._property_schema(topic_set) if topic_set is not None else ()
+        self._property_schemas = {schema.topic: schema for schema in schemas}
+        return xaddr, topics, schemas
 
     @staticmethod
     def _topic_paths(topic_set: ET.Element) -> tuple[str, ...]:
@@ -215,6 +210,43 @@ class OnvifClient:
         visit(topic_set, ())
         return _bounded_names(dict.fromkeys(paths), MAX_TOPIC_PATHS)
 
+    @staticmethod
+    def _property_schema(topic_set: ET.Element) -> tuple[PropertySchema, ...]:
+        schemas: list[PropertySchema] = []
+
+        def fields(description: ET.Element, section_name: str) -> tuple[PropertyField, ...]:
+            section = next((child for child in description
+                            if _local_name(child.tag) == section_name), None)
+            if section is None:
+                return ()
+            result = []
+            for item in section.iter():
+                if _local_name(item.tag) != "SimpleItemDescription":
+                    continue
+                name, value_type = item.attrib.get("Name"), item.attrib.get("Type")
+                if name and value_type:
+                    result.append(PropertyField(
+                        name[:MAX_DIAGNOSTIC_NAME_LENGTH],
+                        value_type[:MAX_DIAGNOSTIC_NAME_LENGTH]))
+            return tuple(result[:MAX_NOTIFICATION_FIELDS])
+
+        def visit(element: ET.Element, parents: tuple[str, ...]) -> None:
+            current = parents + ((_local_name(element.tag),) if element is not topic_set else ())
+            if element.attrib.get(f"{{{TOPICS}}}topic", "").lower() == "true":
+                description = next((child for child in element
+                                    if _local_name(child.tag) == "MessageDescription"), None)
+                if (description is not None
+                        and description.attrib.get("IsProperty", "").lower() == "true"):
+                    schemas.append(PropertySchema(
+                        "/".join(current), fields(description, "Source"),
+                        fields(description, "Key"), fields(description, "Data")))
+            for child in element:
+                if isinstance(child.tag, str) and _local_name(child.tag) != "MessageDescription":
+                    visit(child, current)
+
+        visit(topic_set, ())
+        return tuple(schemas[:MAX_TOPIC_PATHS])
+
     async def subscribe(self, event_service: str) -> PullPoint:
         root = await self._post(
             event_service, f"{EVENTS}/EventPortType/CreatePullPointSubscriptionRequest",
@@ -225,6 +257,10 @@ class OnvifClient:
                         if _local_name(element.tag) == "Address" and element.text), None) if reference is not None else None
         if not address:
             raise ValueError("ONVIF subscription response did not contain an address")
+        parsed = urlsplit(address)
+        if (_origin(address)[:2] != self._origin[:2]
+                or parsed.username is not None or parsed.password is not None):
+            raise ValueError("ONVIF service address is outside the configured camera origin")
         parameters = next((element for element in reference.iter()
                            if _local_name(element.tag) == "ReferenceParameters"), None)
         serialized = tuple(ET.tostring(child) for child in parameters)[:32] if parameters is not None else ()
@@ -237,16 +273,7 @@ class OnvifClient:
             termination = self._parse_datetime(termination_text)
             current = self._parse_datetime(current_text) if current_text is not None else datetime.now(timezone.utc)
             expires_at = time.monotonic() + max(0.0, (termination - current).total_seconds())
-            parsed = urlsplit(address)
-            print("DEBUG PullPoint scheme:", parsed.scheme)
-            print("DEBUG PullPoint host:", parsed.hostname)
-            print("DEBUG PullPoint port:", parsed.port)
-            print("DEBUG PullPoint path:", parsed.path)
-            print("DEBUG PullPoint query:", parsed.query)
-            print(
-                "DEBUG reference parameters:",
-                [_local_name(ET.fromstring(p).tag) for p in serialized]
-            )
+        self._trusted_pullpoints.add(address)
         return PullPoint(address, serialized, expires_at)
 
     @staticmethod
@@ -269,25 +296,88 @@ class OnvifClient:
         root = await self._post(
             pullpoint.address, f"{EVENTS}/PullPointSubscription/PullMessagesRequest", request,
             pull_timeout + self.request_timeout, pullpoint.reference_parameters,
-            allow_alternate_port=True)
+            trusted_subscription=True)
         summaries = []
         for notification in (element for element in root.iter()
                              if _local_name(element.tag) == "NotificationMessage"):
-            topic = next((element.text for element in notification.iter()
-                          if _local_name(element.tag) == "Topic" and element.text), "unknown")
+            raw_topic = next((element.text for element in notification.iter()
+                              if _local_name(element.tag) == "Topic" and element.text), "unknown")
+            topic = _canonical_topic(raw_topic)
             names = sorted({element.attrib["Name"][:MAX_DIAGNOSTIC_NAME_LENGTH]
                             for element in notification.iter()
                             if _local_name(element.tag) in ("SimpleItem", "ElementItem")
                             and "Name" in element.attrib})
-            summaries.append({
+            summary: dict[str, object] = {
                 "topic": topic[:MAX_DIAGNOSTIC_NAME_LENGTH],
                 "fields": list(_bounded_names(names, MAX_NOTIFICATION_FIELDS)),
-            })
+            }
+            schema = self._property_schemas.get(topic)
+            if schema is not None:
+                source_values = self._section_values(notification, "Source")
+                data_values = self._section_values(notification, "Data")
+                sources = {
+                    field.name: source_values[field.name][:MAX_DIAGNOSTIC_NAMES_LENGTH]
+                    for field in schema.source if field.name in source_values
+                }
+                parsed_properties = []
+                for field in schema.data:
+                    raw_value = data_values.get(field.name)
+                    if raw_value is None:
+                        continue
+                    value = self._parse_property_value(raw_value, field.type)
+                    if value is not None:
+                        parsed_properties.append({
+                            "name": field.name, "type": field.type, "value": value,
+                            "sources": sources,
+                        })
+                summary["properties"] = parsed_properties
+            summaries.append(summary)
         return tuple(summaries[:32])
 
+    @staticmethod
+    def _section_values(notification: ET.Element, section_name: str) -> dict[str, str]:
+        section = next((element for element in notification.iter()
+                        if _local_name(element.tag) == section_name), None)
+        if section is None:
+            return {}
+        return {
+            item.attrib["Name"]: item.attrib["Value"]
+            for item in section.iter()
+            if _local_name(item.tag) == "SimpleItem"
+            and "Name" in item.attrib and "Value" in item.attrib
+        }
+
+    @staticmethod
+    def _parse_property_value(value: str, declared_type: str) -> object | None:
+        value_type = declared_type.split(":", 1)[-1].lower()
+        if value_type == "boolean":
+            normalized = value.strip().lower()
+            if normalized in ("true", "1"):
+                return True
+            if normalized in ("false", "0"):
+                return False
+            return None
+        if value_type in ("byte", "short", "int", "integer", "long",
+                          "unsignedbyte", "unsignedshort", "unsignedint", "unsignedlong"):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        if value_type in ("decimal", "double", "float"):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        if value_type in ("string", "referencetoken"):
+            return value[:MAX_DIAGNOSTIC_NAMES_LENGTH]
+        return None
+
     async def unsubscribe(self, pullpoint: PullPoint) -> None:
-        await self._post(
-            pullpoint.address, f"{NOTIFY_WSDL}/SubscriptionManager/UnsubscribeRequest",
-            ET.Element(ET.QName(NOTIFY, "Unsubscribe")),
-            reference_parameters=pullpoint.reference_parameters,
-            allow_alternate_port=True)
+        try:
+            await self._post(
+                pullpoint.address, f"{NOTIFY_WSDL}/SubscriptionManager/UnsubscribeRequest",
+                ET.Element(ET.QName(NOTIFY, "Unsubscribe")),
+                reference_parameters=pullpoint.reference_parameters,
+                trusted_subscription=True)
+        finally:
+            self._trusted_pullpoints.discard(pullpoint.address)

@@ -25,7 +25,7 @@ class CameraConnector:
                  rtsp_transport: str = "tcp", ffmpeg_executable: str = "ffmpeg",
                  process_factory: ProcessFactory = asyncio.create_subprocess_exec,
                  onvif_request_timeout_seconds: float = 10.0,
-                 onvif_pull_timeout_seconds: float = 30.0,
+                 onvif_pull_timeout_seconds: float = 5.0,
                  onvif_retry_seconds: float = 30.0,
                  onvif_client_factory: OnvifClientFactory = OnvifClient,
                  diagnostic_output: Callable[[str], None] | None = None):
@@ -150,6 +150,7 @@ class CameraConnector:
 
     async def _run_onvif(self, camera: CameraConfig, stop: asyncio.Event) -> None:
         assert camera.onvif is not None
+        property_state: dict[tuple[object, ...], object] = {}
         while not stop.is_set():
             pullpoint = None
             client = None
@@ -158,10 +159,16 @@ class CameraConnector:
                 client = self._onvif_client_factory(
                     camera.onvif, request_timeout=self.onvif_request_timeout_seconds,
                     pull_timeout=self.onvif_pull_timeout_seconds)
-                service, topics = await client.discover()
+                service, topics, schemas = await client.discover()
                 topic_text = ", ".join(topics) if topics else "none advertised"
                 self.diagnostic_output(
                     f"{camera.id}: ONVIF event topics ({len(topics)}): {topic_text}")
+                schema_text = ", ".join(
+                    f"{schema.topic} [" + ", ".join(
+                        f"{field.name}:{field.type}" for field in schema.data) + "]"
+                    for schema in schemas) or "none advertised"
+                self.diagnostic_output(
+                    f"{camera.id}: ONVIF property schemas ({len(schemas)}): {schema_text}")
                 pullpoint = await client.subscribe(service)
                 if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
                     self.diagnostic_output(
@@ -177,6 +184,31 @@ class CameraConnector:
                             self.diagnostic_output(
                                 f"{camera.id}: observed ONVIF event shape: "
                                 f"topic={notification['topic']!r}, fields={notification['fields']!r}")
+                            for property_value in notification.get("properties", ()):
+                                identity = (
+                                    notification["topic"], property_value["name"],
+                                    tuple(sorted(property_value["sources"].items())))
+                                current = property_value["value"]
+                                if identity not in property_state:
+                                    property_state[identity] = current
+                                    continue
+                                previous = property_state[identity]
+                                if previous == current:
+                                    continue
+                                property_state[identity] = current
+                                queue = self._runtime_queue
+                                if queue is not None:
+                                    queue.put_nowait(WakeEvent(
+                                        str(uuid.uuid4()), "camera", "onvif_property_changed",
+                                        utc_now(), {
+                                            "camera_id": camera.id,
+                                            "topic": notification["topic"],
+                                            "sources": property_value["sources"],
+                                            "property": property_value["name"],
+                                            "type": property_value["type"],
+                                            "previous": previous,
+                                            "value": current,
+                                        }))
                         if not notifications:
                             try:
                                 await asyncio.wait_for(
