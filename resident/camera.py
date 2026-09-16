@@ -42,6 +42,7 @@ class CameraConnector:
         self._onvif_client_factory = onvif_client_factory
         self.diagnostic_output = diagnostic_output or (lambda _: None)
         self._runtime_queue: asyncio.Queue[WakeEvent] | None = None
+        self._camera_refresh: asyncio.Event | None = None
         self._pending_events: list[WakeEvent] = []
         self.capabilities = [
             Capability(
@@ -88,24 +89,64 @@ class CameraConnector:
             self._pending_events.append(event)
         else:
             self._runtime_queue.put_nowait(event)
+            assert self._camera_refresh is not None
+            self._camera_refresh.set()
         return event
 
     async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
         self._runtime_queue = queue
+        self._camera_refresh = asyncio.Event()
         for event in self._pending_events:
             queue.put_nowait(event)
         self._pending_events.clear()
-        workers = [asyncio.create_task(self._run_onvif(camera, stop))
-                   for camera in self._cameras.values() if camera.onvif is not None]
+        workers: dict[str, tuple[CameraConfig, asyncio.Task[None]]] = {}
         try:
-            await stop.wait()
+            await self._reconcile_onvif_workers(workers, stop)
+            while not stop.is_set():
+                stop_waiter = asyncio.create_task(stop.wait())
+                refresh_waiter = asyncio.create_task(self._camera_refresh.wait())
+                done, pending = await asyncio.wait(
+                    (stop_waiter, refresh_waiter), return_when=asyncio.FIRST_COMPLETED)
+                for waiter in pending:
+                    waiter.cancel()
+                for waiter in pending:
+                    with suppress(asyncio.CancelledError):
+                        await waiter
+                if stop_waiter in done:
+                    break
+                self._camera_refresh.clear()
+                await self._reconcile_onvif_workers(workers, stop)
         finally:
-            for worker in workers:
+            for _, worker in workers.values():
                 worker.cancel()
-            for worker in workers:
+            for _, worker in workers.values():
                 with suppress(asyncio.CancelledError):
                     await worker
             self._runtime_queue = None
+            self._camera_refresh = None
+
+    async def _reconcile_onvif_workers(
+            self, workers: dict[str, tuple[CameraConfig, asyncio.Task[None]]],
+            stop: asyncio.Event) -> None:
+        desired = {
+            camera.id: camera for camera in self._cameras.values()
+            if camera.onvif is not None
+        }
+        stale_ids = [
+            camera_id for camera_id, (camera, _) in workers.items()
+            if camera_id not in desired or camera.onvif != desired[camera_id].onvif
+        ]
+        stale_workers = []
+        for camera_id in stale_ids:
+            _, worker = workers.pop(camera_id)
+            worker.cancel()
+            stale_workers.append(worker)
+        for worker in stale_workers:
+            with suppress(asyncio.CancelledError):
+                await worker
+        for camera_id, camera in desired.items():
+            if camera_id not in workers:
+                workers[camera_id] = (camera, asyncio.create_task(self._run_onvif(camera, stop)))
 
     async def _run_onvif(self, camera: CameraConfig, stop: asyncio.Event) -> None:
         assert camera.onvif is not None

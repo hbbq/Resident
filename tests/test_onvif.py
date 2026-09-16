@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import unittest
 import xml.etree.ElementTree as ET
@@ -226,6 +227,40 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
 
         client._validate_destination("https://camera.test/events")
 
+    def test_asyncio_shutdown_does_not_wait_for_blocked_urllib_request(self):
+        request_started = threading.Event()
+        release_request = threading.Event()
+
+        class BlockingOpener:
+            def open(self, *_args, **_kwargs):
+                request_started.set()
+                release_request.wait()
+                raise TimeoutError
+
+        async def run_connector():
+            camera = CameraConfig(
+                "entry", "Entry", "rtsp://secret@camera.test/live", None,
+                OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+            connector = CameraConnector(
+                [camera], onvif_client_factory=lambda config, **options: OnvifClient(
+                    config, opener_factory=lambda *_: BlockingOpener(), **options))
+            stop = asyncio.Event()
+            task = asyncio.create_task(connector.run(asyncio.Queue(), stop))
+            while not request_started.is_set():
+                await asyncio.sleep(0)
+            stop.set()
+            await task
+
+        runner = threading.Thread(target=lambda: asyncio.run(run_connector()))
+        runner.start()
+        try:
+            self.assertTrue(request_started.wait(1))
+            runner.join(0.5)
+            self.assertFalse(runner.is_alive())
+        finally:
+            release_request.set()
+            runner.join(1)
+
 
 class FakeOnvifClient:
     instances = []
@@ -252,6 +287,52 @@ class FakeOnvifClient:
 
 
 class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_camera_refresh_reconciles_only_changed_onvif_workers(self):
+        FakeOnvifClient.instances.clear()
+        original = {
+            camera_id: CameraConfig(
+                camera_id, camera_id.title(), f"rtsp://secret@{camera_id}.test/live", None,
+                OnvifConfig(f"http://{camera_id}.test/onvif", "user", "password"))
+            for camera_id in ("keep", "change", "remove")
+        }
+        connector = CameraConnector(
+            list(original.values()), onvif_client_factory=FakeOnvifClient)
+        stop = asyncio.Event()
+        task = asyncio.create_task(connector.run(asyncio.Queue(), stop))
+        while len(FakeOnvifClient.instances) < 3:
+            await asyncio.sleep(0)
+        initial = {client.config.endpoint: client for client in FakeOnvifClient.instances}
+
+        connector.replace_cameras([
+            CameraConfig(
+                "keep", "Renamed", "rtsp://new-secret@keep.test/live", None,
+                original["keep"].onvif),
+            CameraConfig(
+                "change", "Change", original["change"].rtsp_url, None,
+                OnvifConfig("http://change.test/onvif", "user", "new-password")),
+            CameraConfig(
+                "added", "Added", "rtsp://secret@added.test/live", None,
+                OnvifConfig("http://added.test/onvif", "user", "password")),
+        ])
+        while len(FakeOnvifClient.instances) < 5:
+            await asyncio.sleep(0)
+
+        self.assertIs(initial["http://keep.test/onvif"], FakeOnvifClient.instances[0])
+        self.assertFalse(initial["http://keep.test/onvif"].unsubscribed)
+        self.assertTrue(initial["http://change.test/onvif"].unsubscribed)
+        self.assertTrue(initial["http://remove.test/onvif"].unsubscribed)
+        self.assertEqual(
+            ["password", "new-password"],
+            [client.config.password for client in FakeOnvifClient.instances
+             if client.config.endpoint == "http://change.test/onvif"])
+        self.assertEqual(
+            1, sum(client.config.endpoint == "http://keep.test/onvif"
+                   for client in FakeOnvifClient.instances))
+
+        stop.set()
+        await task
+        self.assertTrue(all(client.unsubscribed for client in FakeOnvifClient.instances))
+
     async def test_repeated_unusable_subscriptions_use_retry_backoff(self):
         retry_seconds = 0.1
         stop = asyncio.Event()

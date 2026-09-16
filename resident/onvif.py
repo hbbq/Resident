@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import os
+import threading
 import time
 from typing import Callable, Iterable
 import uuid
@@ -157,8 +158,35 @@ class OnvifClient:
     async def _post(self, destination: str, action: str, body: ET.Element,
                     timeout: float | None = None,
                     reference_parameters: tuple[bytes, ...] = ()) -> ET.Element:
-        return await asyncio.to_thread(
-            self._post_sync, destination, action, body, timeout, reference_parameters)
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[ET.Element] = loop.create_future()
+
+        def complete(value: ET.Element | None, error: BaseException | None) -> None:
+            if result.done():
+                return
+            if error is not None:
+                result.set_exception(error)
+            else:
+                assert value is not None
+                result.set_result(value)
+
+        def request() -> None:
+            try:
+                value, error = self._post_sync(
+                    destination, action, body, timeout, reference_parameters), None
+            except BaseException as exc:
+                value, error = None, exc
+            try:
+                loop.call_soon_threadsafe(complete, value, error)
+            except RuntimeError:
+                # The request is isolated in a daemon thread specifically so a closed
+                # event loop cannot make process shutdown wait for blocking urllib work.
+                pass
+
+        threading.Thread(target=request, name="resident-onvif-request", daemon=True).start()
+        request_deadline = timeout or self.request_timeout
+        async with asyncio.timeout(max(0.1, request_deadline)):
+            return await result
 
     async def discover(self) -> tuple[str, tuple[str, ...]]:
         request = ET.Element(ET.QName(DEVICE, "GetCapabilities"))
