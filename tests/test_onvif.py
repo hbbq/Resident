@@ -57,7 +57,8 @@ class StubClient(OnvifClient):
         self.request_timeout = 1
         self.pull_timeout = 2
 
-    async def _post(self, destination, action, body, timeout=None, reference_parameters=()):
+    async def _post(self, destination, action, body, timeout=None, reference_parameters=(),
+                    *, allow_alternate_port=False):
         self.calls.append((destination, action, ET.tostring(body), timeout, reference_parameters))
         return ET.fromstring(self.responses.pop(0))
 
@@ -276,6 +277,40 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "configured camera origin"):
             client._validate_destination("http://camera.test:8080/events")
+
+    async def test_pullpoint_can_use_device_advertised_alternate_port(self):
+        requests = []
+
+        async def handle(request):
+            requests.append(request)
+            content = (
+                b"<Envelope xmlns:wsa='http://www.w3.org/2005/08/addressing'>"
+                b"<SubscriptionReference><wsa:Address>"
+                b"http://camera.test:1024/pullpoint"
+                b"</wsa:Address></SubscriptionReference></Envelope>"
+                if len(requests) == 1 else b"<Envelope/>"
+            )
+            return httpx.Response(200, content=content, request=request)
+
+        client = OnvifClient(
+            OnvifConfig(
+                "http://camera.test:2020/onvif/device_service",
+                SECRET_USER, SECRET_PASSWORD),
+            client_factory=client_using(httpx.MockTransport(handle)))
+        pullpoint = await client.subscribe("http://camera.test:2020/events")
+
+        await client.pull(pullpoint)
+        await client.unsubscribe(pullpoint)
+
+        self.assertEqual([2020, 1024, 1024], [request.url.port for request in requests])
+
+    async def test_pullpoint_alternate_port_does_not_allow_another_host(self):
+        client = OnvifClient(OnvifConfig(
+            "http://camera.test:2020/onvif/device_service",
+            SECRET_USER, SECRET_PASSWORD))
+
+        with self.assertRaisesRegex(ValueError, "configured camera origin"):
+            await client.pull(PullPoint("http://attacker.test:1024/pullpoint"))
 
     def test_default_and_explicit_default_ports_are_the_same_origin(self):
         client = OnvifClient(OnvifConfig(

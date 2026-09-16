@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import traceback
 
 from .config import _cameras_from_environment
 from .onvif import OnvifClient
@@ -29,6 +30,7 @@ async def _probe(camera_id: str, pulls: int, request_timeout: float, pull_timeou
                     f"fields={notification['fields']!r}")
     except Exception as exc:
         print(f"ONVIF probe failed ({type(exc).__name__}); endpoint and credentials were not shown.")
+        traceback.print_exc()
         return 1
     finally:
         if pullpoint is not None:
@@ -36,6 +38,7 @@ async def _probe(camera_id: str, pulls: int, request_timeout: float, pull_timeou
                 await client.unsubscribe(pullpoint)
             except Exception:
                 print("The best-effort ONVIF unsubscribe failed.")
+                traceback.print_exc()
     return 0
 
 

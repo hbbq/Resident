@@ -87,10 +87,15 @@ class OnvifClient:
         self._origin = _origin(config.endpoint)
         self._client_factory = client_factory
 
-    def _validate_destination(self, destination: str) -> None:
+    def _validate_destination(self, destination: str, *,
+                              allow_alternate_port: bool = False) -> None:
         parsed = urlsplit(destination)
         candidate = _origin(destination)
-        if candidate != self._origin or parsed.username is not None or parsed.password is not None:
+        origin_matches = (
+            candidate[:2] == self._origin[:2]
+            if allow_alternate_port else candidate == self._origin
+        )
+        if not origin_matches or parsed.username is not None or parsed.password is not None:
             raise ValueError("ONVIF service address is outside the configured camera origin")
 
     def _envelope(self, action: str, destination: str, body: ET.Element,
@@ -128,8 +133,10 @@ class OnvifClient:
 
     async def _post(self, destination: str, action: str, body: ET.Element,
                     timeout: float | None = None,
-                    reference_parameters: tuple[bytes, ...] = ()) -> ET.Element:
-        self._validate_destination(destination)
+                    reference_parameters: tuple[bytes, ...] = (), *,
+                    allow_alternate_port: bool = False) -> ET.Element:
+        self._validate_destination(
+            destination, allow_alternate_port=allow_alternate_port)
         payload = self._envelope(action, destination, body, reference_parameters)
         request_deadline = timeout or self.request_timeout
         async with asyncio.timeout(max(0.1, request_deadline)):
@@ -162,6 +169,32 @@ class OnvifClient:
         properties = await self._post(
             xaddr, f"{EVENTS}/EventPortType/GetEventPropertiesRequest",
             ET.Element(ET.QName(EVENTS, "GetEventProperties")))
+
+
+        for desc in properties.iter():
+            if _local_name(desc.tag) != "MessageDescription":
+                continue
+
+            print("DEBUG MessageDescription:",
+                "IsProperty=", desc.attrib.get("IsProperty"))
+
+            for section in desc:
+                section_name = _local_name(section.tag)
+                if section_name not in ("Source", "Key", "Data"):
+                    continue
+
+                print(f"  {section_name}:")
+                for item in section.iter():
+                    if _local_name(item.tag) == "SimpleItemDescription":
+                        print(
+                            "   ",
+                            item.attrib.get("Name"),
+                            "->",
+                            item.attrib.get("Type"),
+                        )
+
+
+        
         topic_set = next((element for element in properties.iter()
                           if _local_name(element.tag) == "TopicSet"), None)
         topics = self._topic_paths(topic_set) if topic_set is not None else ()
@@ -204,6 +237,16 @@ class OnvifClient:
             termination = self._parse_datetime(termination_text)
             current = self._parse_datetime(current_text) if current_text is not None else datetime.now(timezone.utc)
             expires_at = time.monotonic() + max(0.0, (termination - current).total_seconds())
+            parsed = urlsplit(address)
+            print("DEBUG PullPoint scheme:", parsed.scheme)
+            print("DEBUG PullPoint host:", parsed.hostname)
+            print("DEBUG PullPoint port:", parsed.port)
+            print("DEBUG PullPoint path:", parsed.path)
+            print("DEBUG PullPoint query:", parsed.query)
+            print(
+                "DEBUG reference parameters:",
+                [_local_name(ET.fromstring(p).tag) for p in serialized]
+            )
         return PullPoint(address, serialized, expires_at)
 
     @staticmethod
@@ -225,7 +268,8 @@ class OnvifClient:
         ET.SubElement(request, ET.QName(EVENTS, "MessageLimit")).text = "32"
         root = await self._post(
             pullpoint.address, f"{EVENTS}/PullPointSubscription/PullMessagesRequest", request,
-            pull_timeout + self.request_timeout, pullpoint.reference_parameters)
+            pull_timeout + self.request_timeout, pullpoint.reference_parameters,
+            allow_alternate_port=True)
         summaries = []
         for notification in (element for element in root.iter()
                              if _local_name(element.tag) == "NotificationMessage"):
@@ -245,4 +289,5 @@ class OnvifClient:
         await self._post(
             pullpoint.address, f"{NOTIFY_WSDL}/SubscriptionManager/UnsubscribeRequest",
             ET.Element(ET.QName(NOTIFY, "Unsubscribe")),
-            reference_parameters=pullpoint.reference_parameters)
+            reference_parameters=pullpoint.reference_parameters,
+            allow_alternate_port=True)
