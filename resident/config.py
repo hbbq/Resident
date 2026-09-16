@@ -75,9 +75,17 @@ def _cameras_from_environment() -> tuple[CameraConfig, ...]:
             endpoint = onvif_item.get("endpoint")
             username = onvif_item.get("username")
             password = onvif_item.get("password")
-            parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
+            try:
+                parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
+                port = parsed.port if parsed is not None else None
+            except ValueError as exc:
+                raise ValueError(
+                    f"Camera {camera_id} ONVIF endpoint must have a valid port") from exc
             if parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc:
                 raise ValueError(f"Camera {camera_id} ONVIF endpoint must be an absolute HTTP(S) URL")
+            effective_port = port if port is not None else {"http": 80, "https": 443}[parsed.scheme]
+            if not 1 <= effective_port <= 65535:
+                raise ValueError(f"Camera {camera_id} ONVIF endpoint must have a valid port")
             if not isinstance(username, str) or not username:
                 raise ValueError(f"Camera {camera_id} ONVIF username must be nonempty")
             if not isinstance(password, str) or not password:

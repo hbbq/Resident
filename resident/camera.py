@@ -111,10 +111,12 @@ class CameraConnector:
         assert camera.onvif is not None
         while not stop.is_set():
             pullpoint = None
-            client = self._onvif_client_factory(
-                camera.onvif, request_timeout=self.onvif_request_timeout_seconds,
-                pull_timeout=self.onvif_pull_timeout_seconds)
+            client = None
+            recreate = False
             try:
+                client = self._onvif_client_factory(
+                    camera.onvif, request_timeout=self.onvif_request_timeout_seconds,
+                    pull_timeout=self.onvif_pull_timeout_seconds)
                 service, topics = await client.discover()
                 topic_text = ", ".join(topics) if topics else "none advertised"
                 self.diagnostic_output(
@@ -122,6 +124,10 @@ class CameraConnector:
                 pullpoint = await client.subscribe(service)
                 self.diagnostic_output(f"{camera.id}: ONVIF PullPoint subscription active")
                 while not stop.is_set():
+                    if pullpoint.expires_within(
+                            self.onvif_pull_timeout_seconds + self.onvif_request_timeout_seconds):
+                        recreate = True
+                        break
                     notifications = await client.pull(pullpoint)
                     for notification in notifications:
                         self.diagnostic_output(
@@ -138,9 +144,11 @@ class CameraConnector:
                 self.diagnostic_output(
                     f"{camera.id}: ONVIF probe/pull failed ({type(exc).__name__}); retrying")
             finally:
-                if pullpoint is not None:
+                if client is not None and pullpoint is not None:
                     with suppress(Exception):
                         await asyncio.shield(client.unsubscribe(pullpoint))
+            if recreate:
+                continue
             try:
                 await asyncio.wait_for(stop.wait(), self.onvif_retry_seconds)
             except TimeoutError:

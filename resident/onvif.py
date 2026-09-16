@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import os
+import time
 from typing import Callable, Iterable
 import uuid
 from urllib.parse import urlsplit
@@ -28,6 +29,7 @@ DEVICE = "http://www.onvif.org/ver10/device/wsdl"
 EVENTS = "http://www.onvif.org/ver10/events/wsdl"
 TOPICS = "http://docs.oasis-open.org/wsn/t-1"
 NOTIFY = "http://docs.oasis-open.org/wsn/b-2"
+NOTIFY_WSDL = "http://docs.oasis-open.org/wsn/bw-2"
 MAX_TOPIC_PATHS = 100
 MAX_NOTIFICATION_FIELDS = 32
 MAX_DIAGNOSTIC_NAME_LENGTH = 256
@@ -38,6 +40,10 @@ MAX_DIAGNOSTIC_NAMES_LENGTH = 4_096
 class PullPoint:
     address: str
     reference_parameters: tuple[bytes, ...] = field(default=(), repr=False)
+    expires_at: float | None = field(default=None, repr=False)
+
+    def expires_within(self, seconds: float) -> bool:
+        return self.expires_at is not None and self.expires_at <= time.monotonic() + seconds
 
 
 def _local_name(tag: str) -> str:
@@ -192,7 +198,23 @@ class OnvifClient:
         parameters = next((element for element in reference.iter()
                            if _local_name(element.tag) == "ReferenceParameters"), None)
         serialized = tuple(ET.tostring(child) for child in parameters)[:32] if parameters is not None else ()
-        return PullPoint(address, serialized)
+        current_text = next((element.text for element in root.iter()
+                             if _local_name(element.tag) == "CurrentTime" and element.text), None)
+        termination_text = next((element.text for element in root.iter()
+                                 if _local_name(element.tag) == "TerminationTime" and element.text), None)
+        expires_at = None
+        if termination_text is not None:
+            termination = self._parse_datetime(termination_text)
+            current = self._parse_datetime(current_text) if current_text is not None else datetime.now(timezone.utc)
+            expires_at = time.monotonic() + max(0.0, (termination - current).total_seconds())
+        return PullPoint(address, serialized, expires_at)
+
+    @staticmethod
+    def _parse_datetime(value: str) -> datetime:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     async def pull(self, pullpoint: PullPoint) -> tuple[dict[str, object], ...]:
         request = ET.Element(ET.QName(EVENTS, "PullMessages"))
@@ -218,6 +240,6 @@ class OnvifClient:
 
     async def unsubscribe(self, pullpoint: PullPoint) -> None:
         await self._post(
-            pullpoint.address, f"{EVENTS}/SubscriptionManager/Unsubscribe",
+            pullpoint.address, f"{NOTIFY_WSDL}/SubscriptionManager/UnsubscribeRequest",
             ET.Element(ET.QName(NOTIFY, "Unsubscribe")),
             reference_parameters=pullpoint.reference_parameters)

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import unittest
 import xml.etree.ElementTree as ET
 
 from resident.camera import CameraConnector
 from resident.config import CameraConfig, OnvifConfig
 from resident.onvif import (
-    EVENTS, MAX_DIAGNOSTIC_NAMES_LENGTH, MAX_DIAGNOSTIC_NAME_LENGTH, TOPICS, OnvifClient,
-    PullPoint,
+    EVENTS, MAX_DIAGNOSTIC_NAMES_LENGTH, MAX_DIAGNOSTIC_NAME_LENGTH, NOTIFY_WSDL, TOPICS,
+    OnvifClient, PullPoint,
 )
 
 
@@ -120,6 +121,31 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"subscription-1", pullpoint.reference_parameters[0])
         self.assertEqual(pullpoint.reference_parameters, client.calls[1][4])
 
+    async def test_subscription_tracks_finite_lifetime(self):
+        client = StubClient(["""
+            <Envelope xmlns:wsa='http://www.w3.org/2005/08/addressing'>
+              <SubscriptionReference><wsa:Address>http://camera.test/pull</wsa:Address>
+              </SubscriptionReference>
+              <CurrentTime>2026-09-16T10:00:00Z</CurrentTime>
+              <TerminationTime>2026-09-16T10:02:00Z</TerminationTime>
+            </Envelope>"""])
+        started = time.monotonic()
+
+        pullpoint = await client.subscribe("http://camera.test/events")
+
+        self.assertIsNotNone(pullpoint.expires_at)
+        self.assertAlmostEqual(started + 120, pullpoint.expires_at, delta=1)
+        self.assertFalse(pullpoint.expires_within(60))
+        self.assertTrue(pullpoint.expires_within(121))
+
+    async def test_unsubscribe_uses_ws_base_notification_action(self):
+        client = StubClient(["<Envelope/>"])
+
+        await client.unsubscribe(PullPoint("http://camera.test/pull"))
+
+        self.assertEqual(
+            f"{NOTIFY_WSDL}/SubscriptionManager/UnsubscribeRequest", client.calls[0][1])
+
     def test_soap_envelope_uses_password_digest_not_plaintext_password(self):
         client = OnvifClient(OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
 
@@ -175,6 +201,35 @@ class FakeOnvifClient:
 
 
 class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finite_subscription_is_recreated_before_expiry(self):
+        stop = asyncio.Event()
+
+        class ExpiringClient(FakeOnvifClient):
+            subscriptions = 0
+
+            async def subscribe(self, _):
+                self.__class__.subscriptions += 1
+                if self.__class__.subscriptions == 2:
+                    stop.set()
+                return PullPoint("internal-pullpoint", expires_at=time.monotonic() + 1)
+
+            async def pull(self, _):
+                raise AssertionError("an expiring subscription must not start a long pull")
+
+        ExpiringClient.instances.clear()
+        ExpiringClient.subscriptions = 0
+        camera = CameraConfig(
+            "entry", "Entry", "rtsp://secret@camera.test/live", None,
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+        connector = CameraConnector(
+            [camera], onvif_client_factory=ExpiringClient,
+            onvif_request_timeout_seconds=1, onvif_pull_timeout_seconds=1)
+
+        await connector.run(asyncio.Queue(), stop)
+
+        self.assertEqual(2, ExpiringClient.subscriptions)
+        self.assertTrue(all(client.unsubscribed for client in ExpiringClient.instances))
+
     async def test_probe_is_opt_in_diagnostic_only_and_stops_cleanly(self):
         FakeOnvifClient.instances.clear()
         diagnostics = []
@@ -227,6 +282,31 @@ class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(queue.empty())
         self.assertNotIn(SECRET_ENDPOINT, diagnostics[0])
         self.assertNotIn(SECRET_PASSWORD, diagnostics[0])
+
+    async def test_client_construction_failure_is_retried(self):
+        stop = asyncio.Event()
+        attempts = 0
+
+        def factory(config, **options):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ValueError(f"bad endpoint {SECRET_ENDPOINT}")
+            stop.set()
+            return FakeOnvifClient(config, **options)
+
+        diagnostics = []
+        camera = CameraConfig(
+            "entry", "Entry", "rtsp://secret@camera.test/live", None,
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+        connector = CameraConnector(
+            [camera], onvif_client_factory=factory, onvif_retry_seconds=0.01,
+            diagnostic_output=diagnostics.append)
+
+        await connector.run(asyncio.Queue(), stop)
+
+        self.assertEqual(2, attempts)
+        self.assertNotIn(SECRET_ENDPOINT, "\n".join(diagnostics))
 
 
 if __name__ == "__main__":

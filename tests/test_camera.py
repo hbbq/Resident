@@ -249,6 +249,17 @@ class CameraConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "onvif|ONVIF"):
                     Config.from_env_and_args(["--data-dir", ".resident"])
 
+    def test_onvif_configuration_rejects_invalid_effective_ports(self):
+        for endpoint in ("http://camera.test:99999/onvif", "https://camera.test:0/onvif"):
+            configured = [{
+                "id": "entry", "name": "Entry", "url": SECRET_URL,
+                "onvif": {"endpoint": endpoint, "username": "user", "password": "pass"},
+            }]
+            with self.subTest(endpoint=endpoint), patch.dict(
+                    os.environ, {"RESIDENT_CAMERAS": json.dumps(configured)}):
+                with self.assertRaisesRegex(ValueError, "ONVIF endpoint.*valid port"):
+                    Config.from_env_and_args(["--data-dir", ".resident"])
+
 
 class CaptureProvider:
     def __init__(self):
