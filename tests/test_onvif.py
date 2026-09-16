@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
 import unittest
 import xml.etree.ElementTree as ET
+
+import httpx
 
 from resident.camera import CameraConnector
 from resident.config import CameraConfig, OnvifConfig
@@ -18,6 +19,34 @@ from resident.onvif import (
 SECRET_ENDPOINT = "http://camera.test/onvif/device_service"
 SECRET_USER = "onvif-user"
 SECRET_PASSWORD = "onvif-password"
+
+
+class BlockingTransport(httpx.AsyncBaseTransport):
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.active = 0
+        self.maximum_active = 0
+        self.aborted = 0
+
+    async def handle_async_request(self, request):
+        self.active += 1
+        self.maximum_active = max(self.maximum_active, self.active)
+        self.started.set()
+        try:
+            await self.release.wait()
+            return httpx.Response(200, content=b"<Envelope/>", request=request)
+        except asyncio.CancelledError:
+            self.aborted += 1
+            raise
+        finally:
+            self.active -= 1
+
+
+def client_using(transport):
+    def factory(**options):
+        return httpx.AsyncClient(transport=transport, **options)
+    return factory
 
 
 class StubClient(OnvifClient):
@@ -209,6 +238,33 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(SECRET_PASSWORD.encode(), envelope)
         self.assertIn(b"PasswordDigest", envelope)
 
+    async def test_http_digest_authentication_is_preserved(self):
+        requests = []
+
+        async def handle(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(401, headers={
+                    "WWW-Authenticate": (
+                        'Digest realm="camera", nonce="0123456789", '
+                        'algorithm=MD5, qop="auth"'),
+                }, request=request)
+            return httpx.Response(200, content=b"<Envelope/>", request=request)
+
+        client = OnvifClient(
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD),
+            client_factory=client_using(httpx.MockTransport(handle)))
+
+        await client._post(
+            SECRET_ENDPOINT, f"{EVENTS}/GetEventProperties",
+            ET.Element(ET.QName(EVENTS, "GetEventProperties")))
+
+        self.assertEqual(2, len(requests))
+        authorization = requests[1].headers["Authorization"]
+        self.assertTrue(authorization.startswith("Digest "))
+        self.assertIn(f'username="{SECRET_USER}"', authorization)
+        self.assertNotIn(SECRET_PASSWORD, authorization)
+
     def test_discovered_service_cannot_send_credentials_to_another_origin(self):
         client = OnvifClient(OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
 
@@ -227,39 +283,59 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
 
         client._validate_destination("https://camera.test/events")
 
-    def test_asyncio_shutdown_does_not_wait_for_blocked_urllib_request(self):
-        request_started = threading.Event()
-        release_request = threading.Event()
+    async def test_timed_out_request_is_aborted_before_retry_begins(self):
+        transport = BlockingTransport()
+        client = OnvifClient(
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD),
+            request_timeout=0.1, client_factory=client_using(transport))
+        request = ET.Element(ET.QName(EVENTS, "GetEventProperties"))
 
-        class BlockingOpener:
-            def open(self, *_args, **_kwargs):
-                request_started.set()
-                release_request.wait()
-                raise TimeoutError
+        with self.assertRaises(TimeoutError):
+            await client._post(SECRET_ENDPOINT, "urn:first", request)
+        self.assertEqual(0, transport.active)
 
-        async def run_connector():
-            camera = CameraConfig(
-                "entry", "Entry", "rtsp://secret@camera.test/live", None,
-                OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
-            connector = CameraConnector(
-                [camera], onvif_client_factory=lambda config, **options: OnvifClient(
-                    config, opener_factory=lambda *_: BlockingOpener(), **options))
-            stop = asyncio.Event()
-            task = asyncio.create_task(connector.run(asyncio.Queue(), stop))
-            while not request_started.is_set():
-                await asyncio.sleep(0)
-            stop.set()
-            await task
+        transport.started.clear()
+        retry = asyncio.create_task(client._post(SECRET_ENDPOINT, "urn:retry", request))
+        await transport.started.wait()
+        self.assertEqual(1, transport.active)
+        retry.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await retry
+        self.assertEqual(0, transport.active)
+        self.assertEqual(2, transport.aborted)
 
-        runner = threading.Thread(target=lambda: asyncio.run(run_connector()))
-        runner.start()
-        try:
-            self.assertTrue(request_started.wait(1))
-            runner.join(0.5)
-            self.assertFalse(runner.is_alive())
-        finally:
-            release_request.set()
-            runner.join(1)
+    async def test_connector_shutdown_aborts_in_flight_request(self):
+        transport = BlockingTransport()
+        camera = CameraConfig(
+            "entry", "Entry", "rtsp://secret@camera.test/live", None,
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+        connector = CameraConnector(
+            [camera], onvif_client_factory=lambda config, **options: OnvifClient(
+                config, client_factory=client_using(transport), **options))
+        stop = asyncio.Event()
+        task = asyncio.create_task(connector.run(asyncio.Queue(), stop))
+        await transport.started.wait()
+
+        stop.set()
+        await asyncio.wait_for(task, 0.5)
+
+        self.assertEqual(0, transport.active)
+        self.assertEqual(1, transport.aborted)
+
+    async def test_repeated_timeouts_do_not_accumulate_concurrent_requests(self):
+        transport = BlockingTransport()
+        client = OnvifClient(
+            OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD),
+            request_timeout=0.1, client_factory=client_using(transport))
+        request = ET.Element(ET.QName(EVENTS, "GetEventProperties"))
+
+        for attempt in range(5):
+            with self.assertRaises(TimeoutError):
+                await client._post(SECRET_ENDPOINT, f"urn:attempt:{attempt}", request)
+            self.assertEqual(0, transport.active)
+
+        self.assertEqual(1, transport.maximum_active)
+        self.assertEqual(5, transport.aborted)
 
 
 class FakeOnvifClient:

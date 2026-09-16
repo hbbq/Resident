@@ -6,16 +6,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import os
-import threading
 import time
 from typing import Callable, Iterable
 import uuid
 from urllib.parse import urlsplit
-from urllib.request import (
-    HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, HTTPRedirectHandler, Request,
-    build_opener,
-)
 import xml.etree.ElementTree as ET
+
+import httpx
 
 from .config import OnvifConfig
 
@@ -78,35 +75,23 @@ def _bounded_names(names: Iterable[str], count: int) -> tuple[str, ...]:
     return tuple(bounded)
 
 
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 class OnvifClient:
     """Small ONVIF event probe; raw XML and credentials never leave this boundary."""
 
     def __init__(self, config: OnvifConfig, *, request_timeout: float = 10.0,
                  pull_timeout: float = 30.0,
-                 opener_factory: Callable[..., object] = build_opener):
+                 client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient):
         self.config = config
         self.request_timeout = request_timeout
         self.pull_timeout = pull_timeout
-        self._passwords = HTTPPasswordMgrWithDefaultRealm()
-        self._passwords.add_password(None, config.endpoint, config.username, config.password)
-        parsed = urlsplit(config.endpoint)
         self._origin = _origin(config.endpoint)
-        self._passwords.add_password(
-            None, f"{parsed.scheme}://{parsed.netloc}/", config.username, config.password)
-        self._opener = opener_factory(HTTPDigestAuthHandler(self._passwords), _NoRedirect())
+        self._client_factory = client_factory
 
     def _validate_destination(self, destination: str) -> None:
         parsed = urlsplit(destination)
         candidate = _origin(destination)
         if candidate != self._origin or parsed.username is not None or parsed.password is not None:
             raise ValueError("ONVIF service address is outside the configured camera origin")
-        self._passwords.add_password(
-            None, destination, self.config.username, self.config.password)
 
     def _envelope(self, action: str, destination: str, body: ET.Element,
                   reference_parameters: tuple[bytes, ...] = ()) -> bytes:
@@ -141,52 +126,28 @@ class OnvifClient:
         ET.SubElement(envelope, ET.QName(SOAP, "Body")).append(body)
         return ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
 
-    def _post_sync(self, destination: str, action: str, body: ET.Element,
-                   timeout: float | None = None,
-                   reference_parameters: tuple[bytes, ...] = ()) -> ET.Element:
-        self._validate_destination(destination)
-        payload = self._envelope(action, destination, body, reference_parameters)
-        request = Request(destination, data=payload, method="POST", headers={
-            "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"',
-        })
-        with self._opener.open(request, timeout=timeout or self.request_timeout) as response:
-            document = response.read(2_000_001)
-        if len(document) > 2_000_000:
-            raise ValueError("ONVIF response exceeded size limit")
-        return ET.fromstring(document)
-
     async def _post(self, destination: str, action: str, body: ET.Element,
                     timeout: float | None = None,
                     reference_parameters: tuple[bytes, ...] = ()) -> ET.Element:
-        loop = asyncio.get_running_loop()
-        result: asyncio.Future[ET.Element] = loop.create_future()
-
-        def complete(value: ET.Element | None, error: BaseException | None) -> None:
-            if result.done():
-                return
-            if error is not None:
-                result.set_exception(error)
-            else:
-                assert value is not None
-                result.set_result(value)
-
-        def request() -> None:
-            try:
-                value, error = self._post_sync(
-                    destination, action, body, timeout, reference_parameters), None
-            except BaseException as exc:
-                value, error = None, exc
-            try:
-                loop.call_soon_threadsafe(complete, value, error)
-            except RuntimeError:
-                # The request is isolated in a daemon thread specifically so a closed
-                # event loop cannot make process shutdown wait for blocking urllib work.
-                pass
-
-        threading.Thread(target=request, name="resident-onvif-request", daemon=True).start()
+        self._validate_destination(destination)
+        payload = self._envelope(action, destination, body, reference_parameters)
         request_deadline = timeout or self.request_timeout
         async with asyncio.timeout(max(0.1, request_deadline)):
-            return await result
+            async with self._client_factory(
+                    auth=httpx.DigestAuth(self.config.username, self.config.password),
+                    follow_redirects=False, timeout=None, trust_env=False) as client:
+                async with client.stream(
+                        "POST", destination, content=payload, headers={
+                            "Content-Type": (
+                                f'application/soap+xml; charset=utf-8; action="{action}"'),
+                        }) as response:
+                    response.raise_for_status()
+                    document = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        document.extend(chunk)
+                        if len(document) > 2_000_000:
+                            raise ValueError("ONVIF response exceeded size limit")
+        return ET.fromstring(document)
 
     async def discover(self) -> tuple[str, tuple[str, ...]]:
         request = ET.Element(ET.QName(DEVICE, "GetCapabilities"))
