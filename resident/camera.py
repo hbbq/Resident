@@ -9,10 +9,12 @@ from typing import Awaitable, Callable, Sequence
 from .capabilities import Capability
 from .config import CameraConfig
 from .domain import ImageAttachment, ToolOutput, WakeEvent
+from .onvif import SUBSCRIPTION_SAFETY_MARGIN, OnvifClient
 from .store import utc_now
 
 
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
+OnvifClientFactory = Callable[..., OnvifClient]
 
 
 class CameraConnector:
@@ -21,7 +23,12 @@ class CameraConnector:
     def __init__(self, cameras: Sequence[CameraConfig], *, timeout_seconds: float = 8.0,
                  max_width: int = 1280, max_height: int = 720, max_bytes: int = 2_000_000,
                  rtsp_transport: str = "tcp", ffmpeg_executable: str = "ffmpeg",
-                 process_factory: ProcessFactory = asyncio.create_subprocess_exec):
+                 process_factory: ProcessFactory = asyncio.create_subprocess_exec,
+                 onvif_request_timeout_seconds: float = 10.0,
+                 onvif_pull_timeout_seconds: float = 30.0,
+                 onvif_retry_seconds: float = 30.0,
+                 onvif_client_factory: OnvifClientFactory = OnvifClient,
+                 diagnostic_output: Callable[[str], None] | None = None):
         self._cameras = {camera.id: camera for camera in cameras}
         if len(self._cameras) != len(cameras):
             raise ValueError("Duplicate camera id")
@@ -29,7 +36,13 @@ class CameraConnector:
         self.max_width, self.max_height, self.max_bytes = max_width, max_height, max_bytes
         self.rtsp_transport, self.ffmpeg_executable = rtsp_transport, ffmpeg_executable
         self._process_factory = process_factory
+        self.onvif_request_timeout_seconds = max(0.1, onvif_request_timeout_seconds)
+        self.onvif_pull_timeout_seconds = max(1.0, onvif_pull_timeout_seconds)
+        self.onvif_retry_seconds = max(0.1, onvif_retry_seconds)
+        self._onvif_client_factory = onvif_client_factory
+        self.diagnostic_output = diagnostic_output or (lambda _: None)
         self._runtime_queue: asyncio.Queue[WakeEvent] | None = None
+        self._camera_refresh: asyncio.Event | None = None
         self._pending_events: list[WakeEvent] = []
         self.capabilities = [
             Capability(
@@ -76,17 +89,115 @@ class CameraConnector:
             self._pending_events.append(event)
         else:
             self._runtime_queue.put_nowait(event)
+            assert self._camera_refresh is not None
+            self._camera_refresh.set()
         return event
 
     async def run(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
         self._runtime_queue = queue
+        self._camera_refresh = asyncio.Event()
         for event in self._pending_events:
             queue.put_nowait(event)
         self._pending_events.clear()
+        workers: dict[str, tuple[CameraConfig, asyncio.Task[None]]] = {}
         try:
-            await stop.wait()
+            await self._reconcile_onvif_workers(workers, stop)
+            while not stop.is_set():
+                stop_waiter = asyncio.create_task(stop.wait())
+                refresh_waiter = asyncio.create_task(self._camera_refresh.wait())
+                done, pending = await asyncio.wait(
+                    (stop_waiter, refresh_waiter), return_when=asyncio.FIRST_COMPLETED)
+                for waiter in pending:
+                    waiter.cancel()
+                for waiter in pending:
+                    with suppress(asyncio.CancelledError):
+                        await waiter
+                if stop_waiter in done:
+                    break
+                self._camera_refresh.clear()
+                await self._reconcile_onvif_workers(workers, stop)
         finally:
+            for _, worker in workers.values():
+                worker.cancel()
+            for _, worker in workers.values():
+                with suppress(asyncio.CancelledError):
+                    await worker
             self._runtime_queue = None
+            self._camera_refresh = None
+
+    async def _reconcile_onvif_workers(
+            self, workers: dict[str, tuple[CameraConfig, asyncio.Task[None]]],
+            stop: asyncio.Event) -> None:
+        desired = {
+            camera.id: camera for camera in self._cameras.values()
+            if camera.onvif is not None
+        }
+        stale_ids = [
+            camera_id for camera_id, (camera, _) in workers.items()
+            if camera_id not in desired or camera.onvif != desired[camera_id].onvif
+        ]
+        stale_workers = []
+        for camera_id in stale_ids:
+            _, worker = workers.pop(camera_id)
+            worker.cancel()
+            stale_workers.append(worker)
+        for worker in stale_workers:
+            with suppress(asyncio.CancelledError):
+                await worker
+        for camera_id, camera in desired.items():
+            if camera_id not in workers:
+                workers[camera_id] = (camera, asyncio.create_task(self._run_onvif(camera, stop)))
+
+    async def _run_onvif(self, camera: CameraConfig, stop: asyncio.Event) -> None:
+        assert camera.onvif is not None
+        while not stop.is_set():
+            pullpoint = None
+            client = None
+            recreate = False
+            try:
+                client = self._onvif_client_factory(
+                    camera.onvif, request_timeout=self.onvif_request_timeout_seconds,
+                    pull_timeout=self.onvif_pull_timeout_seconds)
+                service, topics = await client.discover()
+                topic_text = ", ".join(topics) if topics else "none advertised"
+                self.diagnostic_output(
+                    f"{camera.id}: ONVIF event topics ({len(topics)}): {topic_text}")
+                pullpoint = await client.subscribe(service)
+                if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
+                    self.diagnostic_output(
+                        f"{camera.id}: ONVIF PullPoint subscription lifetime unusable; retrying")
+                else:
+                    self.diagnostic_output(f"{camera.id}: ONVIF PullPoint subscription active")
+                    while not stop.is_set():
+                        if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
+                            recreate = True
+                            break
+                        notifications = await client.pull(pullpoint)
+                        for notification in notifications:
+                            self.diagnostic_output(
+                                f"{camera.id}: observed ONVIF event shape: "
+                                f"topic={notification['topic']!r}, fields={notification['fields']!r}")
+                        if not notifications:
+                            try:
+                                await asyncio.wait_for(
+                                    stop.wait(), min(1.0, self.onvif_retry_seconds))
+                            except TimeoutError:
+                                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.diagnostic_output(
+                    f"{camera.id}: ONVIF probe/pull failed ({type(exc).__name__}); retrying")
+            finally:
+                if client is not None and pullpoint is not None:
+                    with suppress(Exception):
+                        await asyncio.shield(client.unsubscribe(pullpoint))
+            if recreate:
+                continue
+            try:
+                await asyncio.wait_for(stop.wait(), self.onvif_retry_seconds)
+            except TimeoutError:
+                pass
 
     async def list_cameras(self, _: dict) -> dict:
         return {"cameras": [self._safe_metadata(camera) for camera in self._cameras.values()]}

@@ -29,6 +29,10 @@ class TerminalDiagnostics:
         if self.verbose:
             print(f"[agentcontroller] {message}")
 
+    def camera(self, message: str) -> None:
+        if self.verbose:
+            print(f"[camera] {message}")
+
     def telegram(self, message: str) -> None:
         if self.verbose or message.startswith("permanent failure:"):
             print(f"[telegram] {message}")
@@ -66,6 +70,10 @@ def main() -> int:
             max_width=config.camera_max_width, max_height=config.camera_max_height,
             max_bytes=config.camera_max_bytes, rtsp_transport=config.camera_rtsp_transport,
             ffmpeg_executable=config.ffmpeg_executable,
+            onvif_request_timeout_seconds=config.camera_onvif_request_timeout_seconds,
+            onvif_pull_timeout_seconds=config.camera_onvif_pull_timeout_seconds,
+            onvif_retry_seconds=config.camera_onvif_retry_seconds,
+            diagnostic_output=terminal_diagnostics.camera,
         )
         connectors.append(cameras)
         capabilities.extend(cameras.capabilities)
