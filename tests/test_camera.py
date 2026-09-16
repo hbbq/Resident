@@ -220,6 +220,35 @@ class CameraConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Duplicate camera id"):
                 Config.from_env_and_args(["--data-dir", ".resident"])
 
+    def test_onvif_configuration_is_explicit_and_secrets_are_redacted(self):
+        configured = [{
+            "id": "entry", "name": "Entry", "url": SECRET_URL,
+            "onvif": {
+                "endpoint": "http://camera.test/onvif/device_service",
+                "username": "onvif-user", "password": "onvif-password",
+            },
+        }]
+        with patch.dict(os.environ, {"RESIDENT_CAMERAS": json.dumps(configured)}):
+            config = Config.from_env_and_args(["--data-dir", ".resident"])
+
+        camera = config.cameras[0]
+        self.assertEqual("http://camera.test/onvif/device_service", camera.onvif.endpoint)
+        rendered = repr(camera)
+        self.assertNotIn("camera.test", rendered)
+        self.assertNotIn("onvif-user", rendered)
+        self.assertNotIn("onvif-password", rendered)
+
+    def test_partial_or_non_http_onvif_configuration_is_rejected(self):
+        for onvif in (
+            {"endpoint": "http://camera.test/onvif", "username": "user"},
+            {"endpoint": "rtsp://camera.test/onvif", "username": "user", "password": "pass"},
+        ):
+            configured = [{"id": "entry", "name": "Entry", "url": SECRET_URL, "onvif": onvif}]
+            with self.subTest(onvif=onvif), patch.dict(
+                    os.environ, {"RESIDENT_CAMERAS": json.dumps(configured)}):
+                with self.assertRaisesRegex(ValueError, "onvif|ONVIF"):
+                    Config.from_env_and_args(["--data-dir", ".resident"])
+
 
 class CaptureProvider:
     def __init__(self):

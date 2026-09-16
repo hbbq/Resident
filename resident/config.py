@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 DEFAULT_PERSONALITY = (
@@ -22,11 +23,19 @@ def _environment_flag(name: str, default: bool = False) -> bool:
 
 
 @dataclass(frozen=True)
+class OnvifConfig:
+    endpoint: str = field(repr=False)
+    username: str = field(repr=False)
+    password: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class CameraConfig:
     id: str
     name: str
     rtsp_url: str = field(repr=False)
     description: str | None = None
+    onvif: OnvifConfig | None = field(default=None, repr=False)
 
 
 def _cameras_from_environment() -> tuple[CameraConfig, ...]:
@@ -42,10 +51,12 @@ def _cameras_from_environment() -> tuple[CameraConfig, ...]:
     cameras: list[CameraConfig] = []
     seen: set[str] = set()
     for item in items:
-        if not isinstance(item, dict) or set(item) - {"id", "name", "url", "description"}:
-            raise ValueError("Each camera must contain only id, name, url, and optional description")
+        if not isinstance(item, dict) or set(item) - {"id", "name", "url", "description", "onvif"}:
+            raise ValueError(
+                "Each camera must contain only id, name, url, optional description, and optional onvif")
         camera_id, name, url = item.get("id"), item.get("name"), item.get("url")
         description = item.get("description")
+        onvif_item = item.get("onvif")
         if not isinstance(camera_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", camera_id):
             raise ValueError("Camera id must be 1-64 safe identifier characters")
         if camera_id in seen:
@@ -56,8 +67,25 @@ def _cameras_from_environment() -> tuple[CameraConfig, ...]:
             raise ValueError(f"Camera {camera_id} must have an RTSP URL")
         if description is not None and not isinstance(description, str):
             raise ValueError(f"Camera {camera_id} description must be a string")
+        onvif = None
+        if onvif_item is not None:
+            if not isinstance(onvif_item, dict) or set(onvif_item) != {"endpoint", "username", "password"}:
+                raise ValueError(
+                    f"Camera {camera_id} onvif must contain endpoint, username, and password")
+            endpoint = onvif_item.get("endpoint")
+            username = onvif_item.get("username")
+            password = onvif_item.get("password")
+            parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
+            if parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise ValueError(f"Camera {camera_id} ONVIF endpoint must be an absolute HTTP(S) URL")
+            if not isinstance(username, str) or not username:
+                raise ValueError(f"Camera {camera_id} ONVIF username must be nonempty")
+            if not isinstance(password, str) or not password:
+                raise ValueError(f"Camera {camera_id} ONVIF password must be nonempty")
+            onvif = OnvifConfig(endpoint, username, password)
         seen.add(camera_id)
-        cameras.append(CameraConfig(camera_id, name.strip(), url, description.strip() if description else None))
+        cameras.append(CameraConfig(
+            camera_id, name.strip(), url, description.strip() if description else None, onvif))
     return tuple(cameras)
 
 
@@ -93,6 +121,9 @@ class Config:
     camera_max_height: int = 720
     camera_max_bytes: int = 2_000_000
     camera_rtsp_transport: str = "tcp"
+    camera_onvif_request_timeout_seconds: float = 10.0
+    camera_onvif_pull_timeout_seconds: float = 30.0
+    camera_onvif_retry_seconds: float = 30.0
     ffmpeg_executable: str = "ffmpeg"
     verbose: bool = False
 
@@ -134,6 +165,12 @@ class Config:
                             default=int(os.getenv("RESIDENT_CAMERA_MAX_BYTES", "2000000")))
         parser.add_argument("--camera-rtsp-transport", choices=("tcp", "udp"),
                             default=os.getenv("RESIDENT_CAMERA_RTSP_TRANSPORT", "tcp"))
+        parser.add_argument("--camera-onvif-request-timeout-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_CAMERA_ONVIF_REQUEST_TIMEOUT_SECONDS", "10")))
+        parser.add_argument("--camera-onvif-pull-timeout-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_CAMERA_ONVIF_PULL_TIMEOUT_SECONDS", "30")))
+        parser.add_argument("--camera-onvif-retry-seconds", type=float,
+                            default=float(os.getenv("RESIDENT_CAMERA_ONVIF_RETRY_SECONDS", "30")))
         parser.add_argument("--ffmpeg-executable", default=os.getenv("RESIDENT_FFMPEG_EXECUTABLE", "ffmpeg"))
         args = parser.parse_args(argv)
         telegram_token = os.getenv("RESIDENT_TELEGRAM_BOT_TOKEN", "").strip() or None
@@ -178,5 +215,8 @@ class Config:
             camera_max_height=max(1, args.camera_max_height),
             camera_max_bytes=max(1024, args.camera_max_bytes),
             camera_rtsp_transport=args.camera_rtsp_transport,
+            camera_onvif_request_timeout_seconds=max(0.1, args.camera_onvif_request_timeout_seconds),
+            camera_onvif_pull_timeout_seconds=max(1.0, args.camera_onvif_pull_timeout_seconds),
+            camera_onvif_retry_seconds=max(0.1, args.camera_onvif_retry_seconds),
             ffmpeg_executable=args.ffmpeg_executable,
         )

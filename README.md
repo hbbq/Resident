@@ -52,7 +52,7 @@ The first successful observation establishes a silent, durable baseline. Later a
 
 Resident can use the read-only `agentcontroller_list_workflow_items` capability, optionally filtered by exact `owner/name` repository and limited to at most 100 results. v0 exposes no issue body or comment inspection, run-log access, notification rule, or mutation capability. Resident decides whether a factual change warrants Owner communication. The polling interval defaults to 60 seconds and can be configured with `--agentcontroller-poll-seconds` or `RESIDENT_AGENTCONTROLLER_POLL_SECONDS`.
 
-## Experimental RTSP camera connector
+## Experimental camera connector
 
 Set `RESIDENT_CAMERAS` to a JSON array to opt into on-demand, read-only camera access. Each camera requires a stable `id`, display `name`, and secret `url`; `description` is optional safe metadata. For example:
 
@@ -66,6 +66,22 @@ Resident can list configured cameras with `camera_list` without connecting to th
 Capture defaults to RTSP over TCP, an 8-second timeout, 1280x720 maximum output dimensions, and a 2 MB encoded-frame limit. These can be adjusted with `--camera-rtsp-transport`, `--camera-capture-timeout-seconds`, `--camera-max-width`, `--camera-max-height`, and `--camera-max-bytes`, or their corresponding `RESIDENT_...` environment variables.
 
 `RESIDENT_CAMERAS` remains startup configuration. An embedding with a genuinely refreshable camera source can replace the connector's camera set explicitly; added, removed, or changed cameras then produce one `camera` / `cameras_changed` wake containing only safe IDs, names, and descriptions. Endpoint-only changes are detected but the endpoint and credentials are never included in the event.
+
+ONVIF event probing is a separate, opt-in experiment. Add an explicit `onvif` object to a camera; Resident never infers an ONVIF endpoint or credentials from its RTSP URL:
+
+```powershell
+$env:RESIDENT_CAMERAS = '[{"id":"entry","name":"Entry camera","url":"rtsp://user:password@camera.local/stream","onvif":{"endpoint":"http://camera.local/onvif/device_service","username":"local-onvif-user","password":"local-onvif-password"}}]'
+```
+
+While the connector is active it queries the advertised Event Service topics, creates a PullPoint subscription, and pulls notifications with finite timeouts. In verbose mode, operator diagnostics show advertised topic names and observed payload field names only. Raw XML, payload values, service/subscription URLs, credentials, and transport error text are not logged, journaled, or exposed to Resident. Offline cameras and subscription failures are retried without producing a wake. This first experiment deliberately emits no ONVIF `WakeEvent`: a factual state-transition mapping will be added only after the configured TP-Link camera's actual topics and values have been validated. It does not capture frames, analyze video, or notify the Owner in response to an ONVIF notification.
+
+For finite manual validation without starting Resident or requiring an OpenAI API key, set `RESIDENT_CAMERAS` locally as above and run:
+
+```powershell
+python -m resident.onvif_probe --camera-id entry --pulls 3
+```
+
+The probe prints the same sanitized topic/field shape information and attempts to unsubscribe before exiting. Request, pull, and retry timing can be configured for the runtime with `--camera-onvif-request-timeout-seconds`, `--camera-onvif-pull-timeout-seconds`, and `--camera-onvif-retry-seconds`, or the corresponding `RESIDENT_...` variables.
 
 Run the deterministic offline lifecycle suite without credentials:
 
