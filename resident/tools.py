@@ -40,21 +40,26 @@ class ToolRegistry:
         self.tools: dict[str, Tool] = {
             "remember": Tool(ToolSpec("remember",
                 "Persist a selective autobiographical memory with your own descriptive assessment. "
-                "Provenance describes the underlying information source; it does not enact policy.",
-                _schema(("content", "kind", "importance", "confidence", "provenance"),
+                "Provenance describes the underlying information source; it does not enact policy. "
+                "Set standing true only for an Owner-derived preference or rule that should be supplied "
+                "as durable guidance across future wakes, even without textual relevance.",
+                _schema(("content", "kind", "importance", "confidence", "provenance", "standing"),
                         content={"type": "string"}, kind={"type": "string", "enum": MEMORY_KINDS},
                         importance={"type": "string", "enum": MEMORY_LEVELS},
                         confidence={"type": "string", "enum": MEMORY_LEVELS},
-                        provenance={"type": "string", "enum": MEMORY_PROVENANCES})), self._remember),
+                        provenance={"type": "string", "enum": MEMORY_PROVENANCES},
+                        standing={"type": "boolean"})), self._remember),
             "recall": Tool(ToolSpec("recall", "Search persistent memories by words, ranked by relevance and semantic metadata, or list the most durable memories.",
                 _schema(("query",), query={"type": "string"}, limit={"type": "integer", "minimum": 1, "maximum": 20})), self._recall),
             "update_memory": Tool(ToolSpec("update_memory",
-                "Refine an existing memory's content or assessment instead of accumulating avoidable contradictions.",
+                "Refine an existing memory's content or assessment instead of accumulating avoidable "
+                "contradictions, especially when the Owner changes standing guidance.",
                 _schema(("id",), id={"type": "string"}, content={"type": "string"},
                         kind={"type": "string", "enum": MEMORY_KINDS},
                         importance={"type": "string", "enum": MEMORY_LEVELS},
                         confidence={"type": "string", "enum": MEMORY_LEVELS},
-                        provenance={"type": "string", "enum": MEMORY_PROVENANCES}) |
+                        provenance={"type": "string", "enum": MEMORY_PROVENANCES},
+                        standing={"type": "boolean"}) |
                 {"minProperties": 2}), self._update_memory),
             "forget": Tool(ToolSpec("forget", "Delete a memory by id.",
                 _schema(("id",), id={"type": "string"})), self._forget),
@@ -133,6 +138,7 @@ class ToolRegistry:
             allowed = [allowed] if isinstance(allowed, str) else allowed
             matches = (value is None and "null" in allowed) or ("string" in allowed and isinstance(value, str)) or \
                 ("integer" in allowed and isinstance(value, int) and not isinstance(value, bool)) or \
+                ("boolean" in allowed and isinstance(value, bool)) or \
                 ("object" in allowed and isinstance(value, dict))
             if not matches:
                 return f"Argument {key!r} has the wrong type"
@@ -145,7 +151,7 @@ class ToolRegistry:
     def _remember(self, a: dict[str, Any]) -> dict[str, Any]:
         item_id = self.store.remember(
             a["content"], "resident", kind=a["kind"], importance=a["importance"],
-            confidence=a["confidence"], provenance=a["provenance"])
+            confidence=a["confidence"], provenance=a["provenance"], standing=a["standing"])
         self.emit("memory.created", {"memory_id": item_id})
         return {"memory_id": item_id, "memory": self.store.memory(item_id)}
 
@@ -154,7 +160,7 @@ class ToolRegistry:
 
     def _update_memory(self, a: dict[str, Any]) -> dict[str, Any]:
         fields = {name: a[name] for name in (
-            "content", "kind", "importance", "confidence", "provenance") if name in a}
+            "content", "kind", "importance", "confidence", "provenance", "standing") if name in a}
         updated = self.store.update_memory(a["id"], **fields)
         if updated: self.emit("memory.updated", {"memory_id": a["id"]})
         return {"updated": updated, "memory": self.store.memory(a["id"]) if updated else None}

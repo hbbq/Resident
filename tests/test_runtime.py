@@ -34,6 +34,7 @@ class LifecycleProvider:
                 ToolCall(f"remember-{self.round}", "remember", {
                     "content": f"Wake observed: {content}", "kind": "experience",
                     "importance": "low", "confidence": "high", "provenance": "resident",
+                    "standing": False,
                 }),
                 ToolCall(f"time-{self.round}", "diagnostics_current_time", {}),
                 ToolCall(f"message-{self.round}", "send_owner_message", {"content": f"I observed {content}"}),
@@ -73,6 +74,7 @@ class ContinuationLifecycleProvider:
             return ModelTurn("continuation", tool_calls=(ToolCall("call", "remember", {
                 "content": "work", "kind": "experience", "importance": "low",
                 "confidence": "medium", "provenance": "resident",
+                "standing": False,
             }),))
         if self.cancel:
             await self.release.wait()
@@ -534,7 +536,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(7, store.connection.execute(
+            self.assertEqual(8, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
@@ -646,6 +648,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("all intentional communication", requests[0]["instructions"])
         self.assertIn("final response message is wake-result diagnostic text only",
                       requests[0]["instructions"])
+        self.assertIn("supplied owner_guidance", requests[0]["instructions"])
 
     async def test_image_tool_result_is_sent_as_multimodal_ephemeral_content(self):
         provider = OpenAIResponsesProvider("test-key", "vision-model")

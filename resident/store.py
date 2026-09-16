@@ -15,7 +15,8 @@ _SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "communication.delivered": ("message_id", "delivered", "spontaneous"),
     "communication.failed": ("message_id", "delivered", "spontaneous"),
     "communication.rejected": ("message_id", "delivered", "spontaneous"),
-    "context.assembled": ("characters", "memories", "pending_intentions", "recent_messages"),
+    "context.assembled": (
+        "characters", "memories", "owner_guidance", "pending_intentions", "recent_messages"),
     "intention.created": ("intention_id",),
     "intention.updated": ("intention_id", "status"),
     "memory.created": ("memory_id",),
@@ -51,7 +52,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 7 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 8 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -65,7 +66,8 @@ class Store:
           confidence TEXT NOT NULL DEFAULT 'low'
             CHECK(confidence IN ('low','medium','high')),
           provenance TEXT NOT NULL DEFAULT 'unknown'
-            CHECK(provenance IN ('owner','resident','connector','unknown')));
+            CHECK(provenance IN ('owner','resident','connector','unknown')),
+          standing INTEGER NOT NULL DEFAULT 0 CHECK(standing IN (0,1)));
         CREATE TABLE IF NOT EXISTS intentions(
           id TEXT PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed','cancelled')),
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -160,13 +162,14 @@ class Store:
             "importance": "TEXT NOT NULL DEFAULT 'low' CHECK(importance IN ('low','medium','high'))",
             "confidence": "TEXT NOT NULL DEFAULT 'low' CHECK(confidence IN ('low','medium','high'))",
             "provenance": "TEXT NOT NULL DEFAULT 'unknown' CHECK(provenance IN ('owner','resident','connector','unknown'))",
+            "standing": "INTEGER NOT NULL DEFAULT 0 CHECK(standing IN (0,1))",
         }
         with self.connection:
             for name, declaration in memory_metadata_columns.items():
                 if name not in memory_columns:
                     self.connection.execute(
                         f"ALTER TABLE memories ADD COLUMN {name} {declaration}")
-        self.connection.execute("UPDATE schema_version SET version=7")
+        self.connection.execute("UPDATE schema_version SET version=8")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -310,22 +313,30 @@ class Store:
 
     def remember(self, content: str, source: str, *, kind: str = "unknown",
                  importance: str = "low", confidence: str = "low",
-                 provenance: str = "unknown") -> str:
+                 provenance: str = "unknown", standing: bool = False) -> str:
         item_id, now = str(uuid.uuid4()), utc_now()
         with self.connection:
             self.connection.execute("""
                 INSERT INTO memories(
-                  id,content,source,created_at,updated_at,kind,importance,confidence,provenance)
-                VALUES(?,?,?,?,?,?,?,?,?)
-            """, (item_id, content, source, now, now, kind, importance, confidence, provenance))
+                  id,content,source,created_at,updated_at,kind,importance,confidence,provenance,standing)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+            """, (item_id, content, source, now, now, kind, importance, confidence, provenance,
+                  int(standing)))
         return item_id
 
     def memory(self, item_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("""
-            SELECT id,content,source,kind,importance,confidence,provenance,created_at,updated_at
+            SELECT id,content,source,kind,importance,confidence,provenance,standing,
+                   created_at,updated_at
             FROM memories WHERE id=?
         """, (item_id,)).fetchone()
-        return None if row is None else dict(row)
+        return None if row is None else self._memory_dict(row)
+
+    @staticmethod
+    def _memory_dict(row: sqlite3.Row) -> dict[str, Any]:
+        memory = dict(row)
+        memory["standing"] = bool(memory["standing"])
+        return memory
 
     def recall(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         terms = list(dict.fromkeys(
@@ -335,7 +346,7 @@ class Store:
         confidence_rank = "CASE confidence WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END"
         provenance_rank = "CASE provenance WHEN 'owner' THEN 2 WHEN 'resident' THEN 1 WHEN 'connector' THEN 1 ELSE 0 END"
         kind_rank = "CASE kind WHEN 'preference' THEN 3 WHEN 'rule' THEN 3 WHEN 'fact' THEN 2 WHEN 'experience' THEN 1 ELSE 0 END"
-        columns = "id,content,source,kind,importance,confidence,provenance,created_at,updated_at"
+        columns = "id,content,source,kind,importance,confidence,provenance,standing,created_at,updated_at"
         if terms:
             escaped_terms = [
                 term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -360,15 +371,32 @@ class Store:
                 ORDER BY {importance_rank} DESC, {confidence_rank} DESC, {provenance_rank} DESC,
                   {kind_rank} DESC, updated_at DESC, id DESC LIMIT ?""", (limit,)
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._memory_dict(r) for r in rows]
+
+    def recall_standing_owner_guidance(self, limit: int = 4) -> list[dict[str, Any]]:
+        """Return bounded durable guidance without requiring wake-text overlap."""
+        rows = self.connection.execute("""
+            SELECT id,content,source,kind,importance,confidence,provenance,standing,
+                   created_at,updated_at
+            FROM memories
+            WHERE standing=1 AND provenance='owner' AND kind IN ('preference','rule')
+            ORDER BY
+              CASE importance WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
+              CASE confidence WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC,
+              updated_at DESC, id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [self._memory_dict(row) for row in rows]
 
     def update_memory(self, item_id: str, *, content: str | None = None,
                       kind: str | None = None, importance: str | None = None,
-                      confidence: str | None = None, provenance: str | None = None) -> bool:
+                      confidence: str | None = None, provenance: str | None = None,
+                      standing: bool | None = None) -> bool:
         changes = {
             key: value for key, value in {
                 "content": content, "kind": kind, "importance": importance,
                 "confidence": confidence, "provenance": provenance,
+                "standing": None if standing is None else int(standing),
             }.items() if value is not None
         }
         if not changes:

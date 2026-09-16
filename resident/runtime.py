@@ -236,6 +236,7 @@ class ResidentRuntime:
             self._emit("context.assembled", {
                 "characters": len(context),
                 "memories": len(context_document["retrieved_memories"]),
+                "owner_guidance": len(context_document["owner_guidance"]),
                 "pending_intentions": len(self.store.pending_intentions()),
                 "recent_messages": len(self.store.recent_messages(self.config.context_messages)),
             })
