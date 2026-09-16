@@ -167,7 +167,7 @@ class AgentControllerConnector:
         items = [
             {**item, "repository_name": repository_names[item["repository"]]}
             for _, item in sorted(indexed.items())
-            if repository is None or item["repository"] == repository
+            if repository in (None, "") or item["repository"] == repository
         ]
         return {
             "schema_version": 1,

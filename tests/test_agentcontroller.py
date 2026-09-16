@@ -139,6 +139,22 @@ class AgentControllerConnectorTests(unittest.IsolatedAsyncioTestCase):
             capability.name for capability in connector.capabilities
         ])
 
+    async def test_list_capability_empty_repository_matches_omitted_filter(self):
+        self.write_snapshot(snapshot(
+            workflow_item(1),
+            workflow_item(2, repository="other/repo"),
+        ))
+        connector = AgentControllerConnector(self.path)
+
+        for arguments in ({}, {"repository": ""}):
+            with self.subTest(arguments=arguments):
+                result = await connector.list_workflow_items(arguments)
+                self.assertEqual(2, result["total_count"])
+                self.assertEqual(
+                    {"owner/repo", "other/repo"},
+                    {item["repository"] for item in result["items"]},
+                )
+
     async def test_missing_snapshot_is_reported_without_exposing_its_path(self):
         connector = AgentControllerConnector(self.path)
         with self.assertRaisesRegex(RuntimeError, "snapshot is unavailable") as raised:
