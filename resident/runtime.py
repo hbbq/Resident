@@ -236,7 +236,9 @@ class ResidentRuntime:
                 "pending_intentions": len(self.store.pending_intentions()),
                 "recent_messages": len(self.store.recent_messages(self.config.context_messages)),
             })
-            registry = ToolRegistry(self.store, capabilities, self._send_owner_message, self._emit)
+            registry = ToolRegistry(
+                self.store, capabilities, self._send_owner_message, self._emit,
+                current_run_id=run_id)
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1

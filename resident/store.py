@@ -10,6 +10,27 @@ from typing import Any
 from .domain import Identity, WakeEvent
 
 
+_SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
+    "communication.delivered": ("message_id", "delivered", "spontaneous"),
+    "communication.failed": ("message_id", "delivered", "spontaneous"),
+    "communication.rejected": ("message_id", "delivered", "spontaneous"),
+    "context.assembled": ("characters", "memories", "pending_intentions", "recent_messages"),
+    "intention.created": ("intention_id",),
+    "intention.updated": ("intention_id", "status"),
+    "memory.created": ("memory_id",),
+    "memory.forgotten": ("memory_id",),
+    "memory.updated": ("memory_id",),
+    "model.responded": ("tool_call_count", "has_message", "input_tokens", "output_tokens"),
+    "tool.called": ("name",),
+    "tool.completed": ("name",),
+    "wake.failed": ("error_type",),
+    "wake.finished": ("status", "duration_seconds", "model_calls"),
+    "wake.sleeping": ("status",),
+    "wakeup.scheduled": ("schedule_id", "due_at"),
+}
+_SAFE_JOURNAL_EVENT_LIMIT = 50
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -29,7 +50,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -64,6 +85,8 @@ class Store:
           completed_at TEXT);
         CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_wake_runs_started ON wake_runs(started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_journal_run_sequence ON journal(run_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
         """)
         # An already-provisioned Resident predates capability snapshots. Seed an
@@ -119,7 +142,7 @@ class Store:
                     SELECT 'legacy',update_id,message_id FROM telegram_owner_updates_v1
                 """)
                 self.connection.execute("DROP TABLE telegram_owner_updates_v1")
-        self.connection.execute("UPDATE schema_version SET version=5")
+        self.connection.execute("UPDATE schema_version SET version=6")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -229,6 +252,33 @@ class Store:
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def search_messages(self, *, query: str = "", direction: str | None = None,
+                        from_time: str | None = None, to_time: str | None = None,
+                        limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("lower(content) LIKE lower(?) ESCAPE '\\'")
+            parameters.append(f"%{escaped}%")
+        if direction is not None:
+            clauses.append("direction=?")
+            parameters.append(direction)
+        if from_time is not None:
+            clauses.append("created_at>=?")
+            parameters.append(from_time)
+        if to_time is not None:
+            clauses.append("created_at<=?")
+            parameters.append(to_time)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.extend((limit, offset))
+        rows = self.connection.execute(f"""
+            SELECT id,direction,content,delivery_status,created_at
+            FROM messages{where}
+            ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?
+        """, parameters).fetchall()
+        return [dict(row) for row in rows]
+
     def spontaneous_count_since(self, since: str) -> int:
         return int(self.connection.execute(
             "SELECT count(*) FROM messages WHERE direction='outbound' AND spontaneous=1 AND delivery_status='delivered' AND created_at>=?",
@@ -310,6 +360,71 @@ class Store:
                     UPDATE owner_message_processing SET status='completed',completed_at=?
                     WHERE message_id=? AND status='pending'
                 """, (utc_now(), owner_message_id))
+
+    def wake_history(self, *, query: str = "", source: str | None = None,
+                     status: str | None = None, from_time: str | None = None,
+                     to_time: str | None = None, limit: int = 10,
+                     offset: int = 0, exclude_run_id: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("lower(wake_reason) LIKE lower(?) ESCAPE '\\'")
+            parameters.append(f"%{escaped}%")
+        for column, value in (("wake_source", source), ("status", status)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                parameters.append(value)
+        if exclude_run_id is not None:
+            clauses.append("id<>?")
+            parameters.append(exclude_run_id)
+        if from_time is not None:
+            clauses.append("started_at>=?")
+            parameters.append(from_time)
+        if to_time is not None:
+            clauses.append("started_at<=?")
+            parameters.append(to_time)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.extend((limit, offset))
+        runs = self.connection.execute(f"""
+            SELECT id,started_at,finished_at,wake_reason,wake_source,status,
+                   duration_seconds,model_calls
+            FROM wake_runs{where}
+            ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?
+        """, parameters).fetchall()
+        history = []
+        for run in runs:
+            events, events_truncated = self._safe_journal_events(run["id"])
+            history.append({**dict(run), "events": events, "events_truncated": events_truncated})
+        return history
+
+    def _safe_journal_events(self, run_id: str) -> tuple[list[dict[str, Any]], bool]:
+        event_types = tuple(_SAFE_JOURNAL_FIELDS)
+        placeholders = ",".join("?" for _ in event_types)
+        rows = self.connection.execute(f"""
+            SELECT event_type,occurred_at,data_json FROM journal
+            WHERE run_id=? AND event_type IN ({placeholders})
+            ORDER BY sequence DESC LIMIT ?
+        """, (run_id, *event_types, _SAFE_JOURNAL_EVENT_LIMIT + 1)).fetchall()
+        events_truncated = len(rows) > _SAFE_JOURNAL_EVENT_LIMIT
+        events: list[dict[str, Any]] = []
+        for row in reversed(rows[:_SAFE_JOURNAL_EVENT_LIMIT]):
+            allowed_fields = _SAFE_JOURNAL_FIELDS.get(row["event_type"])
+            if allowed_fields is None:
+                continue
+            try:
+                data = json.loads(row["data_json"])
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            event = {"type": row["event_type"], "occurred_at": row["occurred_at"]}
+            event.update({
+                field: data[field] for field in allowed_fields
+                if field in data and (data[field] is None or isinstance(data[field], (str, int, float, bool)))
+            })
+            events.append(event)
+        return events, events_truncated
 
     def journal(self, event_type: str, data: dict[str, Any], run_id: str | None = None) -> None:
         with self.connection:
