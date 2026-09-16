@@ -9,8 +9,8 @@ import xml.etree.ElementTree as ET
 from resident.camera import CameraConnector
 from resident.config import CameraConfig, OnvifConfig
 from resident.onvif import (
-    EVENTS, MAX_DIAGNOSTIC_NAMES_LENGTH, MAX_DIAGNOSTIC_NAME_LENGTH, NOTIFY_WSDL, TOPICS,
-    OnvifClient, PullPoint,
+    ADDRESSING, EVENTS, MAX_DIAGNOSTIC_NAMES_LENGTH, MAX_DIAGNOSTIC_NAME_LENGTH,
+    NOTIFY_WSDL, TOPICS, OnvifClient, PullPoint,
 )
 
 
@@ -121,6 +121,23 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"subscription-1", pullpoint.reference_parameters[0])
         self.assertEqual(pullpoint.reference_parameters, client.calls[1][4])
 
+    def test_replayed_reference_parameters_are_marked_in_soap_headers(self):
+        client = OnvifClient(OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
+        parameter = b"<Identifier>subscription-1</Identifier>"
+
+        for action, body in (
+                (f"{EVENTS}/PullPointSubscription/PullMessages",
+                 ET.Element(ET.QName(EVENTS, "PullMessages"))),
+                (f"{NOTIFY_WSDL}/SubscriptionManager/UnsubscribeRequest",
+                 ET.Element("Unsubscribe"))):
+            envelope = ET.fromstring(client._envelope(
+                action, SECRET_ENDPOINT, body, (parameter,)))
+            identifier = next(element for element in envelope.iter()
+                              if element.tag == "Identifier")
+
+            self.assertEqual(
+                "true", identifier.attrib[f"{{{ADDRESSING}}}IsReferenceParameter"])
+
     async def test_subscription_tracks_finite_lifetime(self):
         client = StubClient(["""
             <Envelope xmlns:wsa='http://www.w3.org/2005/08/addressing'>
@@ -137,6 +154,22 @@ class OnvifClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(started + 120, pullpoint.expires_at, delta=1)
         self.assertFalse(pullpoint.expires_within(60))
         self.assertTrue(pullpoint.expires_within(121))
+
+    async def test_pull_timeout_is_limited_to_remaining_subscription_lifetime(self):
+        client = StubClient(["<Envelope/>"])
+        client.pull_timeout = 30
+        client.request_timeout = 10
+        pullpoint = PullPoint(
+            "http://camera.test/pullpoint", expires_at=time.monotonic() + 2)
+
+        await client.pull(pullpoint)
+
+        timeout = ET.fromstring(client.calls[0][2]).find(f"{{{EVENTS}}}Timeout")
+        self.assertIsNotNone(timeout)
+        effective_timeout = float(timeout.text.removeprefix("PT").removesuffix("S"))
+        self.assertGreater(effective_timeout, 0)
+        self.assertLess(effective_timeout, 2)
+        self.assertAlmostEqual(effective_timeout + 10, client.calls[0][3], places=5)
 
     async def test_unsubscribe_uses_ws_base_notification_action(self):
         client = StubClient(["<Envelope/>"])
@@ -201,23 +234,25 @@ class FakeOnvifClient:
 
 
 class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_finite_subscription_is_recreated_before_expiry(self):
+    async def test_short_subscription_is_pulled_before_expiry(self):
         stop = asyncio.Event()
 
         class ExpiringClient(FakeOnvifClient):
             subscriptions = 0
+            pulls = 0
 
             async def subscribe(self, _):
                 self.__class__.subscriptions += 1
-                if self.__class__.subscriptions == 2:
-                    stop.set()
                 return PullPoint("internal-pullpoint", expires_at=time.monotonic() + 1)
 
             async def pull(self, _):
-                raise AssertionError("an expiring subscription must not start a long pull")
+                self.__class__.pulls += 1
+                stop.set()
+                return ()
 
         ExpiringClient.instances.clear()
         ExpiringClient.subscriptions = 0
+        ExpiringClient.pulls = 0
         camera = CameraConfig(
             "entry", "Entry", "rtsp://secret@camera.test/live", None,
             OnvifConfig(SECRET_ENDPOINT, SECRET_USER, SECRET_PASSWORD))
@@ -227,7 +262,8 @@ class OnvifConnectorTests(unittest.IsolatedAsyncioTestCase):
 
         await connector.run(asyncio.Queue(), stop)
 
-        self.assertEqual(2, ExpiringClient.subscriptions)
+        self.assertEqual(1, ExpiringClient.subscriptions)
+        self.assertEqual(1, ExpiringClient.pulls)
         self.assertTrue(all(client.unsubscribed for client in ExpiringClient.instances))
 
     async def test_probe_is_opt_in_diagnostic_only_and_stops_cleanly(self):

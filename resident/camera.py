@@ -9,7 +9,7 @@ from typing import Awaitable, Callable, Sequence
 from .capabilities import Capability
 from .config import CameraConfig
 from .domain import ImageAttachment, ToolOutput, WakeEvent
-from .onvif import OnvifClient
+from .onvif import SUBSCRIPTION_SAFETY_MARGIN, OnvifClient
 from .store import utc_now
 
 
@@ -124,8 +124,7 @@ class CameraConnector:
                 pullpoint = await client.subscribe(service)
                 self.diagnostic_output(f"{camera.id}: ONVIF PullPoint subscription active")
                 while not stop.is_set():
-                    if pullpoint.expires_within(
-                            self.onvif_pull_timeout_seconds + self.onvif_request_timeout_seconds):
+                    if pullpoint.expires_within(SUBSCRIPTION_SAFETY_MARGIN):
                         recreate = True
                         break
                     notifications = await client.pull(pullpoint)

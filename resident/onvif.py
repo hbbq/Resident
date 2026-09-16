@@ -34,6 +34,7 @@ MAX_TOPIC_PATHS = 100
 MAX_NOTIFICATION_FIELDS = 32
 MAX_DIAGNOSTIC_NAME_LENGTH = 256
 MAX_DIAGNOSTIC_NAMES_LENGTH = 4_096
+SUBSCRIPTION_SAFETY_MARGIN = 0.1
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,11 @@ class PullPoint:
 
     def expires_within(self, seconds: float) -> bool:
         return self.expires_at is not None and self.expires_at <= time.monotonic() + seconds
+
+    def remaining_lifetime(self) -> float | None:
+        if self.expires_at is None:
+            return None
+        return max(0.0, self.expires_at - time.monotonic())
 
 
 def _local_name(tag: str) -> str:
@@ -112,7 +118,9 @@ class OnvifClient:
             "http://www.w3.org/2005/08/addressing/anonymous")
         ET.SubElement(header, ET.QName(ADDRESSING, "To")).text = destination
         for parameter in reference_parameters:
-            header.append(ET.fromstring(parameter))
+            element = ET.fromstring(parameter)
+            element.set(ET.QName(ADDRESSING, "IsReferenceParameter"), "true")
+            header.append(element)
         security = ET.SubElement(header, ET.QName(WSSE, "Security"), {
             ET.QName(SOAP, "mustUnderstand"): "true",
         })
@@ -217,12 +225,18 @@ class OnvifClient:
         return parsed.astimezone(timezone.utc)
 
     async def pull(self, pullpoint: PullPoint) -> tuple[dict[str, object], ...]:
+        pull_timeout = self.pull_timeout
+        remaining = pullpoint.remaining_lifetime()
+        if remaining is not None:
+            pull_timeout = min(pull_timeout, remaining - SUBSCRIPTION_SAFETY_MARGIN)
+            if pull_timeout <= 0:
+                raise TimeoutError("ONVIF subscription expired before PullMessages")
         request = ET.Element(ET.QName(EVENTS, "PullMessages"))
-        ET.SubElement(request, ET.QName(EVENTS, "Timeout")).text = f"PT{self.pull_timeout:g}S"
+        ET.SubElement(request, ET.QName(EVENTS, "Timeout")).text = f"PT{pull_timeout:g}S"
         ET.SubElement(request, ET.QName(EVENTS, "MessageLimit")).text = "32"
         root = await self._post(
             pullpoint.address, f"{EVENTS}/PullPointSubscription/PullMessages", request,
-            self.pull_timeout + self.request_timeout, pullpoint.reference_parameters)
+            pull_timeout + self.request_timeout, pullpoint.reference_parameters)
         summaries = []
         for notification in (element for element in root.iter()
                              if _local_name(element.tag) == "NotificationMessage"):
