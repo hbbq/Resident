@@ -124,7 +124,11 @@ class OpenAIAgentsProvider:
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required for the OpenAI provider")
         self.api_key, self.model, self.base_url = api_key, model, base_url.rstrip("/")
+        # Keep the operator-supplied identity separate from the identity learned
+        # from the durable session binding. The former always wins; the latter
+        # supplies continuity when no current override is configured.
         self.agent_id = agent_id
+        self._bound_agent_id: str | None = None
         self.poll_seconds = poll_seconds
         self.timeout_seconds = timeout_seconds
         self._session_id: str | None = None
@@ -147,8 +151,11 @@ class OpenAIAgentsProvider:
         self._save_binding = save
         binding = load()
         if binding is not None:
-            self._session_id = binding["session_id"]
-            self._last_turn_id = binding.get("last_turn_id")
+            persisted_agent_id = binding.get("agent_id")
+            if self.agent_id is None or self.agent_id == persisted_agent_id:
+                self._session_id = binding["session_id"]
+                self._last_turn_id = binding.get("last_turn_id")
+                self._bound_agent_id = persisted_agent_id
 
     def bind_action_store(self, begin: Callable[..., dict], complete: Callable[..., None]) -> None:
         self._begin_action, self._complete_action = begin, complete
@@ -296,25 +303,42 @@ class OpenAIAgentsProvider:
                 if "HTTP 404" not in str(exc):
                     raise
                 self._session_id = None
+                self._last_turn_id = None
             else:
-                if self._tool_fingerprint != fingerprint and session.get("status") == "idle":
-                    session = self._request(
-                        "POST", f"/agents/sessions/{self._session_id}", {"agent": agent})
-                    # Track only configuration the session accepted. If the
-                    # session is active, the mismatch remains pending here and
-                    # a later idle call retries the current configuration.
-                    self._tool_fingerprint = fingerprint
-                return session
+                remote_agent_id = (session.get("agent") or {}).get("id")
+                if (self.agent_id is not None and remote_agent_id is not None
+                        and remote_agent_id != self.agent_id):
+                    # A current operator override must not inherit a session
+                    # attached to a different saved Agent resource.
+                    self._session_id = None
+                    self._last_turn_id = None
+                else:
+                    resolved_agent_id = self.agent_id or remote_agent_id or self._bound_agent_id
+                    if resolved_agent_id != self._bound_agent_id:
+                        self._bound_agent_id = resolved_agent_id
+                        self._persist_binding(
+                            self._session_id, resolved_agent_id, self._last_turn_id)
+                    if self._tool_fingerprint != fingerprint and session.get("status") == "idle":
+                        session = self._request(
+                            "POST", f"/agents/sessions/{self._session_id}", {"agent": agent})
+                        # Track only configuration the session accepted. If the
+                        # session is active, the mismatch remains pending here and
+                        # a later idle call retries the current configuration.
+                        self._tool_fingerprint = fingerprint
+                    return session
         body: dict = {
             "environment": {"type": "none"},
             "agent": agent,
             "metadata": {"managed_by": "resident"},
         }
-        if self.agent_id:
-            body["agent_id"] = self.agent_id
+        intended_agent_id = self.agent_id or self._bound_agent_id
+        if intended_agent_id:
+            body["agent_id"] = intended_agent_id
         session = self._request("POST", "/agents/sessions", body)
         self._session_id = session["id"]
-        resolved_agent_id = (session.get("agent") or {}).get("id") or self.agent_id
+        resolved_agent_id = (
+            self.agent_id or (session.get("agent") or {}).get("id") or self._bound_agent_id)
+        self._bound_agent_id = resolved_agent_id
         self._last_turn_id = None
         self._tool_fingerprint = fingerprint
         self._persist_binding(self._session_id, resolved_agent_id, None)
@@ -383,7 +407,8 @@ class OpenAIAgentsProvider:
         if self._active_turn_id == turn_id:
             self._active_turn_id = None
         self._last_turn_id = turn_id
-        agent_id = (session.get("agent") or {}).get("id") or self.agent_id
+        agent_id = self.agent_id or (session.get("agent") or {}).get("id") or self._bound_agent_id
+        self._bound_agent_id = agent_id
         self._persist_binding(session_id, agent_id, turn_id)
         usage = turn.get("usage") or session.get("usage") or {}
         return ModelTurn(turn_id, message=message,

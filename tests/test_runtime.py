@@ -727,6 +727,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual("turn-1", first.response_id)
             self.assertEqual("session-1", store.agent_session_binding("openai_agents")["session_id"])
+            self.assertEqual("agent-1", store.agent_session_binding("openai_agents")["agent_id"])
             self.assertIsNone(store.agent_session_binding("openai_agents")["last_turn_id"])
             completed = await provider.respond(
                 first_context, [], [ToolResult("call-1", {"ok": True})], first.response_id)
@@ -747,6 +748,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 owner_output=lambda _: None, diagnostic_output=lambda _: None)
             self.assertEqual("session-1", recovered._session_id)
             self.assertEqual("turn-1", recovered._last_turn_id)
+            self.assertEqual("agent-1", recovered._bound_agent_id)
 
             second_context = json.dumps({
                 "wake_event": {"id": "wake-2", "source": "connector", "payload": {}}})
@@ -758,6 +760,93 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [reopened_store.owner_thread_id], reopened_store.binding_save_threads)
             reopened_runtime.close()
+
+    def test_agents_binding_restores_persisted_agent_identity_without_override(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        binding = {
+            "session_id": "session-persisted",
+            "agent_id": "agent-persisted",
+            "last_turn_id": "turn-persisted",
+        }
+
+        provider.bind_session_store(lambda: binding, lambda *_: None)
+
+        self.assertEqual("session-persisted", provider._session_id)
+        self.assertEqual("agent-persisted", provider._bound_agent_id)
+        self.assertEqual("turn-persisted", provider._last_turn_id)
+
+    def test_agents_missing_session_reuses_persisted_agent_and_saves_replacement(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        binding = {
+            "session_id": "session-missing",
+            "agent_id": "agent-persisted",
+            "last_turn_id": "turn-old",
+        }
+        provider.bind_session_store(
+            lambda: dict(binding),
+            lambda session_id, agent_id, last_turn_id: binding.update(
+                session_id=session_id, agent_id=agent_id, last_turn_id=last_turn_id),
+        )
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path, body))
+            if path == "/agents/sessions/session-missing" and method == "GET":
+                raise RuntimeError("OpenAI Agents API returned HTTP 404: gone")
+            if path == "/agents/sessions" and method == "POST":
+                return {"id": "session-replacement", "status": "idle"}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+
+        session = provider._ensure_session([])
+
+        self.assertEqual("session-replacement", session["id"])
+        create_body = requests[-1][2]
+        self.assertEqual("agent-persisted", create_body["agent_id"])
+        self.assertEqual("gpt-5.6-luna", create_body["agent"]["model"])
+        self.assertEqual({
+            "session_id": "session-replacement",
+            "agent_id": "agent-persisted",
+            "last_turn_id": None,
+        }, binding)
+
+    def test_agents_explicit_agent_override_replaces_conflicting_persisted_binding(self):
+        provider = OpenAIAgentsProvider(
+            "test-key", "gpt-5.6-luna", agent_id="agent-configured")
+        binding = {
+            "session_id": "session-stale",
+            "agent_id": "agent-persisted",
+            "last_turn_id": "turn-stale",
+        }
+        provider.bind_session_store(
+            lambda: dict(binding),
+            lambda session_id, agent_id, last_turn_id: binding.update(
+                session_id=session_id, agent_id=agent_id, last_turn_id=last_turn_id),
+        )
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path, body))
+            if path == "/agents/sessions" and method == "POST":
+                return {"id": "session-configured", "status": "idle",
+                        "agent": {"id": "agent-configured"}}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+
+        self.assertIsNone(provider._session_id)
+        session = provider._ensure_session([])
+
+        self.assertEqual("session-configured", session["id"])
+        self.assertEqual([("POST", "/agents/sessions")], [
+            (method, path) for method, path, _ in requests])
+        self.assertEqual("agent-configured", requests[0][2]["agent_id"])
+        self.assertEqual({
+            "session_id": "session-configured",
+            "agent_id": "agent-configured",
+            "last_turn_id": None,
+        }, binding)
 
     async def test_agents_binding_failure_is_propagated_and_retried_before_reuse(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
