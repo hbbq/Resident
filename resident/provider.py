@@ -223,9 +223,11 @@ class OpenAIAgentsProvider:
             turn = self._wait_for_turn(session_id, turn_id)
             if turn.tool_calls or turn_id not in self._pending_wakes:
                 return turn
-            pending_context, wake_key, correlation = self._pending_wakes.pop(turn_id)
-            return self._submit_wake(
-                session_id, pending_context, wake_key, correlation)
+            pending_context, wake_key, correlation = self._pending_wakes[turn_id]
+            completed = self._submit_ordinary_wake(
+                tools, pending_context, wake_key, correlation)
+            self._pending_wakes.pop(turn_id, None)
+            return completed
 
         wake_key = self._wake_idempotency_key(context)
         correlated_context, correlation = self._correlated_context(context, wake_key)
@@ -237,7 +239,18 @@ class OpenAIAgentsProvider:
                 self._pending_wakes[recovered.response_id] = (
                     correlated_context, wake_key, correlation)
                 return recovered
+            return self._submit_ordinary_wake(
+                tools, correlated_context, wake_key, correlation)
         return self._submit_wake(session_id, correlated_context, wake_key, correlation)
+
+    def _submit_ordinary_wake(self, tools: Sequence[ToolSpec], context: str,
+                              wake_key: str, correlation: str) -> ModelTurn:
+        """Submit only after an idle session has accepted current configuration."""
+        session = self._ensure_session(tools)
+        if session.get("status") != "idle":
+            raise RuntimeError(
+                "OpenAI Agents session was not idle after wake reconciliation")
+        return self._submit_wake(session["id"], context, wake_key, correlation)
 
     def _submit_wake(self, session_id: str, context: str, wake_key: str,
                      correlation: str) -> ModelTurn:

@@ -1104,6 +1104,135 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(active_done, wake_submitted)
         self.assertEqual("turn-new", turn.response_id)
 
+    async def test_deferred_configuration_is_applied_before_reconciled_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        provider._session_id = "session-1"
+        original = ToolSpec("clock", "Read clock", {"type": "object"})
+        changed = ToolSpec("clock", "Read the local clock", {"type": "object"})
+        provider._tool_fingerprint = json.dumps(
+            provider._agent_config([original]), sort_keys=True, separators=(",", ":"))
+        changed_fingerprint = json.dumps(
+            provider._agent_config([changed]), sort_keys=True, separators=(",", ":"))
+        state = {"status": "in_progress", "items": []}
+        operations = []
+
+        def fake_request(method, path, body=None, **_):
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": state["status"]}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                operations.append("configuration")
+                self.assertEqual(
+                    "Read the local clock", body["agent"]["tools"][0]["description"])
+                return {"id": "session-1", "status": "idle"}
+            if "/turns?" in path:
+                return {"data": [{"id": "turn-active", "status": "in_progress"}]}
+            if path.endswith("/turns/turn-active"):
+                state["status"] = "idle"
+                return {"id": "turn-active", "status": "completed"}
+            if path.endswith("/events"):
+                operations.append("wake")
+                event = body["events"][0]
+                state["items"] = [{
+                    "id": "input-new", "type": "message", "role": "user",
+                    "turn_id": "turn-new", "content": event["input"][0]["content"],
+                }]
+                return {}
+            if path.endswith("/turns/turn-new"):
+                return {"id": "turn-new", "status": "completed"}
+            if "/items?" in path:
+                return {"data": state["items"]}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "capability-change", "source": "connector", "payload": {}}})
+
+        turn = await provider.respond(context, [changed], [])
+
+        self.assertEqual("turn-new", turn.response_id)
+        self.assertEqual(["configuration", "wake"], operations)
+        self.assertEqual(changed_fingerprint, provider._tool_fingerprint)
+
+    async def test_failed_deferred_configuration_update_does_not_submit_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        provider._session_id = "session-1"
+        original = ToolSpec("clock", "Read clock", {"type": "object"})
+        changed = ToolSpec("clock", "Read the local clock", {"type": "object"})
+        applied_fingerprint = json.dumps(
+            provider._agent_config([original]), sort_keys=True, separators=(",", ":"))
+        provider._tool_fingerprint = applied_fingerprint
+        state = {"status": "in_progress"}
+        submitted = []
+
+        def fake_request(method, path, body=None, **_):
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": state["status"]}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                raise RuntimeError("configuration update failed")
+            if "/turns?" in path:
+                return {"data": [{"id": "turn-active", "status": "in_progress"}]}
+            if path.endswith("/turns/turn-active"):
+                state["status"] = "idle"
+                return {"id": "turn-active", "status": "completed"}
+            if path.endswith("/events"):
+                submitted.append(body)
+                return {}
+            if "/items?" in path:
+                return {"data": []}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "capability-change", "source": "connector", "payload": {}}})
+
+        with self.assertRaisesRegex(RuntimeError, "configuration update failed"):
+            await provider.respond(context, [changed], [])
+
+        self.assertEqual([], submitted)
+        self.assertEqual(applied_fingerprint, provider._tool_fingerprint)
+
+    async def test_reconciled_wake_does_not_reapply_unchanged_configuration(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        provider._session_id = "session-1"
+        spec = ToolSpec("clock", "Read clock", {"type": "object"})
+        provider._tool_fingerprint = json.dumps(
+            provider._agent_config([spec]), sort_keys=True, separators=(",", ":"))
+        state = {"status": "in_progress", "items": []}
+        updates = []
+
+        def fake_request(method, path, body=None, **_):
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": state["status"]}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                updates.append(body)
+                return {"id": "session-1", "status": "idle"}
+            if "/turns?" in path:
+                return {"data": [{"id": "turn-active", "status": "in_progress"}]}
+            if path.endswith("/turns/turn-active"):
+                state["status"] = "idle"
+                return {"id": "turn-active", "status": "completed"}
+            if path.endswith("/events"):
+                event = body["events"][0]
+                state["items"] = [{
+                    "id": "input-new", "type": "message", "role": "user",
+                    "turn_id": "turn-new", "content": event["input"][0]["content"],
+                }]
+                return {}
+            if path.endswith("/turns/turn-new"):
+                return {"id": "turn-new", "status": "completed"}
+            if "/items?" in path:
+                return {"data": state["items"]}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "ordinary", "source": "connector", "payload": {}}})
+
+        turn = await provider.respond(context, [spec], [])
+
+        self.assertEqual("turn-new", turn.response_id)
+        self.assertEqual([], updates)
+
     async def test_owner_wake_can_steer_active_turn_and_is_correlated_to_it(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
         provider._session_id = "session-1"
