@@ -130,6 +130,7 @@ class OpenAIAgentsProvider:
         self._tool_fingerprint: str | None = None
         self._active_turn_id: str | None = None
         self._submitted_call_ids: dict[str, set[str]] = {}
+        self._pending_wakes: dict[str, tuple[str, str, str]] = {}
         self._ephemeral_tool_results: dict[str, ToolResult] = {}
         self._save_binding: Callable[[str, str | None, str | None], None] = lambda *_: None
         self._begin_action: Callable[..., dict] | None = None
@@ -178,11 +179,6 @@ class OpenAIAgentsProvider:
                       previous_response_id: str | None) -> ModelTurn:
         session = self._ensure_session(tools)
         session_id = session["id"]
-        if not results and session.get("status") == "requires_action":
-            turn = self._required_actions_turn(session)
-            if turn.tool_calls:
-                return turn
-            return self._wait_for_turn(session_id, turn.response_id)
         if results:
             turn_id = previous_response_id
             if not turn_id:
@@ -192,18 +188,57 @@ class OpenAIAgentsProvider:
             self._submit_events(session_id, events, f"resident-tool:{turn_id}:{call_key}"[:256])
             self._submitted_call_ids.setdefault(turn_id, set()).update(
                 result.call_id for result in results)
-            expected_turn_id = turn_id
-        else:
-            wake_key = self._wake_idempotency_key(context)
-            event = {
-                "type": "agent.session.input.message",
-                "input": [{"role": "user", "content": [
-                    {"type": "input_text", "text": context}
-                ]}],
-            }
-            self._submit_events(session_id, [event], f"resident-wake:{wake_key}"[:256])
-            expected_turn_id = None
-        return self._wait_for_turn(session_id, expected_turn_id)
+            turn = self._wait_for_turn(session_id, turn_id)
+            if turn.tool_calls or turn_id not in self._pending_wakes:
+                return turn
+            pending_context, wake_key, correlation = self._pending_wakes.pop(turn_id)
+            return self._submit_wake(
+                session_id, pending_context, wake_key, correlation)
+
+        wake_key = self._wake_idempotency_key(context)
+        correlated_context, correlation = self._correlated_context(context, wake_key)
+        if not self._is_owner_wake(context):
+            recovered = self._reconcile_before_wake(session_id, session)
+            if recovered is not None and recovered.tool_calls:
+                if not recovered.response_id:
+                    raise RuntimeError("Recovered Agents tool calls have no turn id")
+                self._pending_wakes[recovered.response_id] = (
+                    correlated_context, wake_key, correlation)
+                return recovered
+        return self._submit_wake(session_id, correlated_context, wake_key, correlation)
+
+    def _submit_wake(self, session_id: str, context: str, wake_key: str,
+                     correlation: str) -> ModelTurn:
+        event = {
+            "type": "agent.session.input.message",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": context}
+            ]}],
+        }
+        self._submit_events(session_id, [event], f"resident-wake:{wake_key}"[:256])
+        turn_id = self._wait_for_correlated_turn(session_id, correlation, wake_key)
+        return self._wait_for_turn(session_id, turn_id)
+
+    def _reconcile_before_wake(self, session_id: str, session: dict) -> ModelTurn | None:
+        """Finish remote work without attributing it to the next ordinary wake."""
+        status = session.get("status")
+        if status == "failed":
+            raise RuntimeError(
+                f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
+        if status == "idle":
+            latest = self._latest_turn(session_id)
+            if latest is not None and latest.get("id") != self._last_turn_id:
+                self._completed_turn(session_id, session, latest)
+            return None
+        if status == "requires_action":
+            turn = self._required_actions_turn(session)
+            if turn.tool_calls:
+                return turn
+            return self._wait_for_turn(session_id, turn.response_id)
+        latest = self._latest_turn(session_id)
+        if latest is None or not latest.get("id"):
+            raise RuntimeError("Active Agents session has no recoverable turn")
+        return self._wait_for_turn(session_id, latest["id"])
 
     def _ensure_session(self, tools: Sequence[ToolSpec]) -> dict:
         agent = self._agent_config(tools)
@@ -248,6 +283,8 @@ class OpenAIAgentsProvider:
         }
 
     def _wait_for_turn(self, session_id: str, expected_turn_id: str | None) -> ModelTurn:
+        if not expected_turn_id:
+            raise RuntimeError("Agents turn correlation requires an exact turn id")
         # time.monotonic is imported lazily to keep the adapter's dependencies small.
         import time
         expires = time.monotonic() + self.timeout_seconds
@@ -258,27 +295,38 @@ class OpenAIAgentsProvider:
                 raise RuntimeError(f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
             if status == "requires_action":
                 turn = self._required_actions_turn(session)
-                if turn.tool_calls:
+                if turn.response_id == expected_turn_id and turn.tool_calls:
                     return turn
-            if status == "idle":
-                turn = self._latest_turn(session_id)
-                if turn is not None:
-                    turn_id = turn.get("id")
-                    if ((expected_turn_id and turn_id == expected_turn_id) or
-                            (expected_turn_id is None and turn_id != self._last_turn_id)):
-                        message = self._turn_message(session_id, turn_id)
-                        submitted = self._submitted_call_ids.pop(turn_id, set())
-                        for call_id in submitted:
-                            self._ephemeral_tool_results.pop(call_id, None)
-                        self._last_turn_id = turn_id
-                        agent_id = (session.get("agent") or {}).get("id") or self.agent_id
-                        self._save_binding(session_id, agent_id, turn_id)
-                        usage = turn.get("usage") or session.get("usage") or {}
-                        return ModelTurn(turn_id, message=message,
-                                         input_tokens=usage.get("input_tokens"),
-                                         output_tokens=usage.get("output_tokens"))
+            turn = self._request(
+                "GET", f"/agents/sessions/{session_id}/turns/{expected_turn_id}")
+            turn_status = turn.get("status")
+            if turn_status == "failed":
+                raise RuntimeError(
+                    f"OpenAI Agents turn failed: {turn.get('error') or 'no details'}")
+            if turn_status == "cancelled":
+                raise RuntimeError("OpenAI Agents turn was cancelled")
+            if turn_status == "completed":
+                return self._completed_turn(session_id, session, turn)
             time.sleep(self.poll_seconds)
         raise TimeoutError("Timed out waiting for the OpenAI Agents session")
+
+    def _completed_turn(self, session_id: str, session: dict, turn: dict) -> ModelTurn:
+        turn_id = turn.get("id")
+        if not turn_id:
+            raise RuntimeError("Completed Agents turn has no id")
+        message = self._turn_message(session_id, turn_id)
+        submitted = self._submitted_call_ids.pop(turn_id, set())
+        for call_id in submitted:
+            self._ephemeral_tool_results.pop(call_id, None)
+        if self._active_turn_id == turn_id:
+            self._active_turn_id = None
+        self._last_turn_id = turn_id
+        agent_id = (session.get("agent") or {}).get("id") or self.agent_id
+        self._save_binding(session_id, agent_id, turn_id)
+        usage = turn.get("usage") or session.get("usage") or {}
+        return ModelTurn(turn_id, message=message,
+                         input_tokens=usage.get("input_tokens"),
+                         output_tokens=usage.get("output_tokens"))
 
     def _required_actions_turn(self, session: dict) -> ModelTurn:
         actions = [action for action in session.get("required_actions", [])
@@ -302,6 +350,55 @@ class OpenAIAgentsProvider:
         page = self._request("GET", f"/agents/sessions/{session_id}/turns?order=desc&limit=1")
         data = page.get("data") or []
         return data[0] if data else None
+
+    def _wait_for_correlated_turn(self, session_id: str, correlation: str,
+                                  wake_key: str) -> str:
+        import time
+        expires = time.monotonic() + self.timeout_seconds
+        while time.monotonic() < expires:
+            session = self._request("GET", f"/agents/sessions/{session_id}")
+            if session.get("status") == "failed":
+                raise RuntimeError(
+                    f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
+            turn_id = self._correlated_turn_id(session_id, correlation, wake_key)
+            if turn_id:
+                return turn_id
+            time.sleep(self.poll_seconds)
+        raise TimeoutError("Timed out waiting for the submitted Agents wake")
+
+    def _correlated_turn_id(self, session_id: str, correlation: str,
+                            wake_key: str) -> str | None:
+        after: str | None = None
+        while True:
+            path = f"/agents/sessions/{session_id}/items?order=desc&limit=100"
+            if after:
+                from urllib.parse import quote
+                path += f"&after={quote(after, safe='')}"
+            page = self._request("GET", path)
+            data = page.get("data") or []
+            for item in data:
+                if item.get("type") != "message" or item.get("role") != "user":
+                    continue
+                for part in item.get("content") or []:
+                    if part.get("type") != "input_text" or not part.get("text"):
+                        continue
+                    text = part["text"]
+                    try:
+                        document = json.loads(text)
+                    except (TypeError, json.JSONDecodeError):
+                        document = None
+                    matches_marker = (
+                        isinstance(document, dict) and
+                        document.get("resident_wake_correlation") == correlation)
+                    if matches_marker or self._wake_idempotency_key(text) == wake_key:
+                        turn_id = item.get("turn_id")
+                        if turn_id:
+                            return turn_id
+            if not page.get("has_more") or not data:
+                return None
+            after = page.get("last_id") or data[-1].get("id")
+            if not after:
+                raise RuntimeError("Agents item page has_more without a pagination cursor")
 
     def _turn_message(self, session_id: str, turn_id: str) -> str | None:
         # Session items are cursor-paginated. Read newest-first so a long-lived
@@ -366,6 +463,26 @@ class OpenAIAgentsProvider:
         except (KeyError, TypeError, json.JSONDecodeError):
             import hashlib
             return hashlib.sha256(context.encode()).hexdigest()
+
+    @staticmethod
+    def _is_owner_wake(context: str) -> bool:
+        try:
+            return json.loads(context)["wake_event"]["source"] == "owner"
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return False
+
+    @staticmethod
+    def _correlated_context(context: str, wake_key: str) -> tuple[str, str]:
+        import hashlib
+        correlation = hashlib.sha256(wake_key.encode()).hexdigest()
+        try:
+            document = json.loads(context)
+        except json.JSONDecodeError:
+            document = {"wake_context": context}
+        if not isinstance(document, dict):
+            document = {"wake_context": document}
+        document["resident_wake_correlation"] = correlation
+        return json.dumps(document, separators=(",", ":")), correlation
 
     @staticmethod
     def _tool_result_event(result: ToolResult, turn_id: str) -> dict:

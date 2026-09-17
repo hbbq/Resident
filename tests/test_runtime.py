@@ -654,36 +654,50 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 session_id=session_id, agent_id=agent_id, last_turn_id=last_turn_id),
         )
         requests = []
-        session_states = iter((
-            {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}},
-            {"id": "session-1", "status": "requires_action", "required_actions": [{
-                "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
-                "name": "clock", "arguments": {},
-            }]},
-            {"id": "session-1", "status": "requires_action", "required_actions": [{
-                "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
-                "name": "clock", "arguments": {},
-            }]},
-            {"id": "session-1", "status": "requires_action", "required_actions": [{
-                "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
-                "name": "clock", "arguments": {},
-            }]},
-            {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}},
-        ))
+        state = {"status": "idle", "turn_status": None, "items": []}
 
         def fake_request(method, path, body=None, **_):
             requests.append((method, path, body))
             if path == "/agents/sessions" and method == "POST":
-                return next(session_states)
+                return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
             if path == "/agents/sessions/session-1" and method == "GET":
-                return next(session_states)
+                session = {"id": "session-1", "status": state["status"],
+                           "agent": {"id": "agent-1"}}
+                if state["status"] == "requires_action":
+                    session["required_actions"] = [{
+                        "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
+                        "name": "clock", "arguments": {},
+                    }]
+                return session
             if path.endswith("/events"):
+                event = body["events"][0]
+                if event["type"] == "agent.session.input.message":
+                    state["status"] = "requires_action"
+                    state["turn_status"] = "waiting"
+                    state["items"] = [{
+                        "id": "input-1", "type": "message", "role": "user",
+                        "turn_id": "turn-1", "content": event["input"][0]["content"],
+                    }]
+                else:
+                    state["status"] = "idle"
+                    state["turn_status"] = "completed"
+                    state["items"].insert(0, {
+                        "id": "output-1", "type": "message", "role": "assistant",
+                        "turn_id": "turn-1",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    })
                 return {}
             if "/turns?" in path:
-                return {"data": [{"id": "turn-1", "usage": {"input_tokens": 3}}]}
+                data = [] if state["turn_status"] is None else [{
+                    "id": "turn-1", "status": state["turn_status"],
+                    "usage": {"input_tokens": 3},
+                }]
+                return {"data": data}
+            if path.endswith("/turns/turn-1"):
+                return {"id": "turn-1", "status": state["turn_status"],
+                        "usage": {"input_tokens": 3}}
             if "/items?" in path:
-                return {"data": [{"type": "message", "role": "assistant", "turn_id": "turn-1",
-                                   "content": [{"type": "output_text", "text": "done"}]}]}
+                return {"data": state["items"]}
             if path == "/agents/sessions/session-1" and method == "POST":
                 return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
             raise AssertionError((method, path, body))
@@ -704,6 +718,190 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("agent.session.input.tool_result", event_bodies[1]["events"][0]["type"])
         self.assertEqual("turn-1", event_bodies[1]["events"][0]["turn_id"])
         self.assertEqual(2, len(event_bodies))
+
+    async def test_recovered_requires_action_finishes_before_new_ordinary_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        provider._session_id = "session-1"
+        provider._last_turn_id = "turn-before-recovery"
+        state = {"status": "requires_action", "turns": {
+            "turn-recovered": "waiting"}, "items": []}
+        submitted = []
+
+        def fake_request(method, path, body=None, **_):
+            if path == "/agents/sessions/session-1" and method == "GET":
+                session = {"id": "session-1", "status": state["status"]}
+                if state["status"] == "requires_action":
+                    session["required_actions"] = [{
+                        "type": "function_call", "turn_id": "turn-recovered",
+                        "call_id": "recovered-call", "name": "clock", "arguments": {},
+                    }]
+                return session
+            if path == "/agents/sessions/session-1" and method == "POST":
+                return {"id": "session-1", "status": state["status"]}
+            if path.endswith("/events"):
+                event = body["events"][0]
+                submitted.append(event["type"])
+                if event["type"] == "agent.session.input.tool_result":
+                    state["status"] = "idle"
+                    state["turns"]["turn-recovered"] = "completed"
+                    state["items"].append({
+                        "id": "recovered-output", "type": "message", "role": "assistant",
+                        "turn_id": "turn-recovered",
+                        "content": [{"type": "output_text", "text": "recovered done"}],
+                    })
+                else:
+                    state["turns"]["turn-wake"] = "completed"
+                    state["items"] = [{
+                        "id": "wake-output", "type": "message", "role": "assistant",
+                        "turn_id": "turn-wake",
+                        "content": [{"type": "output_text", "text": "new wake done"}],
+                    }, {
+                        "id": "wake-input", "type": "message", "role": "user",
+                        "turn_id": "turn-wake", "content": event["input"][0]["content"],
+                    }, *state["items"]]
+                return {}
+            if "/turns?" in path:
+                latest = next(reversed(state["turns"]))
+                return {"data": [{"id": latest, "status": state["turns"][latest]}]}
+            if "/turns/" in path:
+                turn_id = path.rsplit("/", 1)[-1]
+                return {"id": turn_id, "status": state["turns"][turn_id]}
+            if "/items?" in path:
+                return {"data": state["items"]}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "wake-new", "source": "homeops", "payload": {}}})
+        first = await provider.respond(context, [], [])
+        self.assertEqual("turn-recovered", first.response_id)
+        self.assertEqual([], submitted)
+
+        completed = await provider.respond(
+            context, [], [ToolResult("recovered-call", {"ok": True})], first.response_id)
+
+        self.assertEqual("turn-wake", completed.response_id)
+        self.assertEqual("new wake done", completed.message)
+        self.assertEqual([
+            "agent.session.input.tool_result", "agent.session.input.message"], submitted)
+
+    async def test_stale_persisted_turn_cannot_satisfy_new_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        provider._session_id = "session-1"
+        provider._last_turn_id = "turn-stale-binding"
+        state = {"items": [{
+            "id": "old-output", "type": "message", "role": "assistant",
+            "turn_id": "turn-old", "content": [
+                {"type": "output_text", "text": "unrelated old completion"}],
+        }]}
+
+        def fake_request(method, path, body=None, **_):
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": "idle"}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                return {"id": "session-1", "status": "idle"}
+            if path.endswith("/events"):
+                event = body["events"][0]
+                state["items"] = [{
+                    "id": "new-output", "type": "message", "role": "assistant",
+                    "turn_id": "turn-new", "content": [
+                        {"type": "output_text", "text": "correlated completion"}],
+                }, {
+                    "id": "new-input", "type": "message", "role": "user",
+                    "turn_id": "turn-new", "content": event["input"][0]["content"],
+                }, *state["items"]]
+                return {}
+            if "/turns?" in path:
+                return {"data": [{"id": "turn-old", "status": "completed"}]}
+            if path.endswith("/turns/turn-new"):
+                return {"id": "turn-new", "status": "completed"}
+            if "/items?" in path:
+                return {"data": state["items"]}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "wake-new", "source": "homeops", "payload": {}}})
+        turn = await provider.respond(context, [], [])
+
+        self.assertEqual("turn-new", turn.response_id)
+        self.assertEqual("correlated completion", turn.message)
+
+    async def test_ordinary_wake_waits_for_active_turn_before_submission(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        provider._session_id = "session-1"
+        state = {"status": "in_progress", "items": []}
+        operations = []
+
+        def fake_request(method, path, body=None, **_):
+            operations.append((method, path))
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": state["status"]}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                return {"id": "session-1", "status": state["status"]}
+            if "/turns?" in path:
+                return {"data": [{"id": "turn-active", "status": "in_progress"}]}
+            if path.endswith("/turns/turn-active"):
+                state["status"] = "idle"
+                return {"id": "turn-active", "status": "completed"}
+            if path.endswith("/events"):
+                event = body["events"][0]
+                state["items"] = [{
+                    "id": "input-new", "type": "message", "role": "user",
+                    "turn_id": "turn-new", "content": event["input"][0]["content"],
+                }]
+                return {}
+            if path.endswith("/turns/turn-new"):
+                return {"id": "turn-new", "status": "completed"}
+            if "/items?" in path:
+                return {"data": state["items"]}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "ordinary", "source": "connector", "payload": {}}})
+        turn = await provider.respond(context, [], [])
+
+        active_done = operations.index(("GET", "/agents/sessions/session-1/turns/turn-active"))
+        wake_submitted = operations.index(("POST", "/agents/sessions/session-1/events"))
+        self.assertLess(active_done, wake_submitted)
+        self.assertEqual("turn-new", turn.response_id)
+
+    async def test_owner_wake_can_steer_active_turn_and_is_correlated_to_it(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        provider._session_id = "session-1"
+        state = {"items": []}
+        operations = []
+
+        def fake_request(method, path, body=None, **_):
+            operations.append((method, path))
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": "in_progress"}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                return {"id": "session-1", "status": "in_progress"}
+            if path.endswith("/events"):
+                event = body["events"][0]
+                state["items"] = [{
+                    "id": "owner-input", "type": "message", "role": "user",
+                    "turn_id": "turn-active", "content": event["input"][0]["content"],
+                }]
+                return {}
+            if path.endswith("/turns/turn-active"):
+                return {"id": "turn-active", "status": "completed"}
+            if "/items?" in path:
+                return {"data": state["items"]}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "owner", "source": "owner", "payload": {
+                "message_id": "message-1"}}})
+        turn = await provider.respond(context, [], [])
+
+        self.assertEqual("turn-active", turn.response_id)
+        self.assertNotIn(("GET", "/agents/sessions/session-1/turns?order=desc&limit=1"),
+                         operations)
+        self.assertEqual(("POST", "/agents/sessions/session-1/events"), operations[1])
 
     def test_agent_session_binding_can_be_rolled_over(self):
         with tempfile.TemporaryDirectory() as temporary:
