@@ -645,6 +645,75 @@ class StoreTests(unittest.TestCase):
 
 
 class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
+    def test_agents_configuration_change_is_deferred_until_session_is_idle(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        status = {"value": "idle"}
+        updates = []
+
+        def fake_request(method, path, body=None, **_):
+            if path == "/agents/sessions" and method == "POST":
+                return {"id": "session-1", "status": "idle"}
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": status["value"]}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                updates.append(body)
+                return {"id": "session-1", "status": "idle"}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        original = ToolSpec("clock", "Read clock", {"type": "object"})
+        changed = ToolSpec("clock", "Read the local clock", {"type": "object"})
+
+        provider._ensure_session([original])
+        applied_fingerprint = provider._tool_fingerprint
+        status["value"] = "in_progress"
+        provider._ensure_session([changed])
+
+        self.assertEqual(applied_fingerprint, provider._tool_fingerprint)
+        self.assertEqual([], updates)
+
+        status["value"] = "idle"
+        provider._ensure_session([changed])
+        changed_fingerprint = json.dumps(
+            provider._agent_config([changed]), sort_keys=True, separators=(",", ":"))
+        self.assertEqual(changed_fingerprint, provider._tool_fingerprint)
+        self.assertEqual("Read the local clock", updates[0]["agent"]["tools"][0]["description"])
+
+        provider._ensure_session([changed])
+        self.assertEqual(1, len(updates))
+
+    def test_agents_configuration_fingerprint_advances_only_after_successful_update(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        fail_update = {"value": True}
+        updates = []
+
+        def fake_request(method, path, body=None, **_):
+            if path == "/agents/sessions" and method == "POST":
+                return {"id": "session-1", "status": "idle"}
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": "idle"}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                updates.append(body)
+                if fail_update["value"]:
+                    raise RuntimeError("configuration update failed")
+                return {"id": "session-1", "status": "idle"}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        original = ToolSpec("clock", "Read clock", {"type": "object"})
+        changed = ToolSpec("clock", "Read the local clock", {"type": "object"})
+        provider._ensure_session([original])
+        applied_fingerprint = provider._tool_fingerprint
+
+        with self.assertRaisesRegex(RuntimeError, "configuration update failed"):
+            provider._ensure_session([changed])
+        self.assertEqual(applied_fingerprint, provider._tool_fingerprint)
+
+        fail_update["value"] = False
+        provider._ensure_session([changed])
+        self.assertNotEqual(applied_fingerprint, provider._tool_fingerprint)
+        self.assertEqual(2, len(updates))
+
     async def test_agents_session_is_persisted_and_reused_for_tool_continuation(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
         binding = {}

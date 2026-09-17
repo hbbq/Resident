@@ -254,7 +254,10 @@ class OpenAIAgentsProvider:
                 if self._tool_fingerprint != fingerprint and session.get("status") == "idle":
                     session = self._request(
                         "POST", f"/agents/sessions/{self._session_id}", {"agent": agent})
-                self._tool_fingerprint = fingerprint
+                    # Track only configuration the session accepted. If the
+                    # session is active, the mismatch remains pending here and
+                    # a later idle call retries the current configuration.
+                    self._tool_fingerprint = fingerprint
                 return session
         body: dict = {
             "environment": {"type": "none"},
