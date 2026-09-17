@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -61,6 +62,18 @@ class MessageOnlyProvider:
 class FailingProvider:
     async def respond(self, context, tools, results, previous_response_id=None):
         raise RuntimeError("provider unavailable")
+
+
+class ThreadRecordingStore(Store):
+    def __init__(self, path):
+        self.owner_thread_id = threading.get_ident()
+        self.binding_save_threads: list[int] = []
+        super().__init__(path)
+
+    def save_agent_session_binding(self, provider, session_id, agent_id, last_turn_id):
+        self.binding_save_threads.append(threading.get_ident())
+        return super().save_agent_session_binding(
+            provider, session_id, agent_id, last_turn_id)
 
 
 class ContinuationLifecycleProvider:
@@ -645,6 +658,161 @@ class StoreTests(unittest.TestCase):
 
 
 class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agents_runtime_persists_session_and_turn_on_sqlite_owner_thread(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            state = {"status": "idle", "turns": {}, "items": []}
+            request_threads = []
+
+            def fake_request(method, request_path, body=None, **_):
+                request_threads.append(threading.get_ident())
+                if request_path == "/agents/sessions" and method == "POST":
+                    return {"id": "session-1", "status": "idle",
+                            "agent": {"id": "agent-1"}}
+                if request_path == "/agents/sessions/session-1" and method == "GET":
+                    session = {"id": "session-1", "status": state["status"],
+                               "agent": {"id": "agent-1"}}
+                    if state["status"] == "requires_action":
+                        session["required_actions"] = [{
+                            "type": "function_call", "turn_id": "turn-1",
+                            "call_id": "call-1", "name": "clock", "arguments": {},
+                        }]
+                    return session
+                if request_path == "/agents/sessions/session-1" and method == "POST":
+                    return {"id": "session-1", "status": state["status"],
+                            "agent": {"id": "agent-1"}}
+                if request_path.endswith("/events"):
+                    event = body["events"][0]
+                    if event["type"] == "agent.session.input.message":
+                        turn_id = "turn-1" if not state["turns"] else "turn-2"
+                        state["turns"][turn_id] = (
+                            "waiting" if turn_id == "turn-1" else "completed")
+                        state["status"] = (
+                            "requires_action" if turn_id == "turn-1" else "idle")
+                        state["items"].insert(0, {
+                            "id": f"input-{turn_id}", "type": "message", "role": "user",
+                            "turn_id": turn_id, "content": event["input"][0]["content"],
+                        })
+                    else:
+                        state["turns"]["turn-1"] = "completed"
+                        state["status"] = "idle"
+                        state["items"].insert(0, {
+                            "id": "output-turn-1", "type": "message", "role": "assistant",
+                            "turn_id": "turn-1", "content": [
+                                {"type": "output_text", "text": "first complete"}],
+                        })
+                    return {}
+                if "/turns?" in request_path:
+                    if not state["turns"]:
+                        return {"data": []}
+                    turn_id = next(reversed(state["turns"]))
+                    return {"data": [{"id": turn_id, "status": state["turns"][turn_id]}]}
+                if "/turns/" in request_path:
+                    turn_id = request_path.rsplit("/", 1)[-1]
+                    return {"id": turn_id, "status": state["turns"][turn_id]}
+                if "/items?" in request_path:
+                    return {"data": state["items"]}
+                raise AssertionError((method, request_path, body))
+
+            store = ThreadRecordingStore(path)
+            provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+            provider._request = fake_request
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            first_context = json.dumps({
+                "wake_event": {"id": "wake-1", "source": "connector", "payload": {}}})
+
+            first = await provider.respond(first_context, [], [])
+
+            self.assertEqual("turn-1", first.response_id)
+            self.assertEqual("session-1", store.agent_session_binding("openai_agents")["session_id"])
+            self.assertIsNone(store.agent_session_binding("openai_agents")["last_turn_id"])
+            completed = await provider.respond(
+                first_context, [], [ToolResult("call-1", {"ok": True})], first.response_id)
+            self.assertEqual("first complete", completed.message)
+            self.assertEqual(
+                "turn-1", store.agent_session_binding("openai_agents")["last_turn_id"])
+            self.assertEqual(
+                [store.owner_thread_id, store.owner_thread_id], store.binding_save_threads)
+            self.assertTrue(request_threads)
+            self.assertTrue(all(thread_id != store.owner_thread_id for thread_id in request_threads))
+            runtime.close()
+
+            reopened_store = ThreadRecordingStore(path)
+            recovered = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+            recovered._request = fake_request
+            reopened_runtime = ResidentRuntime(
+                Config(Path(temporary)), recovered, store=reopened_store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            self.assertEqual("session-1", recovered._session_id)
+            self.assertEqual("turn-1", recovered._last_turn_id)
+
+            second_context = json.dumps({
+                "wake_event": {"id": "wake-2", "source": "connector", "payload": {}}})
+            second = await recovered.respond(second_context, [], [])
+
+            self.assertEqual("turn-2", second.response_id)
+            self.assertEqual(
+                "turn-2", reopened_store.agent_session_binding("openai_agents")["last_turn_id"])
+            self.assertEqual(
+                [reopened_store.owner_thread_id], reopened_store.binding_save_threads)
+            reopened_runtime.close()
+
+    async def test_agents_binding_failure_is_propagated_and_retried_before_reuse(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        owner_thread_id = threading.get_ident()
+        save_calls = []
+        create_calls = []
+        state = {"items": [], "turn_created": False}
+
+        def save(session_id, agent_id, last_turn_id):
+            save_calls.append((threading.get_ident(), session_id, agent_id, last_turn_id))
+            if len(save_calls) == 1:
+                raise sqlite3.OperationalError("simulated persistence failure")
+
+        provider.bind_session_store(lambda: None, save)
+
+        def fake_request(method, request_path, body=None, **_):
+            if request_path == "/agents/sessions" and method == "POST":
+                create_calls.append(request_path)
+                return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
+            if request_path == "/agents/sessions/session-1" and method == "GET":
+                return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
+            if request_path.endswith("/events"):
+                event = body["events"][0]
+                state["turn_created"] = True
+                state["items"] = [{
+                    "id": "input-1", "type": "message", "role": "user",
+                    "turn_id": "turn-1", "content": event["input"][0]["content"],
+                }]
+                return {}
+            if "/turns?" in request_path:
+                return {"data": []}
+            if request_path.endswith("/turns/turn-1"):
+                return {"id": "turn-1", "status": "completed"}
+            if "/items?" in request_path:
+                return {"data": state["items"]}
+            raise AssertionError((method, request_path, body))
+
+        provider._request = fake_request
+        context = json.dumps({
+            "wake_event": {"id": "wake-1", "source": "connector", "payload": {}}})
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "simulated persistence failure"):
+            await provider.respond(context, [], [])
+        self.assertFalse(state["turn_created"])
+
+        turn = await provider.respond(context, [], [])
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual(1, len(create_calls))
+        self.assertEqual([owner_thread_id] * 3, [call[0] for call in save_calls])
+        self.assertEqual(
+            [("session-1", "agent-1", None), ("session-1", "agent-1", None),
+             ("session-1", "agent-1", "turn-1")],
+            [call[1:] for call in save_calls])
+
     def test_agents_configuration_change_is_deferred_until_session_is_idle(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
         status = {"value": "idle"}

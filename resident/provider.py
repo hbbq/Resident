@@ -5,6 +5,8 @@ import base64
 import json
 import urllib.error
 import urllib.request
+from concurrent.futures import Future
+from contextvars import ContextVar
 from typing import Callable, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
@@ -133,6 +135,10 @@ class OpenAIAgentsProvider:
         self._pending_wakes: dict[str, tuple[str, str, str]] = {}
         self._ephemeral_tool_results: dict[str, ToolResult] = {}
         self._save_binding: Callable[[str, str | None, str | None], None] = lambda *_: None
+        self._binding_writer: ContextVar[
+            Callable[[str, str | None, str | None], None] | None
+        ] = ContextVar("agents_binding_writer", default=None)
+        self._pending_binding: tuple[str, str | None, str | None] | None = None
         self._begin_action: Callable[..., dict] | None = None
         self._complete_action: Callable[..., None] | None = None
 
@@ -167,8 +173,34 @@ class OpenAIAgentsProvider:
 
     async def respond(self, context: str, tools: Sequence[ToolSpec], results: Sequence[ToolResult],
                       previous_response_id: str | None = None) -> ModelTurn:
-        return await asyncio.to_thread(
-            self._respond_sync, context, tools, results, previous_response_id)
+        loop = asyncio.get_running_loop()
+
+        def save_on_event_loop(session_id: str, agent_id: str | None,
+                               last_turn_id: str | None) -> None:
+            completed: Future[None] = Future()
+
+            def save() -> None:
+                try:
+                    self._save_binding(session_id, agent_id, last_turn_id)
+                except BaseException as exc:
+                    completed.set_exception(exc)
+                else:
+                    completed.set_result(None)
+
+            # The HTTP/session state machine stays in the worker, but Store's
+            # SQLite connection remains owned by the runtime event-loop thread.
+            # Wait for the checkpoint so remote work cannot outrun durability.
+            loop.call_soon_threadsafe(save)
+            completed.result()
+
+        # asyncio.to_thread propagates this context into only this response's
+        # worker, avoiding a process-wide or connection-wide thread escape.
+        token = self._binding_writer.set(save_on_event_loop)
+        try:
+            return await asyncio.to_thread(
+                self._respond_sync, context, tools, results, previous_response_id)
+        finally:
+            self._binding_writer.reset(token)
 
     def discard_continuation(self, continuation_id: str) -> None:
         # Managed sessions retain turn state. A failed local wake is reconciled
@@ -241,6 +273,7 @@ class OpenAIAgentsProvider:
         return self._wait_for_turn(session_id, latest["id"])
 
     def _ensure_session(self, tools: Sequence[ToolSpec]) -> dict:
+        self._flush_pending_binding()
         agent = self._agent_config(tools)
         fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
         if self._session_id is not None:
@@ -269,10 +302,23 @@ class OpenAIAgentsProvider:
         session = self._request("POST", "/agents/sessions", body)
         self._session_id = session["id"]
         resolved_agent_id = (session.get("agent") or {}).get("id") or self.agent_id
-        self._save_binding(self._session_id, resolved_agent_id, None)
         self._last_turn_id = None
         self._tool_fingerprint = fingerprint
+        self._persist_binding(self._session_id, resolved_agent_id, None)
         return session
+
+    def _persist_binding(self, session_id: str, agent_id: str | None,
+                         last_turn_id: str | None) -> None:
+        binding = (session_id, agent_id, last_turn_id)
+        self._pending_binding = binding
+        writer = self._binding_writer.get() or self._save_binding
+        writer(*binding)
+        if self._pending_binding == binding:
+            self._pending_binding = None
+
+    def _flush_pending_binding(self) -> None:
+        if self._pending_binding is not None:
+            self._persist_binding(*self._pending_binding)
 
     def _agent_config(self, tools: Sequence[ToolSpec]) -> dict:
         return {
@@ -325,7 +371,7 @@ class OpenAIAgentsProvider:
             self._active_turn_id = None
         self._last_turn_id = turn_id
         agent_id = (session.get("agent") or {}).get("id") or self.agent_id
-        self._save_binding(session_id, agent_id, turn_id)
+        self._persist_binding(session_id, agent_id, turn_id)
         usage = turn.get("usage") or session.get("usage") or {}
         return ModelTurn(turn_id, message=message,
                          input_tokens=usage.get("input_tokens"),
