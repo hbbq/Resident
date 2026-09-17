@@ -52,7 +52,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 8 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 10 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -95,6 +95,15 @@ class Store:
           message_id TEXT PRIMARY KEY REFERENCES messages(id),
           status TEXT NOT NULL CHECK(status IN ('pending','completed')),
           completed_at TEXT);
+        CREATE TABLE IF NOT EXISTS agent_session_bindings(
+          provider TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT,
+          last_turn_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS agent_tool_actions(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+          call_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+          output_json TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+          PRIMARY KEY(provider,session_id,call_id));
         CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_wake_runs_started ON wake_runs(started_at DESC);
@@ -169,7 +178,7 @@ class Store:
                 if name not in memory_columns:
                     self.connection.execute(
                         f"ALTER TABLE memories ADD COLUMN {name} {declaration}")
-        self.connection.execute("UPDATE schema_version SET version=8")
+        self.connection.execute("UPDATE schema_version SET version=10")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -186,6 +195,55 @@ class Store:
                 ON CONFLICT(scope) DO UPDATE SET data_json=excluded.data_json,
                     updated_at=excluded.updated_at
             """, (scope, encoded, utc_now()))
+
+    def agent_session_binding(self, provider: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT provider,session_id,agent_id,last_turn_id,created_at,updated_at
+            FROM agent_session_bindings WHERE provider=?
+        """, (provider,)).fetchone()
+        return None if row is None else dict(row)
+
+    def save_agent_session_binding(self, provider: str, session_id: str,
+                                   agent_id: str | None, last_turn_id: str | None) -> None:
+        now = utc_now()
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO agent_session_bindings(
+                  provider,session_id,agent_id,last_turn_id,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(provider) DO UPDATE SET
+                  session_id=excluded.session_id, agent_id=excluded.agent_id,
+                  last_turn_id=excluded.last_turn_id, updated_at=excluded.updated_at
+            """, (provider, session_id, agent_id, last_turn_id, now, now))
+
+    def begin_agent_tool_action(self, provider: str, session_id: str, turn_id: str,
+                                call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+        with self.connection:
+            cursor = self.connection.execute("""
+                INSERT INTO agent_tool_actions(
+                  provider,session_id,turn_id,call_id,name,arguments_json,status,created_at)
+                VALUES(?,?,?,?,?,?,'pending',?) ON CONFLICT DO NOTHING
+            """, (provider, session_id, turn_id, call_id, name, encoded, utc_now()))
+            row = self.connection.execute("""
+                SELECT turn_id,name,arguments_json,status,output_json
+                FROM agent_tool_actions WHERE provider=? AND session_id=? AND call_id=?
+            """, (provider, session_id, call_id)).fetchone()
+        if row["turn_id"] != turn_id or row["name"] != name or row["arguments_json"] != encoded:
+            raise RuntimeError("Agents function call id was reused with different action data")
+        return {
+            "claimed": cursor.rowcount == 1, "status": row["status"],
+            "output": json.loads(row["output_json"]) if row["output_json"] else None,
+        }
+
+    def complete_agent_tool_action(self, provider: str, session_id: str,
+                                   call_id: str, output: dict[str, Any]) -> None:
+        encoded = json.dumps(output, sort_keys=True, separators=(",", ":"))
+        with self.connection:
+            self.connection.execute("""
+                UPDATE agent_tool_actions SET status='completed',output_json=?,completed_at=?
+                WHERE provider=? AND session_id=? AND call_id=? AND status='pending'
+            """, (encoded, utc_now(), provider, session_id, call_id))
 
     def provision(self, resident_name: str, owner_name: str, personality: str) -> tuple[Identity, Identity]:
         now = utc_now()

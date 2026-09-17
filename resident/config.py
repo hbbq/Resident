@@ -134,10 +134,11 @@ class Config:
     resident_name: str = "Resident"
     owner_name: str = "Owner"
     personality: str = DEFAULT_PERSONALITY
-    provider: str = "openai"
+    provider: str = "openai-agents"
     model: str = "gpt-5.6-luna"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
+    openai_agent_id: str | None = None
     max_tool_rounds: int = 8
     context_memories: int = 8
     context_messages: int = 8
@@ -176,7 +177,8 @@ class Config:
         parser.add_argument("--resident-name", default=os.getenv("RESIDENT_NAME", "Resident"))
         parser.add_argument("--owner-name", default=os.getenv("RESIDENT_OWNER_NAME", "Owner"))
         parser.add_argument("--personality", default=os.getenv("RESIDENT_PERSONALITY", DEFAULT_PERSONALITY))
-        parser.add_argument("--provider", choices=("openai",), default=os.getenv("RESIDENT_PROVIDER", "openai"))
+        parser.add_argument("--provider", choices=("openai-agents", "openai-responses", "openai"),
+                            default=os.getenv("RESIDENT_PROVIDER", "openai-agents"))
         parser.add_argument("--model", default=os.getenv("RESIDENT_MODEL", "gpt-5.6-luna"))
         parser.add_argument("--spontaneous-message-limit", type=int,
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_LIMIT", "3")))
@@ -237,6 +239,7 @@ class Config:
             owner_name=args.owner_name, personality=args.personality, provider=args.provider,
             model=args.model, openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+            openai_agent_id=os.getenv("RESIDENT_OPENAI_AGENT_ID", "").strip() or None,
             spontaneous_message_limit=max(0, args.spontaneous_message_limit),
             spontaneous_message_window_seconds=max(1, args.spontaneous_message_window_seconds),
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,

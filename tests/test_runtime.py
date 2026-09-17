@@ -12,7 +12,7 @@ from resident.config import Config
 from resident.capabilities import Capability
 from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.domain import ImageAttachment, ToolResult, ToolSpec
-from resident.provider import OpenAIResponsesProvider
+from resident.provider import OpenAIAgentsProvider, OpenAIResponsesProvider
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
 
@@ -536,7 +536,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(8, store.connection.execute(
+            self.assertEqual(10, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
@@ -615,6 +615,86 @@ class StoreTests(unittest.TestCase):
 
 
 class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agents_session_is_persisted_and_reused_for_tool_continuation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+        binding = {}
+        provider.bind_session_store(
+            lambda: binding or None,
+            lambda session_id, agent_id, last_turn_id: binding.update(
+                session_id=session_id, agent_id=agent_id, last_turn_id=last_turn_id),
+        )
+        requests = []
+        session_states = iter((
+            {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}},
+            {"id": "session-1", "status": "requires_action", "required_actions": [{
+                "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
+                "name": "clock", "arguments": {},
+            }]},
+            {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}},
+            {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}},
+        ))
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path, body))
+            if path == "/agents/sessions" and method == "POST":
+                return next(session_states)
+            if path == "/agents/sessions/session-1" and method == "GET":
+                return next(session_states)
+            if path.endswith("/events"):
+                return {}
+            if "/turns?" in path:
+                return {"data": [{"id": "turn-1", "usage": {"input_tokens": 3}}]}
+            if "/items?" in path:
+                return {"data": [{"type": "message", "role": "assistant", "turn_id": "turn-1",
+                                   "content": [{"type": "output_text", "text": "done"}]}]}
+            if path == "/agents/sessions/session-1" and method == "POST":
+                return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        context = json.dumps({"wake_event": {"id": "wake-1", "payload": {}}})
+        spec = ToolSpec("clock", "Read clock", {
+            "type": "object", "properties": {}, "additionalProperties": False})
+        first = await provider.respond(context, [spec], [])
+        second = await provider.respond(
+            context, [spec], [ToolResult("call-1", {"ok": True})], first.response_id)
+
+        self.assertEqual("turn-1", first.response_id)
+        self.assertEqual("done", second.message)
+        self.assertEqual("session-1", binding["session_id"])
+        event_bodies = [body for method, path, body in requests if path.endswith("/events")]
+        self.assertEqual("resident-wake:wake-1", event_bodies[0]["idempotency_key"])
+        self.assertEqual("agent.session.input.tool_result", event_bodies[1]["events"][0]["type"])
+        self.assertEqual("turn-1", event_bodies[1]["events"][0]["turn_id"])
+
+    def test_agent_session_binding_can_be_rolled_over(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            store.save_agent_session_binding("openai_agents", "session-1", "agent-1", "turn-1")
+            store.save_agent_session_binding("openai_agents", "session-2", "agent-1", None)
+
+            binding = store.agent_session_binding("openai_agents")
+            self.assertEqual("session-2", binding["session_id"])
+            self.assertIsNone(binding["last_turn_id"])
+            store.close()
+
+    def test_agent_tool_action_is_claimed_once_and_replays_completed_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            first = store.begin_agent_tool_action(
+                "openai_agents", "session", "turn", "call", "display1_show_text",
+                {"text": "hello"})
+            store.complete_agent_tool_action(
+                "openai_agents", "session", "call", {"ok": True, "queued": True})
+            replay = store.begin_agent_tool_action(
+                "openai_agents", "session", "turn", "call", "display1_show_text",
+                {"text": "hello"})
+
+            self.assertTrue(first["claimed"])
+            self.assertFalse(replay["claimed"])
+            self.assertEqual({"ok": True, "queued": True}, replay["output"])
+            store.close()
+
     async def test_responses_wire_contract_is_confined_to_adapter(self):
         provider = OpenAIResponsesProvider("test-key", "gpt-5.6-luna")
         requests = []

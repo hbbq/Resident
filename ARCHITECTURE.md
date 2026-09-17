@@ -63,6 +63,14 @@ Resident decides what observations mean, what is interesting, what it wants to d
 
 > Runtime enables Resident's life; it should not live it on Resident's behalf.
 
+### Managed agent boundary
+
+The initial managed-agent integration uses one long-lived OpenAI Agents session per Resident instance. The binding is local, durable, and replaceable; losing or deliberately rolling over that remote session must not change Resident identity or erase Resident-owned memory, schedules, connector checkpoints, communication records, or the local journal.
+
+OpenAI owns conversational session history and the managed turn loop. Resident remains an outbound-only environment bridge: it selects and coalesces wakes, submits factual wake envelopes, executes requested function actions locally, validates every argument, applies deterministic policy, records observable outcomes, and returns results. Function calls are durably claimed before execution; completed results can be replayed without repeating local effects, while an action interrupted before its outcome is recorded is not automatically repeated. HomeOps and other integrated systems remain unaware of OpenAI. Ordinary connector events are processed by the local queue and cannot directly interrupt active work; Owner ingress retains local priority semantics as the runtime evolves.
+
+Agent behavior is declared in repository code and supplied as session configuration, optionally layered over a saved Agent resource. Machine endpoints, device identifiers, credentials, rate and attention limits, and integration policy remain local configuration. Direct function actions are the initial capability bridge; an authenticated MCP/tool-search surface may be considered later if the capability set becomes too large.
+
 ## Wake context
 
 The context supplied at a wakeup is Resident's temporary working context, not a dump of its persistent state.
