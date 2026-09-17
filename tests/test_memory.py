@@ -34,7 +34,7 @@ class MemoryStoreTests(unittest.TestCase):
 
             store = Store(path)
 
-            self.assertEqual(10, store.connection.execute(
+            self.assertEqual(11, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             memory = store.memory("legacy")
             self.assertEqual("resident", memory["source"])

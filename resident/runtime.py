@@ -280,11 +280,24 @@ class ResidentRuntime:
                     prepare = getattr(self.provider, "prepare_tool_call", None)
                     action = prepare(call) if prepare is not None else None
                     if action is not None and not action["claimed"]:
-                        output = action["output"] or {
-                            "ok": False,
-                            "error": "Previous local action outcome is unknown; action was not repeated",
-                        }
-                        result = ToolResult(call.id, output)
+                        ephemeral_result = action.get("ephemeral_result")
+                        if ephemeral_result is not None:
+                            result = ephemeral_result
+                        elif action.get("attachments_ephemeral"):
+                            # Attachment payloads (for example camera frames) are
+                            # intentionally not persisted. Reacquire them after a
+                            # restart instead of submitting an incomplete replay.
+                            execution = await registry.execute(call.name, call.arguments)
+                            result = ToolResult(call.id, execution.output, execution.attachments)
+                            record = getattr(self.provider, "record_tool_result", None)
+                            if record is not None:
+                                record(result)
+                        else:
+                            output = action["output"] or {
+                                "ok": False,
+                                "error": "Previous local action outcome is unknown; action was not repeated",
+                            }
+                            result = ToolResult(call.id, output)
                     else:
                         execution = await registry.execute(call.name, call.arguments)
                         result = ToolResult(call.id, execution.output, execution.attachments)

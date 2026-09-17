@@ -52,7 +52,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 10 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 11 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -102,7 +102,8 @@ class Store:
           provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
           call_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('pending','completed')),
-          output_json TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+          output_json TEXT, attachments_ephemeral INTEGER NOT NULL DEFAULT 0
+            CHECK(attachments_ephemeral IN (0,1)), created_at TEXT NOT NULL, completed_at TEXT,
           PRIMARY KEY(provider,session_id,call_id));
         CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
@@ -178,7 +179,16 @@ class Store:
                 if name not in memory_columns:
                     self.connection.execute(
                         f"ALTER TABLE memories ADD COLUMN {name} {declaration}")
-        self.connection.execute("UPDATE schema_version SET version=10")
+        action_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(agent_tool_actions)")
+        }
+        if "attachments_ephemeral" not in action_columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE agent_tool_actions ADD COLUMN "
+                    "attachments_ephemeral INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK(attachments_ephemeral IN (0,1))")
+        self.connection.execute("UPDATE schema_version SET version=11")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -226,7 +236,7 @@ class Store:
                 VALUES(?,?,?,?,?,?,'pending',?) ON CONFLICT DO NOTHING
             """, (provider, session_id, turn_id, call_id, name, encoded, utc_now()))
             row = self.connection.execute("""
-                SELECT turn_id,name,arguments_json,status,output_json
+                SELECT turn_id,name,arguments_json,status,output_json,attachments_ephemeral
                 FROM agent_tool_actions WHERE provider=? AND session_id=? AND call_id=?
             """, (provider, session_id, call_id)).fetchone()
         if row["turn_id"] != turn_id or row["name"] != name or row["arguments_json"] != encoded:
@@ -234,16 +244,19 @@ class Store:
         return {
             "claimed": cursor.rowcount == 1, "status": row["status"],
             "output": json.loads(row["output_json"]) if row["output_json"] else None,
+            "attachments_ephemeral": bool(row["attachments_ephemeral"]),
         }
 
     def complete_agent_tool_action(self, provider: str, session_id: str,
-                                   call_id: str, output: dict[str, Any]) -> None:
+                                   call_id: str, output: dict[str, Any],
+                                   attachments_ephemeral: bool = False) -> None:
         encoded = json.dumps(output, sort_keys=True, separators=(",", ":"))
         with self.connection:
             self.connection.execute("""
-                UPDATE agent_tool_actions SET status='completed',output_json=?,completed_at=?
+                UPDATE agent_tool_actions SET status='completed',output_json=?,
+                  attachments_ephemeral=?,completed_at=?
                 WHERE provider=? AND session_id=? AND call_id=? AND status='pending'
-            """, (encoded, utc_now(), provider, session_id, call_id))
+            """, (encoded, int(attachments_ephemeral), utc_now(), provider, session_id, call_id))
 
     def provision(self, resident_name: str, owner_name: str, personality: str) -> tuple[Identity, Identity]:
         now = utc_now()

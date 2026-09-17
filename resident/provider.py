@@ -129,6 +129,8 @@ class OpenAIAgentsProvider:
         self._last_turn_id: str | None = None
         self._tool_fingerprint: str | None = None
         self._active_turn_id: str | None = None
+        self._submitted_call_ids: dict[str, set[str]] = {}
+        self._ephemeral_tool_results: dict[str, ToolResult] = {}
         self._save_binding: Callable[[str, str | None, str | None], None] = lambda *_: None
         self._begin_action: Callable[..., dict] | None = None
         self._complete_action: Callable[..., None] | None = None
@@ -147,13 +149,20 @@ class OpenAIAgentsProvider:
     def prepare_tool_call(self, call: ToolCall) -> dict | None:
         if self._begin_action is None or self._session_id is None or self._active_turn_id is None:
             return None
-        return self._begin_action(
+        action = self._begin_action(
             "openai_agents", self._session_id, self._active_turn_id,
             call.id, call.name, call.arguments)
+        if not action["claimed"] and action.get("attachments_ephemeral"):
+            action["ephemeral_result"] = self._ephemeral_tool_results.get(call.id)
+        return action
 
     def record_tool_result(self, result: ToolResult) -> None:
         if self._complete_action is not None and self._session_id is not None:
-            self._complete_action("openai_agents", self._session_id, result.call_id, result.output)
+            if result.attachments:
+                self._ephemeral_tool_results[result.call_id] = result
+            self._complete_action(
+                "openai_agents", self._session_id, result.call_id, result.output,
+                bool(result.attachments))
 
     async def respond(self, context: str, tools: Sequence[ToolSpec], results: Sequence[ToolResult],
                       previous_response_id: str | None = None) -> ModelTurn:
@@ -170,7 +179,10 @@ class OpenAIAgentsProvider:
         session = self._ensure_session(tools)
         session_id = session["id"]
         if not results and session.get("status") == "requires_action":
-            return self._required_actions_turn(session)
+            turn = self._required_actions_turn(session)
+            if turn.tool_calls:
+                return turn
+            return self._wait_for_turn(session_id, turn.response_id)
         if results:
             turn_id = previous_response_id
             if not turn_id:
@@ -178,6 +190,8 @@ class OpenAIAgentsProvider:
             events = [self._tool_result_event(result, turn_id) for result in results]
             call_key = ":".join(sorted(result.call_id for result in results))
             self._submit_events(session_id, events, f"resident-tool:{turn_id}:{call_key}"[:256])
+            self._submitted_call_ids.setdefault(turn_id, set()).update(
+                result.call_id for result in results)
             expected_turn_id = turn_id
         else:
             wake_key = self._wake_idempotency_key(context)
@@ -243,7 +257,9 @@ class OpenAIAgentsProvider:
             if status == "failed":
                 raise RuntimeError(f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
             if status == "requires_action":
-                return self._required_actions_turn(session)
+                turn = self._required_actions_turn(session)
+                if turn.tool_calls:
+                    return turn
             if status == "idle":
                 turn = self._latest_turn(session_id)
                 if turn is not None:
@@ -251,6 +267,9 @@ class OpenAIAgentsProvider:
                     if ((expected_turn_id and turn_id == expected_turn_id) or
                             (expected_turn_id is None and turn_id != self._last_turn_id)):
                         message = self._turn_message(session_id, turn_id)
+                        submitted = self._submitted_call_ids.pop(turn_id, set())
+                        for call_id in submitted:
+                            self._ephemeral_tool_results.pop(call_id, None)
                         self._last_turn_id = turn_id
                         agent_id = (session.get("agent") or {}).get("id") or self.agent_id
                         self._save_binding(session_id, agent_id, turn_id)
@@ -269,10 +288,11 @@ class OpenAIAgentsProvider:
             raise RuntimeError("Agents session returned function actions without one turn id")
         turn_id = next(iter(turn_ids))
         self._active_turn_id = turn_id
+        submitted = self._submitted_call_ids.get(turn_id, set())
         calls = tuple(ToolCall(
             action.get("call_id", ""), action.get("name", ""),
             self._arguments(action.get("arguments")),
-        ) for action in actions)
+        ) for action in actions if action.get("call_id", "") not in submitted)
         usage = session.get("usage") or {}
         return ModelTurn(turn_id, tool_calls=calls,
                          input_tokens=usage.get("input_tokens"),
@@ -284,15 +304,40 @@ class OpenAIAgentsProvider:
         return data[0] if data else None
 
     def _turn_message(self, session_id: str, turn_id: str) -> str | None:
-        page = self._request(
-            "GET", f"/agents/sessions/{session_id}/items?order=asc&limit=100")
-        texts: list[str] = []
-        for item in page.get("data") or []:
-            if item.get("turn_id") != turn_id or item.get("type") != "message" or item.get("role") != "assistant":
-                continue
-            for part in item.get("content") or []:
-                if part.get("type") == "output_text" and part.get("text"):
-                    texts.append(part["text"])
+        # Session items are cursor-paginated. Read newest-first so a long-lived
+        # session reaches the just-completed turn immediately, then continue
+        # until all of that turn's items have been consumed.
+        after: str | None = None
+        found_turn = False
+        messages: list[list[str]] = []
+        while True:
+            path = f"/agents/sessions/{session_id}/items?order=desc&limit=100"
+            if after:
+                from urllib.parse import quote
+                path += f"&after={quote(after, safe='')}"
+            page = self._request("GET", path)
+            data = page.get("data") or []
+            for item in data:
+                if item.get("turn_id") != turn_id:
+                    if found_turn:
+                        return self._join_turn_messages(messages)
+                    continue
+                found_turn = True
+                if item.get("type") != "message" or item.get("role") != "assistant":
+                    continue
+                messages.append([
+                    part["text"] for part in item.get("content") or []
+                    if part.get("type") == "output_text" and part.get("text")
+                ])
+            if not page.get("has_more") or not data:
+                return self._join_turn_messages(messages)
+            after = page.get("last_id") or data[-1].get("id")
+            if not after:
+                raise RuntimeError("Agents item page has_more without a pagination cursor")
+
+    @staticmethod
+    def _join_turn_messages(messages_descending: list[list[str]]) -> str | None:
+        texts = [text for message in reversed(messages_descending) for text in message]
         return "\n".join(texts) or None
 
     def _submit_events(self, session_id: str, events: list[dict], idempotency_key: str) -> None:

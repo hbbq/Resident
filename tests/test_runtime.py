@@ -516,6 +516,36 @@ class AttentionBudgetTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_existing_agent_actions_gain_ephemeral_attachment_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript("""
+                CREATE TABLE schema_version(version INTEGER NOT NULL);
+                INSERT INTO schema_version VALUES(10);
+                CREATE TABLE agent_tool_actions(
+                  provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                  call_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL,
+                  status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+                  output_json TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+                  PRIMARY KEY(provider,session_id,call_id));
+            """)
+            connection.execute(
+                "INSERT INTO agent_tool_actions VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("openai_agents", "session", "turn", "call", "clock", "{}",
+                 "completed", '{"ok":true}', utc_now(), utc_now()))
+            connection.commit()
+            connection.close()
+
+            store = Store(path)
+            action = store.begin_agent_tool_action(
+                "openai_agents", "session", "turn", "call", "clock", {})
+            self.assertEqual(11, store.connection.execute(
+                "SELECT version FROM schema_version").fetchone()[0])
+            self.assertFalse(action["attachments_ephemeral"])
+            self.assertEqual({"ok": True}, action["output"])
+            store.close()
+
     def test_existing_schedule_table_is_migrated_to_support_failed_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "resident.sqlite3"
@@ -536,7 +566,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(10, store.connection.execute(
+            self.assertEqual(11, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
@@ -630,7 +660,14 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
                 "name": "clock", "arguments": {},
             }]},
-            {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}},
+            {"id": "session-1", "status": "requires_action", "required_actions": [{
+                "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
+                "name": "clock", "arguments": {},
+            }]},
+            {"id": "session-1", "status": "requires_action", "required_actions": [{
+                "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
+                "name": "clock", "arguments": {},
+            }]},
             {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}},
         ))
 
@@ -666,6 +703,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("resident-wake:wake-1", event_bodies[0]["idempotency_key"])
         self.assertEqual("agent.session.input.tool_result", event_bodies[1]["events"][0]["type"])
         self.assertEqual("turn-1", event_bodies[1]["events"][0]["turn_id"])
+        self.assertEqual(2, len(event_bodies))
 
     def test_agent_session_binding_can_be_rolled_over(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -693,7 +731,81 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(first["claimed"])
             self.assertFalse(replay["claimed"])
             self.assertEqual({"ok": True, "queued": True}, replay["output"])
+            self.assertFalse(replay["attachments_ephemeral"])
             store.close()
+
+    def test_attachment_action_reuses_memory_only_and_marks_durable_reacquisition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            provider = OpenAIAgentsProvider("test-key", "vision-model")
+            provider._session_id = "session"
+            provider._active_turn_id = "turn"
+            provider.bind_action_store(
+                store.begin_agent_tool_action, store.complete_agent_tool_action)
+            call = ToolCall("capture", "camera_capture_frame", {"camera_id": "entry"})
+            self.assertTrue(provider.prepare_tool_call(call)["claimed"])
+
+            result = ToolResult(
+                "capture", {"ok": True, "status": "captured"},
+                (ImageAttachment(b"private-frame"),))
+            provider.record_tool_result(result)
+            same_process = provider.prepare_tool_call(call)
+            self.assertIs(result, same_process["ephemeral_result"])
+            self.assertTrue(same_process["attachments_ephemeral"])
+
+            restarted = OpenAIAgentsProvider("test-key", "vision-model")
+            restarted._session_id = "session"
+            restarted._active_turn_id = "turn"
+            restarted.bind_action_store(
+                store.begin_agent_tool_action, store.complete_agent_tool_action)
+            after_restart = restarted.prepare_tool_call(call)
+            self.assertFalse(after_restart["claimed"])
+            self.assertTrue(after_restart["attachments_ephemeral"])
+            self.assertIsNone(after_restart["ephemeral_result"])
+            database_text = " ".join(
+                str(value) for row in store.connection.execute(
+                    "SELECT output_json,attachments_ephemeral FROM agent_tool_actions")
+                for value in row)
+            self.assertNotIn("private-frame", database_text)
+            store.close()
+
+    def test_agent_turn_message_uses_descending_cursor_pagination(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        paths = []
+
+        def fake_request(method, path, body=None, **_):
+            paths.append(path)
+            if "after=" not in path:
+                return {
+                    "data": [
+                        {"id": "newest", "turn_id": "turn-2", "type": "message",
+                         "role": "assistant", "content": [
+                             {"type": "output_text", "text": "second"}]},
+                        {"id": "cursor", "turn_id": "turn-2", "type": "reasoning"},
+                    ],
+                    "has_more": True,
+                    "last_id": "cursor",
+                }
+            return {
+                "data": [
+                    {"id": "older-in-turn", "turn_id": "turn-2", "type": "message",
+                     "role": "assistant", "content": [
+                         {"type": "output_text", "text": "first"}]},
+                    {"id": "old-turn", "turn_id": "turn-1", "type": "message",
+                     "role": "assistant", "content": [
+                         {"type": "output_text", "text": "ignore"}]},
+                ],
+                "has_more": True,
+                "last_id": "old-turn",
+            }
+
+        provider._request = fake_request
+        self.assertEqual("first\nsecond", provider._turn_message("session", "turn-2"))
+        self.assertEqual(
+            "/agents/sessions/session/items?order=desc&limit=100", paths[0])
+        self.assertEqual(
+            "/agents/sessions/session/items?order=desc&limit=100&after=cursor", paths[1])
+        self.assertEqual(2, len(paths))
 
     async def test_responses_wire_contract_is_confined_to_adapter(self):
         provider = OpenAIResponsesProvider("test-key", "gpt-5.6-luna")
