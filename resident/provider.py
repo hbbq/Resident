@@ -216,9 +216,9 @@ class OpenAIAgentsProvider:
 
     def _respond_sync(self, context: str, tools: Sequence[ToolSpec], results: Sequence[ToolResult],
                       previous_response_id: str | None) -> ModelTurn:
-        session = self._ensure_session(tools)
-        session_id = session["id"]
         if results:
+            session, _ = self._ensure_session(tools, allow_create=False)
+            session_id = session["id"]
             turn_id = previous_response_id
             if not turn_id:
                 raise RuntimeError("Agents tool results require the requesting turn id")
@@ -238,6 +238,18 @@ class OpenAIAgentsProvider:
 
         wake_key = self._wake_idempotency_key(context)
         correlated_context, correlation = self._correlated_context(context, wake_key)
+        session, created_with_input = self._ensure_session(
+            tools, initial_input=correlated_context)
+        session_id = session["id"]
+        if created_with_input:
+            return self._wait_for_submitted_wake(session_id, correlation, wake_key)
+
+        # Creation has no event idempotency key. If the local binding checkpoint
+        # failed, or the process restarted after accepting the initial input,
+        # recover that correlated turn instead of submitting the wake again.
+        existing_turn_id = self._correlated_turn_id(session_id, correlation, wake_key)
+        if existing_turn_id:
+            return self._wait_for_turn(session_id, existing_turn_id)
         if not self._is_owner_wake(context):
             recovered = self._reconcile_before_wake(session_id, session)
             if recovered is not None and recovered.tool_calls:
@@ -253,7 +265,10 @@ class OpenAIAgentsProvider:
     def _submit_ordinary_wake(self, tools: Sequence[ToolSpec], context: str,
                               wake_key: str, correlation: str) -> ModelTurn:
         """Submit only after an idle session has accepted current configuration."""
-        session = self._ensure_session(tools)
+        session, created_with_input = self._ensure_session(
+            tools, initial_input=context)
+        if created_with_input:
+            return self._wait_for_submitted_wake(session["id"], correlation, wake_key)
         if session.get("status") != "idle":
             raise RuntimeError(
                 "OpenAI Agents session was not idle after wake reconciliation")
@@ -268,6 +283,10 @@ class OpenAIAgentsProvider:
             ]}],
         }
         self._submit_events(session_id, [event], f"resident-wake:{wake_key}"[:256])
+        return self._wait_for_submitted_wake(session_id, correlation, wake_key)
+
+    def _wait_for_submitted_wake(self, session_id: str, correlation: str,
+                                 wake_key: str) -> ModelTurn:
         turn_id = self._wait_for_correlated_turn(session_id, correlation, wake_key)
         return self._wait_for_turn(session_id, turn_id)
 
@@ -292,7 +311,9 @@ class OpenAIAgentsProvider:
             raise RuntimeError("Active Agents session has no recoverable turn")
         return self._wait_for_turn(session_id, latest["id"])
 
-    def _ensure_session(self, tools: Sequence[ToolSpec]) -> dict:
+    def _ensure_session(self, tools: Sequence[ToolSpec], *,
+                        initial_input: str | None = None,
+                        allow_create: bool = True) -> tuple[dict, bool]:
         self._flush_pending_binding()
         agent = self._agent_config(tools)
         fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
@@ -338,10 +359,17 @@ class OpenAIAgentsProvider:
                     else:
                         # If the session is active, leave the mismatch pending and
                         # retry once it becomes idle.
-                        return session
+                        return session, False
+        if not allow_create:
+            raise RuntimeError(
+                "OpenAI Agents session disappeared while continuing a turn")
+        if initial_input is None:
+            raise RuntimeError(
+                "Conversation-only OpenAI Agents sessions require initial input")
         body: dict = {
             "environment": {"type": "none"},
             "agent": agent,
+            "input": initial_input,
             "metadata": {"managed_by": "resident"},
         }
         intended_agent_id = self.agent_id or self._bound_agent_id
@@ -355,7 +383,7 @@ class OpenAIAgentsProvider:
         self._last_turn_id = None
         self._tool_fingerprint = fingerprint
         self._persist_binding(self._session_id, resolved_agent_id, None)
-        return session
+        return session, True
 
     def _persist_binding(self, session_id: str, agent_id: str | None,
                          last_turn_id: str | None) -> None:
@@ -550,9 +578,9 @@ class OpenAIAgentsProvider:
         return "\n".join(texts) or None
 
     def _submit_events(self, session_id: str, events: list[dict], idempotency_key: str) -> None:
-        self._request("POST", f"/agents/sessions/{session_id}/events", {
-            "events": events, "idempotency_key": idempotency_key,
-        }, allow_empty=True)
+        self._request(
+            "POST", f"/agents/sessions/{session_id}/events", {"events": events},
+            allow_empty=True, extra_headers={"Idempotency-Key": idempotency_key})
 
     @staticmethod
     def _arguments(value: object) -> dict:
@@ -620,15 +648,19 @@ class OpenAIAgentsProvider:
         return event
 
     def _request(self, method: str, path: str, body: dict | None = None, *,
-                 allow_empty: bool = False) -> dict:
+                 allow_empty: bool = False,
+                 extra_headers: dict[str, str] | None = None) -> dict:
         data = None if body is None else json.dumps(body).encode()
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "OpenAI-Beta": "agents=v1",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
         request = urllib.request.Request(
             f"{self.base_url}{path}", data=data, method=method,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "OpenAI-Beta": "agents=v1",
-            })
+            headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 payload = response.read()

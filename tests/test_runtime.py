@@ -663,11 +663,20 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             path = Path(temporary) / "resident.sqlite3"
             state = {"status": "idle", "turns": {}, "items": []}
             request_threads = []
+            requests = []
 
             def fake_request(method, request_path, body=None, **_):
                 request_threads.append(threading.get_ident())
+                requests.append((method, request_path, body))
                 if request_path == "/agents/sessions" and method == "POST":
-                    return {"id": "session-1", "status": "idle",
+                    state["turns"]["turn-1"] = "waiting"
+                    state["status"] = "requires_action"
+                    state["items"] = [{
+                        "id": "input-turn-1", "type": "message", "role": "user",
+                        "turn_id": "turn-1", "content": [
+                            {"type": "input_text", "text": body["input"]}],
+                    }]
+                    return {"id": "session-1", "status": "requires_action",
                             "agent": {"id": "agent-1"}}
                 if request_path == "/agents/sessions/session-1" and method == "GET":
                     session = {"id": "session-1", "status": state["status"],
@@ -755,6 +764,17 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             second = await recovered.respond(second_context, [], [])
 
             self.assertEqual("turn-2", second.response_id)
+            creates = [body for method, request_path, body in requests
+                       if method == "POST" and request_path == "/agents/sessions"]
+            message_events = [body for method, request_path, body in requests
+                              if method == "POST" and request_path.endswith("/events")
+                              and body["events"][0]["type"] == "agent.session.input.message"]
+            self.assertEqual(1, len(creates))
+            self.assertIn('"id":"wake-1"', creates[0]["input"])
+            self.assertEqual(1, len(message_events))
+            self.assertIn(
+                '"id":"wake-2"',
+                message_events[0]["events"][0]["input"][0]["content"][0]["text"])
             self.assertEqual(
                 "turn-2", reopened_store.agent_session_binding("openai_agents")["last_turn_id"])
             self.assertEqual(
@@ -794,9 +814,10 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError((method, path, body))
 
         provider._request = fake_request
-        session = provider._ensure_session([spec])
+        session, created = provider._ensure_session([spec], initial_input="wake")
 
         self.assertEqual("session-1", session["id"])
+        self.assertFalse(created)
         self.assertEqual([("GET", "/agents/sessions/session-1", None)], requests)
         self.assertIsNotNone(provider._tool_fingerprint)
 
@@ -824,12 +845,14 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         provider._request = fake_request
 
-        session = provider._ensure_session([])
+        session, created = provider._ensure_session([], initial_input="replacement wake")
 
         self.assertEqual("session-replacement", session["id"])
+        self.assertTrue(created)
         create_body = requests[-1][2]
         self.assertEqual("agent-persisted", create_body["agent_id"])
         self.assertEqual("gpt-5.6-luna", create_body["agent"]["model"])
+        self.assertEqual("replacement wake", create_body["input"])
         self.assertNotIn("name", create_body["agent"])
         self.assertEqual({
             "session_id": "session-replacement",
@@ -862,9 +885,10 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         provider._request = fake_request
 
         self.assertIsNone(provider._session_id)
-        session = provider._ensure_session([])
+        session, created = provider._ensure_session([], initial_input="override wake")
 
         self.assertEqual("session-configured", session["id"])
+        self.assertTrue(created)
         self.assertEqual([("POST", "/agents/sessions")], [
             (method, path) for method, path, _ in requests])
         self.assertEqual("agent-configured", requests[0][2]["agent_id"])
@@ -891,6 +915,12 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         def fake_request(method, request_path, body=None, **_):
             if request_path == "/agents/sessions" and method == "POST":
                 create_calls.append(request_path)
+                state["turn_created"] = True
+                state["items"] = [{
+                    "id": "input-1", "type": "message", "role": "user",
+                    "turn_id": "turn-1", "content": [
+                        {"type": "input_text", "text": body["input"]}],
+                }]
                 return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
             if request_path == "/agents/sessions/session-1" and method == "GET":
                 return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
@@ -916,7 +946,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(sqlite3.OperationalError, "simulated persistence failure"):
             await provider.respond(context, [], [])
-        self.assertFalse(state["turn_created"])
+        self.assertTrue(state["turn_created"])
 
         turn = await provider.respond(context, [], [])
 
@@ -945,23 +975,23 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         original = ToolSpec("clock", "Read clock", {"type": "object"})
         changed = ToolSpec("clock", "Read the local clock", {"type": "object"})
 
-        provider._ensure_session([original])
+        provider._ensure_session([original], initial_input="original wake")
         applied_fingerprint = provider._tool_fingerprint
         status["value"] = "in_progress"
-        provider._ensure_session([changed])
+        provider._ensure_session([changed], initial_input="changed wake")
 
         self.assertEqual(applied_fingerprint, provider._tool_fingerprint)
         self.assertEqual(1, len(creates))
 
         status["value"] = "idle"
-        provider._ensure_session([changed])
+        provider._ensure_session([changed], initial_input="changed wake")
         changed_fingerprint = json.dumps(
             provider._agent_config([changed]), sort_keys=True, separators=(",", ":"))
         self.assertEqual(changed_fingerprint, provider._tool_fingerprint)
         self.assertEqual(
             "Read the local clock", creates[1]["agent"]["tools"][0]["description"])
 
-        provider._ensure_session([changed])
+        provider._ensure_session([changed], initial_input="changed wake")
         self.assertEqual(2, len(creates))
 
     def test_agents_configuration_fingerprint_advances_only_after_successful_replacement(self):
@@ -982,15 +1012,15 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         provider._request = fake_request
         original = ToolSpec("clock", "Read clock", {"type": "object"})
         changed = ToolSpec("clock", "Read the local clock", {"type": "object"})
-        provider._ensure_session([original])
+        provider._ensure_session([original], initial_input="original wake")
         applied_fingerprint = provider._tool_fingerprint
 
         with self.assertRaisesRegex(RuntimeError, "configuration replacement failed"):
-            provider._ensure_session([changed])
+            provider._ensure_session([changed], initial_input="changed wake")
         self.assertEqual(applied_fingerprint, provider._tool_fingerprint)
 
         fail_replacement["value"] = False
-        provider._ensure_session([changed])
+        provider._ensure_session([changed], initial_input="changed wake")
         self.assertNotEqual(applied_fingerprint, provider._tool_fingerprint)
         self.assertEqual(3, len(creates))
 
@@ -1008,7 +1038,15 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         def fake_request(method, path, body=None, **_):
             requests.append((method, path, body))
             if path == "/agents/sessions" and method == "POST":
-                return {"id": "session-1", "status": "idle", "agent": {"id": "agent-1"}}
+                state["status"] = "requires_action"
+                state["turn_status"] = "waiting"
+                state["items"] = [{
+                    "id": "input-1", "type": "message", "role": "user",
+                    "turn_id": "turn-1", "content": [
+                        {"type": "input_text", "text": body["input"]}],
+                }]
+                return {"id": "session-1", "status": "requires_action",
+                        "agent": {"id": "agent-1"}}
             if path == "/agents/sessions/session-1" and method == "GET":
                 session = {"id": "session-1", "status": state["status"],
                            "agent": {"id": "agent-1"}}
@@ -1063,10 +1101,38 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("done", second.message)
         self.assertEqual("session-1", binding["session_id"])
         event_bodies = [body for method, path, body in requests if path.endswith("/events")]
-        self.assertEqual("resident-wake:wake-1", event_bodies[0]["idempotency_key"])
-        self.assertEqual("agent.session.input.tool_result", event_bodies[1]["events"][0]["type"])
-        self.assertEqual("turn-1", event_bodies[1]["events"][0]["turn_id"])
-        self.assertEqual(2, len(event_bodies))
+        create_body = next(body for method, path, body in requests
+                           if method == "POST" and path == "/agents/sessions")
+        self.assertIn('"id":"wake-1"', create_body["input"])
+        self.assertEqual("agent.session.input.tool_result", event_bodies[0]["events"][0]["type"])
+        self.assertEqual("turn-1", event_bodies[0]["events"][0]["turn_id"])
+        self.assertEqual(1, len(event_bodies))
+
+    def test_agents_event_idempotency_is_an_http_header_not_a_body_field(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        requests = []
+
+        def fake_request(method, path, body=None, **kwargs):
+            requests.append((method, path, body, kwargs))
+            return {}
+
+        provider._request = fake_request
+        event = {
+            "type": "agent.session.input.tool_result",
+            "turn_id": "turn-1", "call_id": "call-1",
+            "success": True, "output": '{"ok":true}',
+        }
+
+        provider._submit_events("session-1", [event], "resident-tool:turn-1:call-1")
+
+        method, path, body, kwargs = requests[0]
+        self.assertEqual(("POST", "/agents/sessions/session-1/events"), (method, path))
+        self.assertEqual({"events": [event]}, body)
+        self.assertNotIn("idempotency_key", body)
+        self.assertEqual(
+            {"Idempotency-Key": "resident-tool:turn-1:call-1"},
+            kwargs["extra_headers"])
+        self.assertTrue(kwargs["allow_empty"])
 
     async def test_recovered_requires_action_finishes_before_new_ordinary_wake(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
@@ -1232,10 +1298,15 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             if path == "/agents/sessions/session-1" and method == "GET":
                 return {"id": "session-1", "status": state["status"]}
             if path == "/agents/sessions" and method == "POST":
-                operations.append("configuration")
+                operations.append("configuration_with_wake")
                 self.assertEqual(
                     "Read the local clock", body["agent"]["tools"][0]["description"])
                 self.assertNotIn("name", body["agent"])
+                state["items"] = [{
+                    "id": "input-new", "type": "message", "role": "user",
+                    "turn_id": "turn-new", "content": [
+                        {"type": "input_text", "text": body["input"]}],
+                }]
                 return {"id": "session-2", "status": "idle"}
             if path == "/agents/sessions/session-2" and method == "GET":
                 return {"id": "session-2", "status": "idle"}
@@ -1265,7 +1336,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         turn = await provider.respond(context, [changed], [])
 
         self.assertEqual("turn-new", turn.response_id)
-        self.assertEqual(["configuration", "wake"], operations)
+        self.assertEqual(["configuration_with_wake"], operations)
         self.assertEqual(changed_fingerprint, provider._tool_fingerprint)
 
     async def test_failed_deferred_configuration_replacement_does_not_submit_wake(self):
@@ -1382,7 +1453,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("turn-active", turn.response_id)
         self.assertNotIn(("GET", "/agents/sessions/session-1/turns?order=desc&limit=1"),
                          operations)
-        self.assertEqual(("POST", "/agents/sessions/session-1/events"), operations[1])
+        self.assertIn(("POST", "/agents/sessions/session-1/events"), operations)
 
     def test_agent_session_binding_can_be_rolled_over(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1412,6 +1483,42 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({"ok": True, "queued": True}, replay["output"])
             self.assertFalse(replay["attachments_ephemeral"])
             store.close()
+
+    def test_restart_restores_session_and_replays_completed_action_without_reclaiming(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            store.save_agent_session_binding(
+                "openai_agents", "session-1", "agent-1", "turn-1")
+            claimed = store.begin_agent_tool_action(
+                "openai_agents", "session-1", "turn-1", "call-1",
+                "display1_show_text", {"text": "hello"})
+            store.complete_agent_tool_action(
+                "openai_agents", "session-1", "call-1",
+                {"ok": True, "queued": True})
+            self.assertTrue(claimed["claimed"])
+            store.close()
+
+            reopened = Store(path)
+            provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+            provider.bind_session_store(
+                lambda: reopened.agent_session_binding("openai_agents"),
+                lambda session_id, agent_id, last_turn_id:
+                    reopened.save_agent_session_binding(
+                        "openai_agents", session_id, agent_id, last_turn_id),
+            )
+            provider.bind_action_store(
+                reopened.begin_agent_tool_action, reopened.complete_agent_tool_action)
+            provider._active_turn_id = "turn-1"
+
+            replay = provider.prepare_tool_call(ToolCall(
+                "call-1", "display1_show_text", {"text": "hello"}))
+
+            self.assertEqual("session-1", provider._session_id)
+            self.assertEqual("turn-1", provider._last_turn_id)
+            self.assertFalse(replay["claimed"])
+            self.assertEqual({"ok": True, "queued": True}, replay["output"])
+            reopened.close()
 
     def test_attachment_action_reuses_memory_only_and_marks_durable_reacquisition(self):
         with tempfile.TemporaryDirectory() as temporary:
