@@ -12,14 +12,9 @@ from typing import Any, Protocol, Sequence
 from .store import Store
 
 
-_CREDENTIAL_FIELD = re.compile(
-    r"(?i)(?:^|[_\-\s])(?:authorization|api[_\-\s]?key|access[_\-\s]?token|"
-    r"refresh[_\-\s]?token|auth[_\-\s]?token|token|password|passwd|secret|"
-    r"client[_\-\s]?secret|api[_\-\s]?secret|secret[_\-\s]?key|"
-    r"private[_\-\s]?key|cookie|credentials?)(?:$|[_\-\s])"
-)
 _AUTHORIZATION = re.compile(
-    r"(?im)(\bauthorization\s*[:=]\s*)(?:[^\r\n]+)"
+    r"(?im)(\b(?:authorization|authentication|proxy-authorization)\s*[:=]\s*)"
+    r"(?:[^\r\n]+)"
 )
 _BEARER = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+")
 _LABELED_SECRET = re.compile(
@@ -29,8 +24,12 @@ _LABELED_SECRET = re.compile(
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n}\]]+)"
 )
 _COMMON_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|"
-    r"xox[a-z]-[A-Za-z0-9-]{8,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\."
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{8,}|"
+    r"github_pat_[A-Za-z0-9_]{12,}|glpat-[A-Za-z0-9_-]{8,}|"
+    r"xox[a-z]-[A-Za-z0-9-]{8,}|npm_[A-Za-z0-9]{8,}|"
+    r"pypi-[A-Za-z0-9_-]{12,}|hf_[A-Za-z0-9]{12,}|"
+    r"AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\."
     r"[A-Za-z0-9_-]+)"
 )
 _REDACTED = "[REDACTED]"
@@ -42,26 +41,6 @@ def _redact_text(value: str) -> str:
     value = _BEARER.sub(r"\1[REDACTED]", value)
     value = _LABELED_SECRET.sub(r"\1[REDACTED]", value)
     return _COMMON_TOKEN.sub(_REDACTED, value)
-
-
-def _is_credential_field(key: object) -> bool:
-    return isinstance(key, str) and _CREDENTIAL_FIELD.search(f"_{key}_") is not None
-
-
-def _redact_structured(value: Any) -> Any:
-    """Return a redacted copy, preferring field-aware handling for structured data."""
-    if isinstance(value, dict):
-        return {
-            key: _REDACTED if _is_credential_field(key) else _redact_structured(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_structured(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_structured(item) for item in value)
-    if isinstance(value, str):
-        return _redact_text(value)
-    return value
 
 
 def _canonical_item(item: dict[str, Any]) -> str:
@@ -100,11 +79,42 @@ class CuratorModel(Protocol):
 
 
 def _safe_item(item: dict[str, Any]) -> dict[str, Any] | None:
-    """Allow model-visible material while excluding reasoning and attachment payloads."""
-    if item.get("type") in {"reasoning", "encrypted_reasoning"}:
+    """Project a supported source item onto the Curator's explicit input schema."""
+    item_type = item.get("type")
+    if item_type not in {"message", "function_call", "function_call_output"}:
         return None
-    safe = {key: item.get(key) for key in ("id", "turn_id", "type", "role", "created_at")
-            if item.get(key) is not None}
+
+    safe: dict[str, Any] = {"type": item_type}
+    for key in ("id", "turn_id", "created_at"):
+        value = item.get(key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            safe[key] = value
+
+    if item_type == "message":
+        role = item.get("role")
+        if role in {"user", "assistant", "system", "developer"}:
+            safe["role"] = role
+    else:
+        call_id = item.get("call_id")
+        if isinstance(call_id, str):
+            safe["call_id"] = call_id[:500]
+
+    if item_type == "function_call":
+        name = item.get("name")
+        if isinstance(name, str):
+            safe["name"] = _redact_text(name)[:500]
+        # Tool arguments are intentionally outside the Curator boundary. Their
+        # schemas vary by tool and may contain credentials in unknown fields.
+        return safe
+
+    if item_type == "function_call_output":
+        # Result bodies and errors are similarly excluded. Assistant messages retain
+        # the safe semantic account of what was learned from a tool invocation.
+        success = item.get("success")
+        if isinstance(success, bool):
+            safe["success"] = success
+        return safe
+
     content: list[dict[str, str]] = []
     for part in item.get("content") or []:
         if not isinstance(part, dict) or part.get("type") not in {"input_text", "output_text"}:
@@ -114,14 +124,34 @@ def _safe_item(item: dict[str, Any]) -> dict[str, Any] | None:
             content.append({"type": part["type"], "text": _redact_text(text)})
     if content:
         safe["content"] = content
-    for key in ("name", "call_id", "arguments", "output", "error"):
-        value = item.get(key)
-        if isinstance(value, (str, int, float, bool, dict, list)):
-            redacted = _redact_structured(value)
-            encoded = (json.dumps(redacted, ensure_ascii=False)
-                       if not isinstance(redacted, str) else redacted)
-            safe[key] = encoded[:4000]
-    return safe if len(safe) > 1 else None
+    return safe
+
+
+def _safe_existing_memory(memory: dict[str, Any]) -> dict[str, Any]:
+    """Project durable memory onto the fields needed for consolidation."""
+    safe: dict[str, Any] = {}
+    for key in ("id", "updated_at"):
+        value = memory.get(key)
+        if isinstance(value, str):
+            safe[key] = value
+    for key in ("kind", "content"):
+        value = memory.get(key)
+        if isinstance(value, str):
+            safe[key] = _redact_text(value)
+    confidence = memory.get("confidence")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        safe["confidence"] = confidence
+    return safe
+
+
+def _source_page_identity(page: SessionItemPage) -> tuple[str, tuple[str, ...] | str]:
+    """Identify a remote page from source metadata, never from filtered payloads."""
+    item_ids = tuple(item.get("id") for item in page.items)
+    if item_ids and all(isinstance(item_id, str) and item_id for item_id in item_ids):
+        return "item_ids", item_ids
+    if isinstance(page.cursor, str) and page.cursor:
+        return "cursor", page.cursor
+    raise RuntimeError("Curator page lacks stable source identity")
 
 
 class OpenAICuratorModel:
@@ -137,8 +167,8 @@ class OpenAICuratorModel:
     async def curate(self, session_id: str, items: Sequence[dict[str, Any]],
                      existing: Sequence[dict[str, Any]]) -> dict[str, Any]:
         document = {"session_id": session_id,
-                    "existing_memories": _redact_structured(list(existing)),
-                    "new_session_items": _redact_structured(list(items))}
+                    "existing_memories": list(existing),
+                    "new_session_items": list(items)}
         return await asyncio.to_thread(self._post, document)
 
     def _post(self, document: dict[str, Any]) -> dict[str, Any]:
@@ -199,17 +229,13 @@ class MemoryCurator:
             handover = _redact_text(saved_handover) if isinstance(saved_handover, str) else None
             pages = 0
             seen_cursors = {cursor}
-            seen_pages: set[str] = set()
+            seen_pages: set[tuple[str, tuple[str, ...] | str]] = set()
             more_pages = False
             while pages < self.max_batches:
                 page = await self.source.session_items(cursor, self.batch_size)
                 more_pages = page.has_more
                 safe_items = tuple(item for raw in page.items
                                    if (item := _safe_item(raw)) is not None)
-                page_fingerprint = hashlib.sha256(
-                    json.dumps(safe_items, ensure_ascii=False, sort_keys=True,
-                               separators=(",", ":")).encode()
-                ).hexdigest()
                 if not page.items:
                     if page.has_more:
                         raise RuntimeError("Curator pagination stalled on an empty page")
@@ -218,10 +244,11 @@ class MemoryCurator:
                 next_cursor = page.cursor or last_item_id
                 if next_cursor is None or next_cursor == cursor or next_cursor in seen_cursors:
                     raise RuntimeError("Curator pagination cursor did not advance")
-                if page_fingerprint in seen_pages:
+                page_identity = _source_page_identity(page)
+                if page_identity in seen_pages:
                     raise RuntimeError("Curator pagination repeated a page")
                 seen_cursors.add(next_cursor)
-                seen_pages.add(page_fingerprint)
+                seen_pages.add(page_identity)
                 pages += 1
                 key_material = f"{session_id}:{cursor or ''}:{next_cursor or ''}"
                 operation_key = hashlib.sha256(key_material.encode()).hexdigest()
@@ -232,13 +259,16 @@ class MemoryCurator:
                         break
                     continue
                 try:
-                    existing = _redact_structured(self.store.search_memories(limit=20))
-                    decision = await self.model.curate(session_id, safe_items, existing)
-                    mutations = self._validate_mutations(
-                        decision.get("mutations", []), session_id, safe_items)
-                    proposed_handover = decision.get("handover")
-                    if isinstance(proposed_handover, str) and proposed_handover.strip():
-                        handover = _redact_text(proposed_handover.strip())[:8000]
+                    mutations: list[dict[str, Any]] = []
+                    if safe_items:
+                        existing = tuple(_safe_existing_memory(memory) for memory in
+                                         self.store.search_memories(limit=20))
+                        decision = await self.model.curate(session_id, safe_items, existing)
+                        mutations = self._validate_mutations(
+                            decision.get("mutations", []), session_id, safe_items)
+                        proposed_handover = decision.get("handover")
+                        if isinstance(proposed_handover, str) and proposed_handover.strip():
+                            handover = _redact_text(proposed_handover.strip())[:8000]
                     self.store.apply_curator_batch(
                         "openai_agents", session_id, next_cursor, last_item_id,
                         operation_key, mutations, handover)

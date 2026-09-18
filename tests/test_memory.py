@@ -49,6 +49,17 @@ class EmptyModel:
         return {"mutations": []}
 
 
+class RecordingModel(EmptyModel):
+    def __init__(self):
+        super().__init__()
+        self.pages = []
+
+    async def curate(self, session_id, items, existing):
+        self.calls += 1
+        self.pages.append(tuple(items))
+        return {"mutations": []}
+
+
 class PageSource:
     session_id = "session-pages"
 
@@ -81,11 +92,10 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("secret", str(model.items))
             store.close()
 
-    async def test_credentials_are_redacted_before_curator_and_persistence(self):
+    async def test_unsupported_tool_fields_never_reach_curator_or_provenance(self):
         raw_secrets = (
-            "sk-authorization123", "ghp_bearertoken123", "sk-naturalkey123",
-            "hunter2", "structured-api-key", "structured-password",
-            "output-token", "cookie-value", "persisted-token", "handover-token",
+            "sk_live_UNSUPPORTED123456", "AKIA1234567890ABCDEF",
+            "structured-api-key", "structured-password", "output-token", "cookie-value",
         )
 
         class CredentialSource:
@@ -94,17 +104,25 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             async def session_items(self, cursor, limit):
                 if cursor is not None:
                     return SessionItemPage((), cursor, False)
-                return SessionItemPage(({
-                    "id": "credential-item", "type": "function_call_output",
-                    "created_at": "2026-02-03T04:05:06+00:00",
-                    "content": [{"type": "input_text", "text": (
-                        "Authorization: Bearer sk-authorization123\n"
-                        "Use Bearer ghp_bearertoken123. My API key is sk-naturalkey123 "
-                        "and password=hunter2") }],
-                    "arguments": {"api_key": "structured-api-key",
-                                  "nested": {"password": "structured-password"}},
-                    "output": {"token": "output-token", "cookie": "cookie-value"},
-                },), "credential-item", False)
+                return SessionItemPage((
+                    {
+                        "id": "call-item", "type": "function_call", "name": "clock",
+                        "call_id": "call-1", "arguments": {
+                            "api_key": "structured-api-key",
+                            "nested": {"password": "structured-password"},
+                            "unknown": raw_secrets[1],
+                        },
+                    },
+                    {
+                        "id": "credential-item", "type": "function_call_output",
+                        "created_at": "2026-02-03T04:05:06+00:00", "call_id": "call-1",
+                        "content": [{"type": "input_text", "text": raw_secrets[0]}],
+                        "output": {"token": "output-token", "cookie": "cookie-value",
+                                   "unknown": {"nested": raw_secrets[0]}},
+                        "error": raw_secrets[1],
+                        "unsupported": raw_secrets[0],
+                    },
+                ), "credential-item", False)
 
         class HostileModel:
             def __init__(self):
@@ -114,14 +132,14 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
                 self.items.extend(items)
                 return {"mutations": [{
                     "operation": "create", "kind": "fact",
-                    "content": "Keep token=persisted-token",
-                    "rationale": "Authorization: Bearer persisted-token",
+                    "content": f"Keep {raw_secrets[0]}",
+                    "rationale": f"Authentication: {raw_secrets[1]}",
                     "provenance": [{
                         "item_id": "credential-item", "session_id": "invented-session",
                         "source_type": "invented-type", "timestamp": "invented-time",
                         "excerpt": "invented excerpt", "content_hash": "invented-hash",
                     }],
-                }], "handover": "Bearer handover-token"}
+                }], "handover": f"Bearer {raw_secrets[4]}"}
 
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
@@ -129,9 +147,14 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             handover = await MemoryCurator(store, CredentialSource(), model).catch_up()
 
             model_input = json.dumps(model.items)
-            for secret in raw_secrets[:8]:
+            for secret in raw_secrets:
                 self.assertNotIn(secret, model_input)
-            self.assertGreaterEqual(model_input.count("[REDACTED]"), 7)
+            self.assertEqual([
+                {"type": "function_call", "id": "call-item", "call_id": "call-1",
+                 "name": "clock"},
+                {"type": "function_call_output", "id": "credential-item",
+                 "created_at": "2026-02-03T04:05:06+00:00", "call_id": "call-1"},
+            ], model.items)
             memory = store.memory(store.search_memories()[0]["id"])
             persisted = json.dumps(memory)
             for secret in raw_secrets:
@@ -144,11 +167,51 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("function_call_output", evidence["source_type"])
             self.assertEqual("2026-02-03T04:05:06+00:00", evidence["source_timestamp"])
             self.assertNotIn("invented", json.dumps(evidence))
-            canonical = json.dumps(model.items[0], ensure_ascii=False, sort_keys=True,
+            canonical = json.dumps(model.items[1], ensure_ascii=False, sort_keys=True,
                                    separators=(",", ":"))
             self.assertEqual(hashlib.sha256(canonical.encode()).hexdigest(),
                              evidence["content_hash"])
             self.assertEqual(canonical[:500], evidence["excerpt"])
+            dump = "\n".join(store.connection.iterdump())
+            for secret in raw_secrets:
+                self.assertNotIn(secret, dump)
+            store.close()
+
+    async def test_allowed_text_is_preserved_while_common_credentials_are_redacted(self):
+        secrets = (
+            "sk_live_1234567890abcdef", "rk_test_abcdef1234567890",
+            "AKIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7EXAMPLE",
+            "github_pat_1234567890abcdef", "glpat-1234567890abcdef",
+            "npm_1234567890abcdef", "hf_1234567890abcdef",
+            "AIzaSyD1234567890abcdefghijklmnop",
+        )
+
+        class TextSource:
+            session_id = "text-session"
+
+            async def session_items(self, cursor, limit):
+                text = ("Owner prefers jasmine tea. " + " ".join(secrets) +
+                        "\nAuthentication: opaque-auth-value"
+                        "\nBearer opaque-bearer-value"
+                        "\nAPI token=opaque-api-token")
+                return SessionItemPage(({
+                    "id": "message-1", "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                    "unsupported": {"safe_looking": "must not cross"},
+                },), "message-1", False)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            model = RecordingModel()
+            await MemoryCurator(store, TextSource(), model).catch_up()
+
+            model_input = json.dumps(model.pages)
+            self.assertIn("Owner prefers jasmine tea.", model_input)
+            self.assertNotIn("must not cross", model_input)
+            for secret in (*secrets, "opaque-auth-value", "opaque-bearer-value",
+                           "opaque-api-token"):
+                self.assertNotIn(secret, model_input)
+            self.assertGreaterEqual(model_input.count("[REDACTED]"), len(secrets) + 3)
             store.close()
 
     async def test_repeated_cursor_fails_without_looping(self):
@@ -185,6 +248,45 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "repeated a page"):
                 await MemoryCurator(store, source, EmptyModel(), max_batches=10).catch_up()
             self.assertEqual(2, source.calls)
+            store.close()
+
+    async def test_distinct_filtered_pages_advance_checkpoint_without_curator_input(self):
+        pages = [
+            SessionItemPage(({"id": "reasoning-1", "type": "reasoning",
+                              "content": "first private payload"},), "one", True),
+            SessionItemPage(({"id": "reasoning-2", "type": "encrypted_reasoning",
+                              "encrypted_content": "second private payload"},), "two", False),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source, model = PageSource(pages), RecordingModel()
+            await MemoryCurator(store, source, model, max_batches=10).catch_up()
+
+            self.assertEqual(2, source.calls)
+            self.assertEqual(0, model.calls)
+            checkpoint = store.curator_checkpoint("openai_agents", source.session_id)
+            self.assertEqual("two", checkpoint["cursor"])
+            self.assertEqual("reasoning-2", checkpoint["last_item_id"])
+            store.close()
+
+    async def test_filtered_pages_are_followed_by_visible_curator_input(self):
+        pages = [
+            SessionItemPage(({"id": "reasoning-1", "type": "reasoning",
+                              "content": "private payload"},), "one", True),
+            SessionItemPage(({"id": "message-2", "type": "message", "role": "assistant",
+                              "content": [{"type": "output_text", "text": "Useful summary"}]},),
+                            "two", False),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source, model = PageSource(pages), RecordingModel()
+            await MemoryCurator(store, source, model, max_batches=10).catch_up()
+
+            self.assertEqual(1, model.calls)
+            self.assertIn("Useful summary", json.dumps(model.pages))
+            self.assertNotIn("private payload", json.dumps(model.pages))
+            self.assertEqual("two", store.curator_checkpoint(
+                "openai_agents", source.session_id)["cursor"])
             store.close()
 
     async def test_final_catch_up_is_bounded_and_reports_incomplete(self):
