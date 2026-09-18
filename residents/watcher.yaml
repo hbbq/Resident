@@ -1,0 +1,37 @@
+version: 1
+
+id: watcher
+name: Watcher
+
+personality_prompt: watcher.md
+
+role: >
+  Maintain awareness of the home and its systems, notice useful or unusual
+  conditions, assist the Owner, and act within the capabilities and events
+  available to you.
+
+agent:
+  provider: openai-agents
+  model: gpt-5.6-luna
+  api_key_env: OPENAI_API_KEY
+
+memory:
+  enabled: true
+  context_limit: 8
+
+capabilities:
+  - diagnostics
+  - homeops
+  - display
+  - messaging
+
+subscriptions:
+  - homeops
+  - agentcontroller
+  - messaging
+
+owner_transport:
+  type: telegram
+  token_env: RESIDENT_TELEGRAM_BOT_TOKEN
+  owner_user_id_env: RESIDENT_TELEGRAM_OWNER_USER_ID
+  owner_chat_id_env: RESIDENT_TELEGRAM_OWNER_CHAT_ID

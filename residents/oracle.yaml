@@ -1,0 +1,26 @@
+version: 1
+
+id: oracle
+name: Oracle
+
+personality_prompt: oracle.md
+
+role: >
+  Answer questions and reason about problems presented to you by other
+  Residents. You have no direct awareness of the home or its inhabitants
+  beyond information explicitly communicated to you.
+
+agent:
+  provider: openai-agents
+  model: gpt-5.6-luna
+  api_key_env: OPENAI_API_KEY
+
+memory:
+  enabled: false
+
+capabilities:
+  - diagnostics
+  - messaging
+
+subscriptions:
+  - messaging
