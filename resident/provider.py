@@ -7,9 +7,10 @@ import urllib.error
 import urllib.request
 from concurrent.futures import Future
 from contextvars import ContextVar
-from typing import Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
+from .memory import SessionItemPage
 
 
 class ModelProvider(Protocol):
@@ -119,7 +120,8 @@ class OpenAIAgentsProvider:
 
     def __init__(self, api_key: str, model: str, base_url: str = "https://api.openai.com/v1", *,
                  agent_id: str | None = None, poll_seconds: float = 0.25,
-                 timeout_seconds: float = 120.0):
+                 timeout_seconds: float = 120.0, reasoning_effort: str | None = None,
+                 service_tier: str | None = None):
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required for the OpenAI provider")
         self.api_key, self.model, self.base_url = api_key, model, base_url.rstrip("/")
@@ -127,11 +129,13 @@ class OpenAIAgentsProvider:
         # The ID nested in an inline-created session describes that session's
         # resolved agent, but is not valid as agent_id on a later session create.
         self.agent_id = agent_id
+        self.reasoning_effort, self.service_tier = reasoning_effort, service_tier
         self.poll_seconds = poll_seconds
         self.timeout_seconds = timeout_seconds
         self._session_id: str | None = None
         self._last_turn_id: str | None = None
         self._tool_fingerprint: str | None = None
+        self._protocol_descriptor: dict[str, Any] | None = None
         self._active_turn_id: str | None = None
         self._submitted_call_ids: dict[str, set[str]] = {}
         self._pending_wakes: dict[str, tuple[str, str, str]] = {}
@@ -140,9 +144,18 @@ class OpenAIAgentsProvider:
         self._binding_writer: ContextVar[
             Callable[[str, str | None, str | None], None] | None
         ] = ContextVar("agents_binding_writer", default=None)
+        self._lifecycle_writer: ContextVar[Callable[[Callable, tuple], Any] | None] = (
+            ContextVar("agents_lifecycle_writer", default=None))
         self._pending_binding: tuple[str, str | None, str | None] | None = None
         self._begin_action: Callable[..., dict] | None = None
         self._complete_action: Callable[..., None] | None = None
+        self._load_protocol: Callable[[str], dict | None] = lambda _session_id: None
+        self._save_protocol: Callable[[str, dict], None] = lambda *_: None
+        self._begin_rollover: Callable[[str | None, str, str], str] = (
+            lambda _old, _reason, _requested_by: "")
+        self._complete_rollover: Callable[[str, str, str], None] = lambda *_: None
+        self._fail_rollover: Callable[[str, str], None] = lambda *_: None
+        self._requested_rollover_reason: str | None = None
 
     def bind_session_store(self, load: Callable[[], dict | None],
                            save: Callable[[str, str | None, str | None], None]) -> None:
@@ -161,6 +174,46 @@ class OpenAIAgentsProvider:
 
     def bind_action_store(self, begin: Callable[..., dict], complete: Callable[..., None]) -> None:
         self._begin_action, self._complete_action = begin, complete
+
+    def bind_lifecycle_store(self, load_protocol: Callable[[str], dict | None],
+                             save_protocol: Callable[[str, dict], None],
+                             begin_rollover: Callable[[str | None, str, str], str],
+                             complete_rollover: Callable[[str, str, str], None],
+                             fail_rollover: Callable[[str, str], None]) -> None:
+        self._load_protocol, self._save_protocol = load_protocol, save_protocol
+        self._begin_rollover = begin_rollover
+        self._complete_rollover, self._fail_rollover = complete_rollover, fail_rollover
+        if self._session_id is not None:
+            self._protocol_descriptor = load_protocol(self._session_id)
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    @property
+    def session_protocol_known(self) -> bool:
+        return self._session_id is None or self._protocol_descriptor is not None
+
+    def request_rollover(self, reason: str = "explicit_new_chapter") -> None:
+        if not reason.strip():
+            raise ValueError("Session rollover reason must be nonempty")
+        self._requested_rollover_reason = reason.strip()
+
+    async def session_items(self, cursor: str | None, limit: int = 50) -> SessionItemPage:
+        if self._session_id is None:
+            return SessionItemPage((), cursor, False)
+        return await asyncio.to_thread(self._session_items_sync, self._session_id, cursor, limit)
+
+    def _session_items_sync(self, session_id: str, cursor: str | None,
+                            limit: int) -> SessionItemPage:
+        from urllib.parse import quote
+        path = f"/agents/sessions/{session_id}/items?order=asc&limit={max(1, min(limit, 100))}"
+        if cursor:
+            path += f"&after={quote(cursor, safe='')}"
+        page = self._request("GET", path)
+        data = tuple(item for item in (page.get("data") or []) if isinstance(item, dict))
+        next_cursor = page.get("last_id") or (data[-1].get("id") if data else cursor)
+        return SessionItemPage(data, next_cursor, bool(page.get("has_more")))
 
     def prepare_tool_call(self, call: ToolCall) -> dict | None:
         if self._begin_action is None or self._session_id is None or self._active_turn_id is None:
@@ -205,10 +258,24 @@ class OpenAIAgentsProvider:
         # asyncio.to_thread propagates this context into only this response's
         # worker, avoiding a process-wide or connection-wide thread escape.
         token = self._binding_writer.set(save_on_event_loop)
+        def lifecycle_on_event_loop(function: Callable, arguments: tuple) -> Any:
+            completed: Future[Any] = Future()
+
+            def invoke() -> None:
+                try:
+                    completed.set_result(function(*arguments))
+                except BaseException as exc:
+                    completed.set_exception(exc)
+
+            loop.call_soon_threadsafe(invoke)
+            return completed.result()
+
+        lifecycle_token = self._lifecycle_writer.set(lifecycle_on_event_loop)
         try:
             return await asyncio.to_thread(
                 self._respond_sync, context, tools, results, previous_response_id)
         finally:
+            self._lifecycle_writer.reset(lifecycle_token)
             self._binding_writer.reset(token)
 
     def discard_continuation(self, continuation_id: str) -> None:
@@ -318,6 +385,7 @@ class OpenAIAgentsProvider:
                         allow_create: bool = True) -> tuple[dict, bool]:
         self._flush_pending_binding()
         agent = self._agent_config(tools)
+        desired_protocol = self._agent_protocol(agent)
         fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
         if self._session_id is not None:
             try:
@@ -325,18 +393,36 @@ class OpenAIAgentsProvider:
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
-                self._session_id = None
-                self._last_turn_id = None
+                return self._intentional_rollover(
+                    "remote_session_missing", agent, desired_protocol,
+                    initial_input, allow_create, finalization_status="unavailable")
             else:
                 remote_agent_id = (session.get("agent") or {}).get("id")
                 if (self.agent_id is not None and remote_agent_id is not None
                         and remote_agent_id != self.agent_id):
                     # A current operator override must not inherit a session
                     # attached to a different saved Agent resource.
-                    self._session_id = None
-                    self._last_turn_id = None
+                    return self._intentional_rollover(
+                        "saved_agent_id_changed", agent, desired_protocol,
+                        initial_input, allow_create)
                 else:
                     remote_agent = session.get("agent")
+                    applied_protocol = self._protocol_descriptor
+                    if applied_protocol is None and isinstance(remote_agent, dict):
+                        applied_protocol = self._agent_protocol(remote_agent)
+                    if applied_protocol is None and self._tool_fingerprint is not None:
+                        try:
+                            applied_protocol = self._agent_protocol(
+                                json.loads(self._tool_fingerprint))
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                    compatibility = self._protocol_compatibility(applied_protocol, desired_protocol)
+                    if self._requested_rollover_reason and session.get("status") == "idle":
+                        reason = self._requested_rollover_reason
+                        result = self._intentional_rollover(
+                            reason, agent, desired_protocol, initial_input, allow_create)
+                        self._requested_rollover_reason = None
+                        return result
                     if self._tool_fingerprint is None:
                         if (not isinstance(remote_agent, dict)
                                 or not {"model", "instructions", "tools"} <= remote_agent.keys()
@@ -346,17 +432,28 @@ class OpenAIAgentsProvider:
                             # returned config. A partial legacy response cannot
                             # prove a mismatch, so avoid replacing it eagerly.
                             self._tool_fingerprint = fingerprint
-                    if self._tool_fingerprint != fingerprint and session.get("status") == "idle":
-                        # Session updates only accept model, reasoning, and
-                        # service-tier overrides. Instructions and tools are part
-                        # of session creation, so replace an idle session when the
-                        # Resident configuration actually changes.
-                        self._session_id = None
-                        self._last_turn_id = None
-                    else:
-                        # If the session is active, leave the mismatch pending and
-                        # retry once it becomes idle.
+                    if compatibility == "rollover" and session.get("status") == "idle":
+                        return self._intentional_rollover(
+                            "function_or_immutable_protocol_changed", agent, desired_protocol,
+                            initial_input, allow_create)
+                    if compatibility == "rollover":
+                        # Finish/recover the active turn under its existing contract;
+                        # the next idle reconciliation performs the recorded rollover.
                         return session, False
+                    if compatibility == "compatible_revocation":
+                        return session, False
+                    mutable_patch = self._mutable_patch(remote_agent)
+                    if mutable_patch:
+                        if session.get("status") != "idle":
+                            return session, False
+                        patched = self._request(
+                            "PATCH", f"/agents/sessions/{self._session_id}",
+                            {"agent": mutable_patch})
+                        session = {**session, **patched}
+                    self._protocol_descriptor = desired_protocol
+                    self._lifecycle_call(self._save_protocol, self._session_id, desired_protocol)
+                    self._tool_fingerprint = fingerprint
+                    return session, False
         if not allow_create:
             raise RuntimeError(
                 "OpenAI Agents session disappeared while continuing a turn")
@@ -375,8 +472,42 @@ class OpenAIAgentsProvider:
         self._session_id = session["id"]
         self._last_turn_id = None
         self._tool_fingerprint = fingerprint
+        self._protocol_descriptor = desired_protocol
         self._persist_binding(self._session_id, self.agent_id, None)
+        self._lifecycle_call(self._save_protocol, self._session_id, desired_protocol)
         return session, True
+
+    def _intentional_rollover(self, reason: str, agent: dict,
+                              descriptor: dict[str, Any], initial_input: str | None,
+                              allow_create: bool, *,
+                              finalization_status: str = "completed") -> tuple[dict, bool]:
+        if not allow_create:
+            raise RuntimeError("OpenAI Agents session requires rollover while continuing a turn")
+        if initial_input is None:
+            raise RuntimeError("Intentional session rollover requires bootstrap input")
+        old_session_id = self._session_id
+        rollover_id = self._lifecycle_call(
+            self._begin_rollover, old_session_id, reason, "runtime")
+        body: dict = {
+            "environment": {"type": "none"}, "agent": agent, "input": initial_input,
+            "metadata": {"managed_by": "resident", "rollover_reason": reason},
+        }
+        if self.agent_id:
+            body["agent_id"] = self.agent_id
+        try:
+            session = self._request("POST", "/agents/sessions", body)
+            new_session_id = session["id"]
+            self._session_id, self._last_turn_id = new_session_id, None
+            self._protocol_descriptor = descriptor
+            self._tool_fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
+            self._persist_binding(new_session_id, self.agent_id, None)
+            self._lifecycle_call(self._save_protocol, new_session_id, descriptor)
+            self._lifecycle_call(
+                self._complete_rollover, rollover_id, new_session_id, finalization_status)
+            return session, True
+        except Exception:
+            self._lifecycle_call(self._fail_rollover, rollover_id, "unavailable")
+            raise
 
     def _persist_binding(self, session_id: str, agent_id: str | None,
                          last_turn_id: str | None) -> None:
@@ -392,7 +523,7 @@ class OpenAIAgentsProvider:
             self._persist_binding(*self._pending_binding)
 
     def _agent_config(self, tools: Sequence[ToolSpec]) -> dict:
-        return {
+        agent = {
             "model": self.model,
             "instructions": RESIDENT_AGENT_INSTRUCTIONS,
             "tools": [{
@@ -400,6 +531,65 @@ class OpenAIAgentsProvider:
                 "description": tool.description, "parameters": tool.input_schema,
             } for tool in tools],
         }
+        if self.reasoning_effort:
+            agent["reasoning"] = {"effort": self.reasoning_effort}
+        if self.service_tier:
+            agent["service_tier"] = self.service_tier
+        return agent
+
+    def _mutable_patch(self, remote_agent: object) -> dict[str, Any]:
+        if not isinstance(remote_agent, dict):
+            return {}
+        desired = self._agent_config(())
+        patch: dict[str, Any] = {}
+        for key in ("model", "reasoning", "service_tier"):
+            # A partial legacy session response cannot prove mutable drift.
+            if key in desired and key in remote_agent and remote_agent.get(key) != desired[key]:
+                patch[key] = desired[key]
+        return patch
+
+    def protocol_change_requires_rollover(self, tools: Sequence[ToolSpec]) -> bool:
+        if self._session_id is None:
+            return False
+        if self._requested_rollover_reason:
+            return True
+        applied = self._protocol_descriptor
+        desired = self._agent_protocol(self._agent_config(tools))
+        return self._protocol_compatibility(applied, desired) == "rollover"
+
+    def _lifecycle_call(self, function: Callable, *arguments: Any) -> Any:
+        writer = self._lifecycle_writer.get()
+        return function(*arguments) if writer is None else writer(function, arguments)
+
+    def _agent_protocol(self, agent: dict) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "instructions": agent.get("instructions"),
+            "tools": [{key: tool.get(key) for key in
+                       ("type", "name", "description", "parameters")}
+                      for tool in agent.get("tools", []) if isinstance(tool, dict)],
+            "saved_agent_id": self.agent_id,
+            "environment": {"type": "none"},
+            "security_policy_revision": 1,
+        }
+
+    @staticmethod
+    def _protocol_compatibility(applied: dict[str, Any] | None,
+                                desired: dict[str, Any]) -> str:
+        if applied is None:
+            return "unchanged"
+        if any(applied.get(key) != desired.get(key) for key in (
+                "version", "instructions", "saved_agent_id", "environment",
+                "security_policy_revision")):
+            return "rollover"
+        old_tools = {tool.get("name"): tool for tool in applied.get("tools", [])}
+        new_tools = {tool.get("name"): tool for tool in desired.get("tools", [])}
+        # A local revocation can safely preserve the old advertised contract:
+        # ToolRegistry returns a deterministic unavailable response if it is called.
+        if set(new_tools) < set(old_tools) and all(
+                old_tools[name] == tool for name, tool in new_tools.items()):
+            return "compatible_revocation"
+        return "unchanged" if old_tools == new_tools else "rollover"
 
     @staticmethod
     def _agent_config_matches(remote: object, expected: dict) -> bool:
@@ -408,11 +598,12 @@ class OpenAIAgentsProvider:
         remote_tools = [{key: tool.get(key) for key in (
             "type", "name", "description", "parameters")}
             for tool in remote.get("tools", []) if isinstance(tool, dict)]
-        return {
+        comparable = {
             "model": remote.get("model"),
             "instructions": remote.get("instructions"),
             "tools": remote_tools,
-        } == expected
+        }
+        return comparable == {key: expected.get(key) for key in comparable}
 
     def _wait_for_turn(self, session_id: str, expected_turn_id: str | None) -> ModelTurn:
         if not expected_turn_id:

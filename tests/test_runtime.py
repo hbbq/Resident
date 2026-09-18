@@ -542,7 +542,7 @@ class StoreTests(unittest.TestCase):
             store = Store(path)
             action = store.begin_agent_tool_action(
                 "openai_agents", "session", "turn", "call", "clock", {})
-            self.assertEqual(12, store.connection.execute(
+            self.assertEqual(13, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertFalse(action["attachments_ephemeral"])
             self.assertEqual({"ok": True}, action["output"])
@@ -568,7 +568,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(12, store.connection.execute(
+            self.assertEqual(13, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
@@ -1578,7 +1578,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             store = Store(path)
 
-            self.assertEqual(12, store.connection.execute(
+            self.assertEqual(13, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertIsNone(store.connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone())

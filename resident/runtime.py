@@ -13,6 +13,7 @@ from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider
+from .memory import MemoryCurator
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, ToolRegistry
@@ -62,6 +63,22 @@ class ResidentRuntime:
                 self.store.begin_agent_tool_action,
                 self.store.complete_agent_tool_action,
             )
+        bind_lifecycle_store = getattr(provider, "bind_lifecycle_store", None)
+        if bind_lifecycle_store is not None:
+            bind_lifecycle_store(
+                lambda session_id: self.store.session_protocol("openai_agents", session_id),
+                lambda session_id, descriptor: self.store.save_session_protocol(
+                    "openai_agents", session_id, descriptor),
+                lambda old, reason, requested_by: self.store.begin_session_rollover(
+                    "openai_agents", old, reason, requested_by),
+                self.store.complete_session_rollover,
+                self.store.fail_session_rollover,
+            )
+            self.store.recover_session_rollovers("openai_agents")
+        if config.new_chapter:
+            request_rollover = getattr(provider, "request_rollover", None)
+            if request_rollover is not None:
+                request_rollover("explicit_new_chapter")
         self._event_queue: asyncio.Queue[WakeEvent | None] | None = None
         self._capability_event_states: dict[
             str, tuple[tuple[Capability, ...], dict[str, dict]]
@@ -87,6 +104,10 @@ class ResidentRuntime:
             role=config.role)
         self._active_run_id: str | None = None
         self._active_event: WakeEvent | None = None
+        self.curator: MemoryCurator | None = None
+
+    def bind_curator(self, curator: MemoryCurator) -> None:
+        self.curator = curator
 
     @property
     def capabilities(self) -> tuple[Capability, ...]:
@@ -148,6 +169,11 @@ class ResidentRuntime:
             tuple(capability for capability in self._capabilities if capability.name not in removed))
 
     async def enqueue_startup_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
+        if self.curator is not None:
+            try:
+                await self.curator.catch_up()
+            except Exception as exc:
+                self._emit("curator.failed", {"phase": "startup", "error_type": type(exc).__name__})
         for message in self.store.pending_owner_messages():
             await queue.put(self._owner_message_wake(
                 message["id"], message["content"], message["created_at"]))
@@ -256,10 +282,40 @@ class ResidentRuntime:
                 self.store, capabilities, self._send_owner_message, self._emit,
                 current_run_id=run_id,
                 owner_communication_enabled=self.config.owner_communication_enabled)
+            protocol_rollover = getattr(self.provider, "protocol_change_requires_rollover", None)
+            new_session = (getattr(self.provider, "session_id", None) is None or
+                           not getattr(self.provider, "session_protocol_known", True))
+            handover = None
+            handover_id = None
+            needs_rollover = protocol_rollover is not None and protocol_rollover(registry.specs)
+            unknown_restored_protocol = (
+                getattr(self.provider, "session_id", None) is not None and
+                not getattr(self.provider, "session_protocol_known", True))
+            if needs_rollover or unknown_restored_protocol:
+                new_session = True
+                old_session_id = getattr(self.provider, "session_id", None)
+                if self.curator is not None:
+                    handover = await self.curator.catch_up(final=True)
+                if old_session_id and handover and needs_rollover:
+                    handover_id = self.store.create_handover(
+                        old_session_id, handover,
+                        (datetime.now(UTC) + timedelta(hours=24)).isoformat())
+            if new_session:
+                context_document["new_session_bootstrap"] = {
+                    "durable_memory_awareness": self.store.memory_awareness(limit=8),
+                    "handover": handover,
+                    "note": "Long-term memory is selectively available through memory tools.",
+                }
+                context = json.dumps(context_document, ensure_ascii=False, indent=2)
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
                 turn = await self.provider.respond(context, registry.specs, results, continuation_id)
+                if handover_id is not None:
+                    replacement_id = getattr(self.provider, "session_id", None)
+                    if replacement_id:
+                        self.store.consume_handover(handover_id, replacement_id)
+                    handover_id = None
                 self._emit("model.responded", {
                     "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
@@ -319,6 +375,12 @@ class ResidentRuntime:
                 self._capability_event_states.pop(event.id, None)
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
+            if self.curator is not None:
+                try:
+                    await self.curator.catch_up()
+                except Exception as exc:
+                    self._emit("curator.failed", {
+                        "phase": "incremental", "error_type": type(exc).__name__})
             return run_id
         except asyncio.CancelledError as exc:
             self._discard_continuation(continuation_id)

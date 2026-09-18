@@ -14,6 +14,7 @@ from .host import InstancePolicy, RuntimeHost, messaging_capability
 from .instances import (ResidentDefinition, load_resident_catalog, migrate_legacy_state,
                         resolve_environment)
 from .mailbox import Mailbox
+from .memory import MemoryCurator, OpenAICuratorModel
 from .provider import OpenAIAgentsProvider, OpenAIResponsesProvider
 from .runtime import ResidentRuntime
 from .telegram import TelegramTransport
@@ -54,7 +55,10 @@ def _provider(definition: ResidentDefinition):
     agent_id = (resolve_environment(definition.agent.agent_id_env, required=False)
                 if definition.agent.agent_id_env else None)
     if definition.agent.provider == "openai-agents":
-        return OpenAIAgentsProvider(api_key, definition.agent.model, base_url, agent_id=agent_id)
+        return OpenAIAgentsProvider(
+            api_key, definition.agent.model, base_url, agent_id=agent_id,
+            reasoning_effort=definition.agent.reasoning_effort,
+            service_tier=definition.agent.service_tier)
     return OpenAIResponsesProvider(api_key, definition.agent.model, base_url)
 
 
@@ -92,6 +96,16 @@ def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
         producers.append(connector)
         capabilities.extend(connector.capabilities)
     return producers, capabilities
+
+
+def _bind_curator(runtime: ResidentRuntime, config: Config) -> None:
+    if not config.curator_model or not isinstance(runtime.provider, OpenAIAgentsProvider):
+        return
+    runtime.bind_curator(MemoryCurator(
+        runtime.store, runtime.provider,
+        OpenAICuratorModel(config.curator_api_key, config.curator_model,
+                           config.curator_base_url),
+        batch_size=config.curator_batch_size, max_batches=config.curator_max_batches))
 
 
 def _select_capabilities(grants: tuple[str, ...], available: list[Capability]) -> list[Capability]:
@@ -134,6 +148,8 @@ def build_host(config: Config) -> RuntimeHost:
                 owner_communication_enabled=(
                     definition.owner_transport is not None or definition.id == catalog.default_id),
                 provider=definition.agent.provider, model=definition.agent.model,
+                reasoning_effort=definition.agent.reasoning_effort,
+                service_tier=definition.agent.service_tier,
                 openai_api_key=None, openai_agent_id=None, residents_dir=None)
             transport = None
             if definition.owner_transport:
@@ -161,6 +177,7 @@ def build_host(config: Config) -> RuntimeHost:
                 owner_transport=transport,
                 diagnostic_output=lambda message, item=definition.id:
                     diagnostics.runtime(f"{item}: {message}"))
+            _bind_curator(runtime, instance_config)
             runtimes[definition.id] = runtime
             policies[definition.id] = InstancePolicy(frozenset(definition.subscriptions))
             if transport:
@@ -185,7 +202,9 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
     if not config.openai_api_key:
         raise ValueError("OPENAI_API_KEY must be set for the OpenAI provider")
     provider = (OpenAIAgentsProvider(config.openai_api_key, config.model, config.openai_base_url,
-                                     agent_id=config.openai_agent_id)
+                                     agent_id=config.openai_agent_id,
+                                     reasoning_effort=config.reasoning_effort,
+                                     service_tier=config.service_tier)
                 if config.provider == "openai-agents" else
                 OpenAIResponsesProvider(config.openai_api_key, config.model, config.openai_base_url))
     diagnostics = TerminalDiagnostics(config.verbose)
@@ -201,6 +220,7 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
     runtime = ResidentRuntime(
         config, provider, capabilities=capabilities, event_producers=producers,
         owner_transport=telegram, diagnostic_output=diagnostics.runtime)
+    _bind_curator(runtime, config)
     for producer in producers:
         bind = getattr(producer, "bind_checkpoint", None)
         if bind is not None:

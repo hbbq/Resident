@@ -12,7 +12,8 @@ from .store import Store
 
 CORE_TOOL_NAMES = frozenset({
     "create_intention", "update_intention", "send_owner_message", "schedule_wakeup",
-    "search_communication", "list_wake_history",
+    "search_communication", "list_wake_history", "search_long_term_memory",
+    "get_long_term_memory", "set_owner_guidance", "remove_owner_guidance",
 })
 
 
@@ -63,6 +64,23 @@ class ToolRegistry:
                         limit={"type": "integer", "minimum": 1, "maximum": 20},
                         offset={"type": "integer", "minimum": 0, "maximum": 1000})),
                 self._list_wake_history),
+            "search_long_term_memory": Tool(ToolSpec("search_long_term_memory",
+                "Search curated durable memories when older knowledge is relevant. Returns bounded active records only.",
+                _schema(query={"type": "string"},
+                        limit={"type": "integer", "minimum": 1, "maximum": 20},
+                        offset={"type": "integer", "minimum": 0, "maximum": 1000})),
+                self._search_long_term_memory),
+            "get_long_term_memory": Tool(ToolSpec("get_long_term_memory",
+                "Read one curated memory and its audit provenance by id. This is read-only.",
+                _schema(("id",), id={"type": "string"})), self._get_long_term_memory),
+            "set_owner_guidance": Tool(ToolSpec("set_owner_guidance",
+                "Persist an instruction only when the Owner explicitly intends it to remain in force. "
+                "Use the existing id to revise prior guidance.",
+                _schema(("content",), content={"type": "string"},
+                        id={"type": ["string", "null"]})), self._set_owner_guidance),
+            "remove_owner_guidance": Tool(ToolSpec("remove_owner_guidance",
+                "Remove durable Owner guidance when the Owner explicitly revokes it.",
+                _schema(("id",), id={"type": "string"})), self._remove_owner_guidance),
         }
         if not owner_communication_enabled:
             self.tools.pop("send_owner_message")
@@ -163,4 +181,18 @@ class ToolRegistry:
             exclude_run_id=self.current_run_id,
         )
         return {"wake_runs": runs}
+
+    def _search_long_term_memory(self, a: dict[str, Any]) -> dict[str, Any]:
+        return {"memories": self.store.search_memories(
+            a.get("query", ""), limit=a.get("limit", 10), offset=a.get("offset", 0))}
+
+    def _get_long_term_memory(self, a: dict[str, Any]) -> dict[str, Any]:
+        return {"memory": self.store.memory(a["id"])}
+
+    def _set_owner_guidance(self, a: dict[str, Any]) -> dict[str, Any]:
+        guidance_id = self.store.set_owner_guidance(a["content"], guidance_id=a.get("id"))
+        return {"guidance_id": guidance_id}
+
+    def _remove_owner_guidance(self, a: dict[str, Any]) -> dict[str, Any]:
+        return {"removed": self.store.remove_owner_guidance(a["id"])}
 
