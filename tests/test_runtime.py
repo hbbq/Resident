@@ -13,7 +13,8 @@ from resident.config import Config
 from resident.capabilities import Capability
 from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.domain import ImageAttachment, ToolResult, ToolSpec
-from resident.provider import OpenAIAgentsProvider, OpenAIResponsesProvider
+from resident.provider import (OpenAIAgentsProvider, OpenAIResponsesProvider,
+                               RemoteSessionUnavailable)
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
 
@@ -841,11 +842,9 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 capabilities=[], owner_output=lambda _: None,
                 diagnostic_output=lambda _: None)
 
-            second = await restarted_provider.respond(json.dumps({
-                "wake_event": {"id": "wake-2", "source": "connector", "payload": {}},
-            }), [], [])
+            await restarted_runtime.process(WakeEvent(
+                "wake-2", "connector", "changed", utc_now(), {}))
 
-            self.assertEqual("turn-2", second.response_id)
             self.assertEqual(2, len(creates))
             self.assertTrue(all("agent_id" not in body for body in creates))
             binding = reopened_store.agent_session_binding("openai_agents")
@@ -898,6 +897,86 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("GET", "/agents/sessions/session-1", None)], requests)
         self.assertIsNotNone(provider._tool_fingerprint)
 
+    def test_agents_mutable_settings_can_be_cleared(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._session_id = "session-1"
+        remote_agent = provider._agent_config([])
+        remote_agent.update(
+            reasoning={"effort": "high"}, service_tier="priority")
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path, body))
+            if method == "GET":
+                return {"id": "session-1", "status": "idle", "agent": remote_agent}
+            if method == "PATCH":
+                return {"id": "session-1", "status": "idle"}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+
+        session, created = provider._ensure_session([], initial_input="wake")
+
+        self.assertFalse(created)
+        self.assertEqual("session-1", session["id"])
+        self.assertEqual({"agent": {"reasoning": None, "service_tier": None}},
+                         requests[-1][2])
+
+    async def test_remote_404_replacement_receives_degraded_new_session_bootstrap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
+            store.save_agent_session_binding(
+                "openai_agents", "session-missing", None, "turn-old")
+            descriptor = provider._agent_protocol(provider._agent_config([]))
+            store.save_session_protocol("openai_agents", "session-missing", descriptor)
+            store.set_owner_guidance("Always preserve the garden schedule.")
+            store.create_intention("Finish checking the greenhouse")
+            store.apply_curator_batch(
+                "openai_agents", "session-missing", "item-1", "item-1", "memory-1",
+                [{"memory_id": "memory-1", "operation": "create", "kind": "place",
+                  "content": "The greenhouse has a north bed."}])
+            creates = []
+
+            def fake_request(method, path, body=None, **_):
+                if method == "GET" and path == "/agents/sessions/session-missing":
+                    raise RuntimeError("OpenAI Agents API returned HTTP 404: gone")
+                if method == "POST" and path == "/agents/sessions":
+                    creates.append(body)
+                    return {"id": "session-replacement", "status": "idle"}
+                raise AssertionError((method, path, body))
+
+            provider._request = fake_request
+            provider._wait_for_submitted_wake = lambda *_: ModelTurn(
+                "turn-new", "replacement ready")
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            resident_id = runtime.resident.id
+
+            await runtime.process(WakeEvent(
+                "wake-404", "scheduler", "due", utc_now(), {}))
+
+            self.assertEqual(1, len(creates))
+            created_context = json.loads(creates[0]["input"])
+            bootstrap = created_context["new_session_bootstrap"]
+            self.assertEqual("place", bootstrap["durable_memory_awareness"][0]["kind"])
+            self.assertIn("previous remote session was unavailable", bootstrap["handover"])
+            self.assertEqual(resident_id, created_context["resident"]["stable_id"])
+            self.assertEqual(
+                "Always preserve the garden schedule.",
+                created_context["standing_owner_guidance"][0]["content"])
+            self.assertEqual(
+                "Finish checking the greenhouse",
+                created_context["pending_intentions"][0]["content"])
+            rollover = store.connection.execute(
+                "SELECT old_session_id,new_session_id,reason,finalization_status,status "
+                "FROM session_rollovers").fetchone()
+            self.assertEqual(
+                ("session-missing", "session-replacement", "remote_session_missing",
+                 "unavailable", "completed"), tuple(rollover))
+            runtime.close()
+
     def test_agents_missing_session_ignores_legacy_agent_id_and_saves_replacement(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
         binding = {
@@ -922,14 +1001,16 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         provider._request = fake_request
 
-        session, created = provider._ensure_session([], initial_input="replacement wake")
+        with self.assertRaises(RemoteSessionUnavailable):
+            provider._ensure_session([], initial_input="ordinary wake")
+        session, created = provider._ensure_session([], initial_input="replacement bootstrap")
 
         self.assertEqual("session-replacement", session["id"])
         self.assertTrue(created)
         create_body = requests[-1][2]
         self.assertNotIn("agent_id", create_body)
         self.assertEqual("gpt-5.6-luna", create_body["agent"]["model"])
-        self.assertEqual("replacement wake", create_body["input"])
+        self.assertEqual("replacement bootstrap", create_body["input"])
         self.assertNotIn("name", create_body["agent"])
         self.assertEqual({
             "session_id": "session-replacement",

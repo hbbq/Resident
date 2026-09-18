@@ -20,6 +20,10 @@ class ModelProvider(Protocol):
     def discard_continuation(self, continuation_id: str) -> None: ...
 
 
+class RemoteSessionUnavailable(RuntimeError):
+    """A restored session vanished before a replacement bootstrap was prepared."""
+
+
 RESIDENT_AGENT_INSTRUCTIONS = (
     "Act as the persistent Resident described by each supplied wake context. Use tools for durable state, "
     "local capabilities, communication, and scheduling. Send all intentional communication to the owner, "
@@ -156,6 +160,7 @@ class OpenAIAgentsProvider:
         self._complete_rollover: Callable[[str, str, str], None] = lambda *_: None
         self._fail_rollover: Callable[[str, str], None] = lambda *_: None
         self._requested_rollover_reason: str | None = None
+        self._unavailable_session_id: str | None = None
 
     def bind_session_store(self, load: Callable[[], dict | None],
                            save: Callable[[str, str | None, str | None], None]) -> None:
@@ -198,6 +203,22 @@ class OpenAIAgentsProvider:
         if not reason.strip():
             raise ValueError("Session rollover reason must be nonempty")
         self._requested_rollover_reason = reason.strip()
+
+    async def preflight_session(self) -> str | None:
+        """Detect an unavailable restored session before wake context is built."""
+        session_id = self._session_id
+        if session_id is None:
+            return None
+        try:
+            await asyncio.to_thread(
+                self._request, "GET", f"/agents/sessions/{session_id}")
+        except RuntimeError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+            self._unavailable_session_id = session_id
+            self._requested_rollover_reason = "remote_session_missing"
+            return "remote_session_missing"
+        return None
 
     async def session_items(self, cursor: str | None, limit: int = 50) -> SessionItemPage:
         if self._session_id is None:
@@ -388,14 +409,18 @@ class OpenAIAgentsProvider:
         desired_protocol = self._agent_protocol(agent)
         fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
         if self._session_id is not None:
+            if self._unavailable_session_id == self._session_id:
+                return self._intentional_rollover(
+                    "remote_session_missing", agent, desired_protocol,
+                    initial_input, allow_create, finalization_status="unavailable")
             try:
                 session = self._request("GET", f"/agents/sessions/{self._session_id}")
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
-                return self._intentional_rollover(
-                    "remote_session_missing", agent, desired_protocol,
-                    initial_input, allow_create, finalization_status="unavailable")
+                self._unavailable_session_id = self._session_id
+                self._requested_rollover_reason = "remote_session_missing"
+                raise RemoteSessionUnavailable(str(exc)) from exc
             else:
                 remote_agent_id = (session.get("agent") or {}).get("id")
                 if (self.agent_id is not None and remote_agent_id is not None
@@ -498,6 +523,8 @@ class OpenAIAgentsProvider:
             session = self._request("POST", "/agents/sessions", body)
             new_session_id = session["id"]
             self._session_id, self._last_turn_id = new_session_id, None
+            self._unavailable_session_id = None
+            self._requested_rollover_reason = None
             self._protocol_descriptor = descriptor
             self._tool_fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
             self._persist_binding(new_session_id, self.agent_id, None)
@@ -544,8 +571,10 @@ class OpenAIAgentsProvider:
         patch: dict[str, Any] = {}
         for key in ("model", "reasoning", "service_tier"):
             # A partial legacy session response cannot prove mutable drift.
-            if key in desired and key in remote_agent and remote_agent.get(key) != desired[key]:
-                patch[key] = desired[key]
+            # The session update contract clears reasoning/service tier with
+            # JSON null, so absence from the desired config remains meaningful.
+            if key in remote_agent and remote_agent.get(key) != desired.get(key):
+                patch[key] = desired.get(key)
         return patch
 
     def protocol_change_requires_rollover(self, tools: Sequence[ToolSpec]) -> bool:

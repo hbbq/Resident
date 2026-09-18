@@ -1,10 +1,12 @@
 import asyncio
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from resident.__main__ import build_host
 from resident.config import Config
 from resident.domain import ModelTurn, WakeEvent
 from resident.host import InstancePolicy, RuntimeHost, messaging_capability
@@ -21,6 +23,38 @@ class IdleProvider:
 
 
 class InstanceDefinitionTests(unittest.TestCase):
+    def test_catalog_runtimes_inherit_curator_and_explicit_new_chapter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            for resident_id in ("resident", "helper"):
+                (definitions / f"{resident_id}.yaml").write_text(
+                    f"id: {resident_id}\nname: {resident_id.title()}\n"
+                    "personality: Test.\nrole: Test.\n", encoding="utf-8")
+            config = Config(
+                root / "data", residents_dir=definitions, new_chapter=True,
+                curator_model="curator-model", curator_api_key="curator-key",
+                curator_base_url="https://curator.example/v1",
+                curator_batch_size=17, curator_max_batches=3)
+
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "resident-key"}):
+                host = build_host(config)
+            try:
+                self.assertEqual({"resident", "helper"}, set(host.runtimes))
+                for runtime in host.runtimes.values():
+                    self.assertEqual("curator-model", runtime.config.curator_model)
+                    self.assertEqual("curator-key", runtime.config.curator_api_key)
+                    self.assertEqual("https://curator.example/v1", runtime.config.curator_base_url)
+                    self.assertEqual(17, runtime.curator.batch_size)
+                    self.assertEqual(3, runtime.curator.max_batches)
+                    self.assertEqual("curator-model", runtime.curator.model.model)
+                    self.assertEqual(
+                        "explicit_new_chapter",
+                        runtime.provider._requested_rollover_reason)
+            finally:
+                host.close()
+
     def test_loads_prompt_files_and_separates_policy(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

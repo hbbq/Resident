@@ -150,6 +150,16 @@ def build_host(config: Config) -> RuntimeHost:
                 provider=definition.agent.provider, model=definition.agent.model,
                 reasoning_effort=definition.agent.reasoning_effort,
                 service_tier=definition.agent.service_tier,
+                # Curator policy is process-level configuration shared by each
+                # isolated Resident; keep that inheritance explicit here.
+                curator_model=config.curator_model,
+                curator_api_key=config.curator_api_key,
+                curator_base_url=config.curator_base_url,
+                curator_batch_size=config.curator_batch_size,
+                curator_max_batches=config.curator_max_batches,
+                # The command-line request intentionally targets every enabled
+                # Resident constructed for this catalog startup, exactly once.
+                new_chapter=config.new_chapter,
                 openai_api_key=None, openai_agent_id=None, residents_dir=None)
             transport = None
             if definition.owner_transport:

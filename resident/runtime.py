@@ -12,11 +12,18 @@ from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
-from .provider import ModelProvider
+from .provider import ModelProvider, RemoteSessionUnavailable
 from .memory import MemoryCurator
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, ToolRegistry
+
+
+_DEGRADED_HANDOVER = (
+    "The previous remote session was unavailable, so its final working context could not be "
+    "curated. Continue from the durable Resident identity, standing Owner guidance, pending "
+    "intentions, recent communications, and long-term-memory index in this bootstrap."
+)
 
 
 class EventProducer(Protocol):
@@ -271,6 +278,9 @@ class ResidentRuntime:
                 "occurred_at": event.occurred_at, "payload": event.payload,
             })
             capabilities = capability_event_state[0] if capability_event_state else self._capabilities
+            preflight_session = getattr(self.provider, "preflight_session", None)
+            unavailable_reason = (
+                await preflight_session() if preflight_session is not None else None)
             context = self.context_builder.build(self.resident, self.owner, event, capabilities)
             context_document = json.loads(context)
             self._emit("context.assembled", {
@@ -294,8 +304,10 @@ class ResidentRuntime:
             if needs_rollover or unknown_restored_protocol:
                 new_session = True
                 old_session_id = getattr(self.provider, "session_id", None)
-                if self.curator is not None:
+                if self.curator is not None and unavailable_reason is None:
                     handover = await self.curator.catch_up(final=True)
+                elif unavailable_reason is not None:
+                    handover = _DEGRADED_HANDOVER
                 if old_session_id and handover and needs_rollover:
                     handover_id = self.store.create_handover(
                         old_session_id, handover,
@@ -310,7 +322,26 @@ class ResidentRuntime:
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
-                turn = await self.provider.respond(context, registry.specs, results, continuation_id)
+                try:
+                    turn = await self.provider.respond(
+                        context, registry.specs, results, continuation_id)
+                except RemoteSessionUnavailable:
+                    if results or continuation_id is not None:
+                        raise
+                    old_session_id = getattr(self.provider, "session_id", None)
+                    handover = _DEGRADED_HANDOVER
+                    if old_session_id:
+                        handover_id = self.store.create_handover(
+                            old_session_id, handover,
+                            (datetime.now(UTC) + timedelta(hours=24)).isoformat())
+                    context_document["new_session_bootstrap"] = {
+                        "durable_memory_awareness": self.store.memory_awareness(limit=8),
+                        "handover": handover,
+                        "note": "Long-term memory is selectively available through memory tools.",
+                    }
+                    context = json.dumps(context_document, ensure_ascii=False, indent=2)
+                    turn = await self.provider.respond(
+                        context, registry.specs, results, continuation_id)
                 if handover_id is not None:
                     replacement_id = getattr(self.provider, "session_id", None)
                     if replacement_id:
