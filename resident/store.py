@@ -373,7 +373,7 @@ class Store:
                         INSERT INTO memory_provenance(
                           memory_id,revision,source_session_id,source_item_id,source_type,
                           source_timestamp,excerpt,content_hash) VALUES(?,?,?,?,?,?,?,?)
-                    """, (memory_id, revision, evidence.get("session_id", session_id),
+                    """, (memory_id, revision, session_id,
                           evidence.get("item_id"), evidence.get("source_type", "session_item"),
                           evidence.get("timestamp"), evidence.get("excerpt"),
                           evidence.get("content_hash")))

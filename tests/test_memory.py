@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,6 +40,27 @@ class FakeModel:
         }], "handover": "Continue discussing tea."}
 
 
+class EmptyModel:
+    def __init__(self):
+        self.calls = 0
+
+    async def curate(self, session_id, items, existing):
+        self.calls += 1
+        return {"mutations": []}
+
+
+class PageSource:
+    session_id = "session-pages"
+
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.calls = 0
+
+    async def session_items(self, cursor, limit):
+        self.calls += 1
+        return self.pages.pop(0)
+
+
 class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_curator_checkpoint_and_idempotent_memory_with_redacted_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -56,6 +79,136 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             detail = store.memory(memories[0]["id"])
             self.assertIn("[REDACTED]", detail["provenance"][0]["excerpt"])
             self.assertNotIn("secret", str(model.items))
+            store.close()
+
+    async def test_credentials_are_redacted_before_curator_and_persistence(self):
+        raw_secrets = (
+            "sk-authorization123", "ghp_bearertoken123", "sk-naturalkey123",
+            "hunter2", "structured-api-key", "structured-password",
+            "output-token", "cookie-value", "persisted-token", "handover-token",
+        )
+
+        class CredentialSource:
+            session_id = "real-session"
+
+            async def session_items(self, cursor, limit):
+                if cursor is not None:
+                    return SessionItemPage((), cursor, False)
+                return SessionItemPage(({
+                    "id": "credential-item", "type": "function_call_output",
+                    "created_at": "2026-02-03T04:05:06+00:00",
+                    "content": [{"type": "input_text", "text": (
+                        "Authorization: Bearer sk-authorization123\n"
+                        "Use Bearer ghp_bearertoken123. My API key is sk-naturalkey123 "
+                        "and password=hunter2") }],
+                    "arguments": {"api_key": "structured-api-key",
+                                  "nested": {"password": "structured-password"}},
+                    "output": {"token": "output-token", "cookie": "cookie-value"},
+                },), "credential-item", False)
+
+        class HostileModel:
+            def __init__(self):
+                self.items = []
+
+            async def curate(self, session_id, items, existing):
+                self.items.extend(items)
+                return {"mutations": [{
+                    "operation": "create", "kind": "fact",
+                    "content": "Keep token=persisted-token",
+                    "rationale": "Authorization: Bearer persisted-token",
+                    "provenance": [{
+                        "item_id": "credential-item", "session_id": "invented-session",
+                        "source_type": "invented-type", "timestamp": "invented-time",
+                        "excerpt": "invented excerpt", "content_hash": "invented-hash",
+                    }],
+                }], "handover": "Bearer handover-token"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            model = HostileModel()
+            handover = await MemoryCurator(store, CredentialSource(), model).catch_up()
+
+            model_input = json.dumps(model.items)
+            for secret in raw_secrets[:8]:
+                self.assertNotIn(secret, model_input)
+            self.assertGreaterEqual(model_input.count("[REDACTED]"), 7)
+            memory = store.memory(store.search_memories()[0]["id"])
+            persisted = json.dumps(memory)
+            for secret in raw_secrets:
+                self.assertNotIn(secret, persisted + str(handover))
+            self.assertIn("[REDACTED]", memory["content"])
+            self.assertIn("[REDACTED]", memory["rationale"])
+            self.assertEqual("Bearer [REDACTED]", handover)
+            evidence = memory["provenance"][0]
+            self.assertEqual("real-session", evidence["source_session_id"])
+            self.assertEqual("function_call_output", evidence["source_type"])
+            self.assertEqual("2026-02-03T04:05:06+00:00", evidence["source_timestamp"])
+            self.assertNotIn("invented", json.dumps(evidence))
+            canonical = json.dumps(model.items[0], ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":"))
+            self.assertEqual(hashlib.sha256(canonical.encode()).hexdigest(),
+                             evidence["content_hash"])
+            self.assertEqual(canonical[:500], evidence["excerpt"])
+            store.close()
+
+    async def test_repeated_cursor_fails_without_looping(self):
+        pages = [
+            SessionItemPage(({"id": "one", "type": "message"},), "cursor-one", True),
+            SessionItemPage(({"id": "two", "type": "message"},), "cursor-one", True),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source, model = PageSource(pages), EmptyModel()
+            with self.assertRaisesRegex(RuntimeError, "cursor did not advance"):
+                await MemoryCurator(store, source, model, max_batches=10).catch_up()
+            self.assertEqual(2, source.calls)
+            self.assertEqual("cursor-one", store.curator_checkpoint(
+                "openai_agents", source.session_id)["cursor"])
+            store.close()
+
+    async def test_has_more_empty_page_fails_without_looping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source = PageSource([SessionItemPage((), None, True)])
+            with self.assertRaisesRegex(RuntimeError, "empty page"):
+                await MemoryCurator(store, source, EmptyModel()).catch_up()
+            self.assertEqual(1, source.calls)
+            store.close()
+
+    async def test_repeated_page_fails_even_if_cursor_changes(self):
+        repeated = ({"id": "same", "type": "message"},)
+        pages = [SessionItemPage(repeated, "one", True),
+                 SessionItemPage(repeated, "two", True)]
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source = PageSource(pages)
+            with self.assertRaisesRegex(RuntimeError, "repeated a page"):
+                await MemoryCurator(store, source, EmptyModel(), max_batches=10).catch_up()
+            self.assertEqual(2, source.calls)
+            store.close()
+
+    async def test_final_catch_up_is_bounded_and_reports_incomplete(self):
+        class AdvancingSource:
+            session_id = "session-final"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def session_items(self, cursor, limit):
+                self.calls += 1
+                item_id = f"item-{self.calls}"
+                return SessionItemPage(({"id": item_id, "type": "message"},),
+                                       item_id, True)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source, model = AdvancingSource(), EmptyModel()
+            with self.assertRaisesRegex(RuntimeError, "consolidation incomplete"):
+                await MemoryCurator(store, source, model, max_batches=2).catch_up(final=True)
+            self.assertEqual(2, source.calls)
+            self.assertEqual(2, model.calls)
+            self.assertEqual("item-2", store.curator_checkpoint(
+                "openai_agents", source.session_id)["cursor"])
             store.close()
 
     async def test_memory_updates_invalidate_without_destroying_revision_history(self):
