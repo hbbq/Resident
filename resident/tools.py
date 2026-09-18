@@ -35,7 +35,8 @@ class ToolRegistry:
     def __init__(self, store: Store, capabilities: Sequence[Capability],
                  send_message: Callable[[str], Awaitable[dict[str, Any]] | dict[str, Any]],
                  emit: Callable[[str, dict[str, Any]], None], *,
-                 current_run_id: str | None = None):
+                 current_run_id: str | None = None, memory_enabled: bool = True,
+                 owner_communication_enabled: bool = True):
         self.store, self.emit, self.current_run_id = store, emit, current_run_id
         self.tools: dict[str, Tool] = {
             "remember": Tool(ToolSpec("remember",
@@ -94,6 +95,11 @@ class ToolRegistry:
                         offset={"type": "integer", "minimum": 0, "maximum": 1000})),
                 self._list_wake_history),
         }
+        if not memory_enabled:
+            for name in ("remember", "recall", "update_memory", "forget"):
+                self.tools.pop(name)
+        if not owner_communication_enabled:
+            self.tools.pop("send_owner_message")
         for capability in capabilities:
             if capability.name in self.tools:
                 raise ValueError(f"Duplicate tool name: {capability.name}")

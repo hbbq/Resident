@@ -131,9 +131,17 @@ def _cameras_from_environment() -> tuple[CameraConfig, ...]:
 @dataclass(frozen=True)
 class Config:
     data_dir: Path
+    residents_dir: Path | None = None
+    prompt_root: Path | None = None
+    default_resident: str = "resident"
+    migrate_legacy: bool = False
+    instance_id: str = "resident"
     resident_name: str = "Resident"
     owner_name: str = "Owner"
     personality: str = DEFAULT_PERSONALITY
+    role: str = ""
+    memory_enabled: bool = True
+    owner_communication_enabled: bool = True
     provider: str = "openai-agents"
     model: str = "gpt-5.6-luna"
     openai_api_key: str | None = None
@@ -172,6 +180,12 @@ class Config:
     def from_env_and_args(cls, argv: list[str] | None = None) -> "Config":
         parser = argparse.ArgumentParser(description="Run a persistent Resident instance")
         parser.add_argument("--data-dir", default=os.getenv("RESIDENT_DATA_DIR", ".resident"))
+        parser.add_argument("--residents-dir", default=os.getenv("RESIDENTS_DIR"),
+                            help="directory of startup-time Resident YAML definitions")
+        parser.add_argument("--prompt-root", default=os.getenv("RESIDENT_PROMPT_ROOT"))
+        parser.add_argument("--default-resident", default=os.getenv("RESIDENT_DEFAULT_ID", "resident"))
+        parser.add_argument("--migrate-legacy", action="store_true",
+                            help="move resident.sqlite3 into instances/resident and exit")
         parser.add_argument("--verbose", action="store_true", default=_environment_flag("RESIDENT_VERBOSE"),
                             help="show detailed runtime and connector diagnostics")
         parser.add_argument("--resident-name", default=os.getenv("RESIDENT_NAME", "Resident"))
@@ -235,6 +249,9 @@ class Config:
             raise ValueError("RESIDENT_DISPLAYS requires RESIDENT_HOMEOPS_URL or --homeops-url")
         return cls(
             data_dir=Path(args.data_dir).expanduser(), verbose=args.verbose,
+            residents_dir=Path(args.residents_dir).expanduser() if args.residents_dir else None,
+            prompt_root=Path(args.prompt_root).expanduser() if args.prompt_root else None,
+            default_resident=args.default_resident, migrate_legacy=args.migrate_legacy,
             resident_name=args.resident_name,
             owner_name=args.owner_name, personality=args.personality, provider=args.provider,
             model=args.model, openai_api_key=os.getenv("OPENAI_API_KEY"),

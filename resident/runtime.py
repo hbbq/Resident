@@ -83,7 +83,9 @@ class ResidentRuntime:
         self._mirror_owner_output = self.owner_output if owner_transport is not None else None
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
         self.context_builder = ContextBuilder(
-            self.store, memory_limit=config.context_memories, message_limit=config.context_messages)
+            self.store, memory_limit=config.context_memories if config.memory_enabled else 0,
+            message_limit=config.context_messages,
+            role=config.role)
         self._active_run_id: str | None = None
         self._active_event: WakeEvent | None = None
 
@@ -255,7 +257,8 @@ class ResidentRuntime:
             })
             registry = ToolRegistry(
                 self.store, capabilities, self._send_owner_message, self._emit,
-                current_run_id=run_id)
+                current_run_id=run_id, memory_enabled=self.config.memory_enabled,
+                owner_communication_enabled=self.config.owner_communication_enabled)
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1

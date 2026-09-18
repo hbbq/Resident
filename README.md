@@ -10,6 +10,40 @@ See [VISION.md](VISION.md) for the current product/behavior vision and [ARCHITEC
 
 The first experimental vertical slice is a Python 3.12+ asynchronous process with durable SQLite state. It preserves Resident and owner identities, memory, pending intentions, communication, wake runs, an append-only journal, and self-requested scheduled wakeups across restarts. Owner messages and due schedules become wake events; inference stops after each bounded model/tool exchange while terminal input and scheduling remain active.
 
+### Declarative Resident instances
+
+The runtime can host multiple independently configured Residents from startup-time YAML definitions. Pass `--residents-dir residents` (or set `RESIDENTS_DIR`); prompt references are resolved below `--prompt-root`, which defaults to the sibling `prompts` directory. Each stable definition ID receives its own database at `DATA_DIR/instances/<id>/resident.sqlite3`, including its durable identity, memory, journal, schedules, tool actions, and Agents session binding. Editing its name, personality, role, or policy does not create a new identity. Shared connector events are polled once and fanned out only to matching `subscriptions`; tools are separately selected by `capabilities`, so observation never grants action authority.
+
+A minimal Dungeon Master can be introduced without Python changes:
+
+```yaml
+# residents/dungeon-master.yaml
+version: 1
+id: dungeon-master
+name: Dungeon Master
+personality_prompt: dungeon-master.md
+role: Run a persistent tabletop campaign.
+agent:
+  provider: openai-agents
+  model: gpt-5.6-luna
+  api_key_env: OPENAI_API_KEY
+capabilities: [messaging]
+subscriptions: []
+memory:
+  enabled: true
+  context_limit: 8
+```
+
+Definitions accept inline `personality`/`role` or `personality_prompt`/`role_prompt`, Agent settings, memory and curator policy data, capability grants, event subscriptions, an optional Telegram Owner transport, and optional body metadata. YAML aliases, unknown fields, prompt path traversal, and inline secret-shaped fields are rejected. Secrets are named with `*_env` references and resolved only while constructing local resources. A Telegram transport uses `token_env`, `owner_user_id_env`, and `owner_chat_id_env`; one resolved bot token may serve exactly one Resident. Unsuffixed terminal input targets `--default-resident` (`resident` by default), and configuration changes require restart.
+
+Granting `messaging` exposes `messaging_send`. It writes to the process-shared durable mailbox and returns immediately; it is not RPC and does not await a reply. Resident IDs and `owner` are logical addresses. Messages default to a five-minute TTL and move from `pending` to `delivered` only when handed to the recipient event queue or Owner transport; expiry and delivery do not imply that a recipient read, understood, acted, or replied. A reply is another independent message.
+
+Legacy environment/CLI startup remains available when no definitions directory is supplied. To explicitly move an existing singleton database into the normal `resident` instance layout before declarative startup, stop the runtime and run:
+
+```powershell
+python -m resident --data-dir .resident --migrate-legacy
+```
+
 The live adapter uses the beta OpenAI Agents API and defaults to `gpt-5.6-luna`. Resident creates one long-lived managed session with the first accepted wake as its required initial input, stores its replaceable session binding in local SQLite, and submits subsequent wakes with `Idempotency-Key` request headers. Local function actions are claimed before execution and completed results are retained, so a re-delivered action returns its recorded result instead of repeating a display or Owner-message side effect; an interrupted action with an unknown outcome is reported rather than repeated automatically. OpenAI owns conversational turn history; Resident continues to own identity, durable memory, schedules, event filtering, local policy, and all HomeOps/device and Owner transports. Set an API key and choose a persistent data directory:
 
 ```powershell
@@ -17,7 +51,7 @@ $env:OPENAI_API_KEY = "..."
 python -m resident --data-dir .resident
 ```
 
-Enter an owner message at the prompt. All intentional Resident-to-Owner communication, including direct replies, goes through `send_owner_message` and is rendered as `[Resident -> Owner] ...`. Model-returned text is a wake result for journaling and diagnostics, not a second communication transport; it is hidden by default and shown only with verbose diagnostics. A rejected or failed send never falls back to model-returned text. By default, the terminal otherwise shows only a small startup/shutdown status and actionable runtime failures, keeping routine spontaneous wakes nearly invisible. Pass `--verbose` or set `RESIDENT_VERBOSE=true` to show detailed wake, context, model, tool, memory, connector, and metric diagnostics. Verbosity affects terminal presentation only; the structured journal remains complete. Enter `/quit` to stop. Reusing the data directory reloads the same stable identities, local state, and Agents session binding. Display names and personality can be configured on initial provisioning with `--resident-name`, `--owner-name`, and `--personality`; persisted identity is authoritative on later runs. `RESIDENT_MODEL`, `OPENAI_BASE_URL`, and the equivalent name/data environment variables may also be used. An existing saved Agent resource can be selected with `RESIDENT_OPENAI_AGENT_ID`; repository-defined instructions and local function schemas remain authoritative session overrides. Set `RESIDENT_PROVIDER=openai-responses` (or the legacy alias `openai`) to use the temporary Responses fallback.
+Enter an owner message at the prompt. All intentional Resident-to-Owner communication, including direct replies, goes through `send_owner_message` and is rendered as `[Resident -> Owner] ...`. Model-returned text is a wake result for journaling and diagnostics, not a second communication transport; it is hidden by default and shown only with verbose diagnostics. A rejected or failed send never falls back to model-returned text. By default, the terminal otherwise shows only a small startup/shutdown status and actionable runtime failures, keeping routine spontaneous wakes nearly invisible. Pass `--verbose` or set `RESIDENT_VERBOSE=true` to show detailed wake, context, model, tool, memory, connector, and metric diagnostics. Verbosity affects terminal presentation only; the structured journal remains complete. Enter `/quit` to stop. Reusing the data directory reloads the same stable identities, local state, and Agents session binding. Display names and personality can be configured with `--resident-name`, `--owner-name`, and `--personality`; later configuration refreshes this metadata while retaining the same durable identity. `RESIDENT_MODEL`, `OPENAI_BASE_URL`, and the equivalent name/data environment variables may also be used. An existing saved Agent resource can be selected with `RESIDENT_OPENAI_AGENT_ID`; repository-defined instructions and local function schemas remain authoritative session overrides. Set `RESIDENT_PROVIDER=openai-responses` (or the legacy alias `openai`) to use the temporary Responses fallback.
 
 Before the sleeping prompt, normal output includes one concise readiness line for each enabled integration and an overall result. HomeOps is ready after its first valid latest-measurements poll; AgentController after its first valid snapshot and baseline handling; Telegram after webhook validation and a successful zero-wait `getUpdates` preflight; and ONVIF after every configured camera has either established a usable PullPoint subscription or failed its first attempt. Cameras are reported separately after the configured FFmpeg executable is found locally; startup does not connect to RTSP streams or capture frames. A `FAILED` line records the initial attempt and does not stop the existing background retry loop or provide continuous health monitoring. Detailed causes and later retry diagnostics remain available with `--verbose`.
 

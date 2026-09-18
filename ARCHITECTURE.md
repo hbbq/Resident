@@ -1,5 +1,13 @@
 # Resident Architecture
 
+## Instance and host boundary
+
+`RuntimeHost` is the process-level lifecycle and routing boundary. It loads a strict startup-time catalog, constructs one `ResidentRuntime`, provider, queue, and SQLite `Store` per stable declarative ID, and owns shared connector polling and the durable mailbox. Resident-owned state lives under `instances/<id>`; changing declarative prompts or policy refreshes metadata without replacing the durable Resident UUID or provider session binding.
+
+Local policy is resolved before inference. Subscriptions decide which shared events enter an instance queue, while capability grants decide which executable tool schemas enter that instance's context and registry. Neither implies the other, and definitions cannot supply handlers, credentials, arbitrary schemas, or expand their own authority. Instance-private Telegram transports are bound to exactly one queue and store checkpoint. The default terminal route is explicit rather than broadcast.
+
+Generic inter-instance communication is a host-owned asynchronous mailbox, not direct runtime access or RPC. Messages contain logical sender/recipient addresses, content, timestamps, expiry, and `pending`/`delivered`/`expired` state. Handoff to a Resident creates an ordinary messaging wake; handoff to `owner` uses the sender's Owner transport. Delivery records handoff only, and replies are independent messages.
+
 This document records architectural principles that have been decided so far. It intentionally avoids specifying implementation details that have not yet been justified by experience.
 
 ## Core principle
