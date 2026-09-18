@@ -3,12 +3,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from resident.config import Config
 from resident.domain import ModelTurn, WakeEvent
 from resident.host import InstancePolicy, RuntimeHost, messaging_capability
 from resident.instances import load_resident_catalog, migrate_legacy_state
 from resident.mailbox import Mailbox
+from resident.readiness import ReadinessItem, ReadinessResult
 from resident.runtime import ResidentRuntime
 from resident.store import utc_now
 
@@ -34,7 +36,7 @@ role: Answer narrow questions.
 memory:
   enabled: false
 capabilities: [messaging]
-subscriptions: [messaging]
+subscriptions: [homeops]
 """, encoding="utf-8")
             catalog = load_resident_catalog(root / "residents", default_id="oracle")
             oracle = catalog.residents[0]
@@ -42,6 +44,7 @@ subscriptions: [messaging]
             self.assertEqual("Answer narrow questions.", oracle.role)
             self.assertFalse(oracle.memory["enabled"])
             self.assertEqual(("messaging",), oracle.capabilities)
+            self.assertEqual(("homeops",), oracle.subscriptions)
 
     def test_rejects_inline_secrets_and_prompt_traversal(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -57,6 +60,20 @@ subscriptions: [messaging]
                 encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "prompt root"):
                 load_resident_catalog(root / "residents")
+
+    def test_rejects_unknown_and_malformed_subscriptions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            definitions = Path(temporary) / "residents"
+            definitions.mkdir()
+            definition = definitions / "resident.yaml"
+            for selector, message in (("homeops.typo", "Unknown subscription"),
+                                      ("homeops.*", "Malformed subscription")):
+                with self.subTest(selector=selector):
+                    definition.write_text(
+                        "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                        f"subscriptions: [{selector}]\n", encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_resident_catalog(definitions)
 
     def test_explicit_legacy_migration_preserves_database(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -85,8 +102,8 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
                                  capabilities=[])
         self.host = RuntimeHost(
             {"a": self.a, "b": self.b},
-            {"a": InstancePolicy(frozenset({"homeops"})),
-             "b": InstancePolicy(frozenset({"homeops.changed"}))},
+            {"a": InstancePolicy(frozenset({"homeops", "messaging"})),
+             "b": InstancePolicy(frozenset({"homeops.changed", "messaging"}))},
             self.mailbox, default_id="a")
 
     async def asyncTearDown(self):
@@ -115,6 +132,47 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         await self.host.deliver_mailbox()
         reply_event = await self.host.queues["a"].get()
         self.assertEqual(reply["message_id"], reply_event.payload["message_id"])
+
+    async def test_mailbox_does_not_deliver_or_wake_a_non_subscriber(self):
+        self.host.policies["b"] = InstancePolicy(frozenset({"homeops"}))
+        send_a = messaging_capability(self.mailbox, "a", lambda: self.host.recipients)
+        result = await send_a.handler({"recipient": "b", "content": "private"})
+
+        self.assertEqual(0, await self.host.deliver_mailbox())
+        self.assertTrue(self.host.queues["b"].empty())
+        self.assertEqual("pending", self.mailbox.get(result["message_id"])["status"])
+
+    async def test_host_waits_for_connector_readiness_before_terminal(self):
+        class GatedProducer:
+            readiness_items = (ReadinessItem("connector", "Connector"),)
+
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def run(self, queue, stop, readiness):
+                self.started.set()
+                await self.release.wait()
+                readiness.put_nowait(ReadinessResult("connector", False, "initial attempt"))
+                await stop.wait()
+
+        producer = GatedProducer()
+        output = []
+        self.host.event_producers = (producer,)
+        self.host.diagnostic_output = output.append
+        terminal = AsyncMock(return_value="/quit")
+        with patch("resident.host.asyncio.to_thread", new=terminal):
+            run = asyncio.create_task(self.host.run())
+            await producer.started.wait()
+            await asyncio.sleep(0)
+            self.assertEqual(0, terminal.await_count)
+            self.assertEqual([], output)
+            producer.release.set()
+            await run
+
+        self.assertEqual("Connector........... FAILED (initial attempt)", output[0])
+        self.assertEqual("Startup completed with connector errors.", output[1])
+        self.assertTrue(output[2].startswith("Runtime host started"))
 
     async def test_instance_state_and_identity_are_isolated_and_stable(self):
         self.a.store.remember("only a", "resident")

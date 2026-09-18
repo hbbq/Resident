@@ -9,6 +9,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 from .capabilities import Capability
 from .domain import WakeEvent
 from .mailbox import DEFAULT_TTL_SECONDS, Mailbox
+from .readiness import ReadinessItem, ReadinessResult
 from .runtime import EventProducer, ResidentRuntime
 from .store import utc_now
 
@@ -101,8 +102,9 @@ class RuntimeHost:
                     {"message_id": message["id"], "sender": message["sender"],
                      "content": message["content"], "created_at": message["created_at"]},
                 )
-                await self.queues[recipient].put(event)
-                delivered += int(self.mailbox.delivered(message["id"]))
+                if self.policies[recipient].receives(event):
+                    await self.queues[recipient].put(event)
+                    delivered += int(self.mailbox.delivered(message["id"]))
             elif recipient == "owner" and message["sender"] in self.runtimes:
                 runtime = self.runtimes[message["sender"]]
                 try:
@@ -142,6 +144,69 @@ class RuntimeHost:
             scheduler.cancel()
             await asyncio.gather(scheduler, return_exceptions=True)
 
+    async def _collect_startup_readiness(
+            self, shared_queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,
+    ) -> tuple[list[asyncio.Task[None]], list[tuple[ReadinessItem, ReadinessResult]]]:
+        producers = [(producer, shared_queue) for producer in self.event_producers]
+        producers.extend(
+            (producer, self.queues[instance_id])
+            for instance_id, items in self.instance_producers.items()
+            for producer in items
+        )
+        tasks: list[asyncio.Task[None]] = []
+        watched: list[tuple[asyncio.Task[None], tuple[ReadinessItem, ...],
+                            asyncio.Queue[ReadinessResult]]] = []
+        ordered: list[tuple[ReadinessItem, ReadinessResult]] = []
+        try:
+            for producer, queue in producers:
+                items = tuple(getattr(producer, "readiness_items", ()))
+                if items:
+                    readiness: asyncio.Queue[ReadinessResult] = asyncio.Queue()
+                    task = asyncio.create_task(producer.run(queue, stop, readiness))
+                    watched.append((task, items, readiness))
+                else:
+                    task = asyncio.create_task(producer.run(queue, stop))
+                tasks.append(task)
+
+            for task, items, readiness in watched:
+                expected = {item.key for item in items}
+                if len(expected) != len(items):
+                    raise ValueError("Duplicate startup readiness key")
+                results: dict[str, ReadinessResult] = {}
+                while len(results) < len(items):
+                    receiver = asyncio.create_task(readiness.get())
+                    done, _ = await asyncio.wait(
+                        {receiver, task}, return_when=asyncio.FIRST_COMPLETED)
+                    if receiver in done:
+                        result = receiver.result()
+                        if result.key in expected and result.key not in results:
+                            results[result.key] = result
+                    else:
+                        receiver.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await receiver
+                    if task in done:
+                        for item in items:
+                            results.setdefault(item.key, ReadinessResult(item.key, False))
+                ordered.extend((item, results[item.key]) for item in items)
+            return tasks, ordered
+        except BaseException:
+            stop.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    def _render_startup_readiness(
+            self, results: list[tuple[ReadinessItem, ReadinessResult]]) -> None:
+        for item, result in results:
+            status = "OK" if result.ok else "FAILED"
+            detail = f" ({result.detail})" if result.detail else ""
+            self.diagnostic_output(f"{item.label:.<20} {status}{detail}")
+        self.diagnostic_output(
+            "All systems GO" if all(result.ok for _, result in results)
+            else "Startup completed with connector errors.")
+
     async def run(self, *, interactive: bool = True) -> None:
         stop = asyncio.Event()
         shared_queue: asyncio.Queue[WakeEvent] = asyncio.Queue()
@@ -163,18 +228,20 @@ class RuntimeHost:
                 if text.strip():
                     await self.queues[self.default_id].put(runtime.owner_message_event(text))
 
-        workers = [asyncio.create_task(self._worker(item, stop)) for item in self.runtimes]
-        tasks = [asyncio.create_task(router()), asyncio.create_task(self._mailbox_loop(stop))]
-        tasks.extend(asyncio.create_task(producer.run(shared_queue, stop))
-                     for producer in self.event_producers)
-        for instance_id, producers in self.instance_producers.items():
-            tasks.extend(asyncio.create_task(producer.run(self.queues[instance_id], stop))
-                         for producer in producers)
-        if interactive:
-            tasks.append(asyncio.create_task(terminal()))
-        self.diagnostic_output(
-            f"Runtime host started {len(self.runtimes)} Residents; default={self.default_id}")
+        workers: list[asyncio.Task[None]] = []
+        tasks: list[asyncio.Task[None]] = []
         try:
+            producers, readiness = await self._collect_startup_readiness(shared_queue, stop)
+            tasks.extend(producers)
+            self._render_startup_readiness(readiness)
+            workers.extend(asyncio.create_task(self._worker(item, stop))
+                           for item in self.runtimes)
+            tasks.extend((asyncio.create_task(router()),
+                          asyncio.create_task(self._mailbox_loop(stop))))
+            if interactive:
+                tasks.append(asyncio.create_task(terminal()))
+            self.diagnostic_output(
+                f"Runtime host started {len(self.runtimes)} Residents; default={self.default_id}")
             await stop.wait()
         finally:
             self._stopping = True

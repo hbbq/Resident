@@ -12,6 +12,17 @@ import yaml
 
 _ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _ENV = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
+_SUBSCRIPTION = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?\Z")
+_SUBSCRIPTION_EVENTS = frozenset({
+    "agentcontroller.workflow_changed",
+    "camera.cameras_changed",
+    "camera.onvif_property_changed",
+    "homeops.measurement_changed",
+    "messaging.message_received",
+})
+_SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
+                           {item.split(".", 1)[0] for item in _SUBSCRIPTION_EVENTS} |
+                           {"*"})
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
     "role", "role_prompt", "agent", "memory", "curator", "capabilities",
@@ -82,6 +93,18 @@ def _string_list(value: Any, label: str) -> tuple[str, ...]:
     if len(value) != len(set(value)):
         raise ValueError(f"{label} contains duplicates")
     return tuple(value)
+
+
+def _subscriptions(value: Any, label: str) -> tuple[str, ...]:
+    selectors = _string_list(value, label)
+    malformed = sorted(item for item in selectors
+                       if item != "*" and not _SUBSCRIPTION.fullmatch(item))
+    if malformed:
+        raise ValueError(f"Malformed subscription selectors: {', '.join(malformed)}")
+    unknown = sorted(set(selectors) - _SUBSCRIPTION_SELECTORS)
+    if unknown:
+        raise ValueError(f"Unknown subscription selectors: {', '.join(unknown)}")
+    return selectors
 
 
 def _prompt(root: Path, reference: Any, label: str) -> str:
@@ -193,7 +216,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
     return ResidentDefinition(
         resident_id, name, personality, role, enabled, agent, memory, curator,
         _string_list(data.get("capabilities"), "capabilities"),
-        _string_list(data.get("subscriptions"), "subscriptions"), transport, body,
+        _subscriptions(data.get("subscriptions"), "subscriptions"), transport, body,
     )
 
 
