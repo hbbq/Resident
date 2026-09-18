@@ -24,6 +24,10 @@ class RemoteSessionUnavailable(RuntimeError):
     """A restored session vanished before a replacement bootstrap was prepared."""
 
 
+class RolloverRecoveryRequired(RuntimeError):
+    """Remote creation may have succeeded and cannot be reconciled by this API."""
+
+
 RESIDENT_AGENT_INSTRUCTIONS = (
     "Act as the persistent Resident described by each supplied wake context. Use tools for durable state, "
     "local capabilities, communication, and scheduling. Send all intentional communication to the owner, "
@@ -140,6 +144,7 @@ class OpenAIAgentsProvider:
         self._last_turn_id: str | None = None
         self._tool_fingerprint: str | None = None
         self._protocol_descriptor: dict[str, Any] | None = None
+        self._mutable_settings_descriptor: dict[str, Any] | None = None
         self._active_turn_id: str | None = None
         self._submitted_call_ids: dict[str, set[str]] = {}
         self._pending_wakes: dict[str, tuple[str, str, str]] = {}
@@ -155,12 +160,20 @@ class OpenAIAgentsProvider:
         self._complete_action: Callable[..., None] | None = None
         self._load_protocol: Callable[[str], dict | None] = lambda _session_id: None
         self._save_protocol: Callable[[str, dict], None] = lambda *_: None
-        self._begin_rollover: Callable[[str | None, str, str], str] = (
-            lambda _old, _reason, _requested_by: "")
-        self._complete_rollover: Callable[[str, str, str], None] = lambda *_: None
+        self._load_mutable: Callable[[str], dict | None] = lambda _session_id: None
+        self._save_mutable: Callable[[str, dict], None] = lambda *_: None
+        self._load_pending_rollover: Callable[[], dict | None] = lambda: None
+        self._begin_rollover: Callable[[str | None, str, str, dict], dict] = (
+            lambda old, reason, requested_by, request: {
+                "id": "", "old_session_id": old, "reason": reason,
+                "creation_state": "not_attempted", "create_request": request})
+        self._mark_rollover_create_started: Callable[[str], None] = lambda *_: None
+        self._bind_rollover: Callable[..., None] = lambda *_: None
+        self._complete_rollover: Callable[[str], None] = lambda *_: None
         self._fail_rollover: Callable[[str, str], None] = lambda *_: None
         self._requested_rollover_reason: str | None = None
         self._unavailable_session_id: str | None = None
+        self._lifecycle_bound = False
 
     def bind_session_store(self, load: Callable[[], dict | None],
                            save: Callable[[str, str | None, str | None], None]) -> None:
@@ -182,14 +195,28 @@ class OpenAIAgentsProvider:
 
     def bind_lifecycle_store(self, load_protocol: Callable[[str], dict | None],
                              save_protocol: Callable[[str, dict], None],
-                             begin_rollover: Callable[[str | None, str, str], str],
-                             complete_rollover: Callable[[str, str, str], None],
+                             load_mutable: Callable[[str], dict | None],
+                             save_mutable: Callable[[str, dict], None],
+                             load_pending_rollover: Callable[[], dict | None],
+                             begin_rollover: Callable[[str | None, str, str, dict], dict],
+                             mark_rollover_create_started: Callable[[str], None],
+                             bind_rollover: Callable[..., None],
+                             complete_rollover: Callable[[str], None],
                              fail_rollover: Callable[[str, str], None]) -> None:
+        self._lifecycle_bound = True
         self._load_protocol, self._save_protocol = load_protocol, save_protocol
+        self._load_mutable, self._save_mutable = load_mutable, save_mutable
+        self._load_pending_rollover = load_pending_rollover
         self._begin_rollover = begin_rollover
+        self._mark_rollover_create_started = mark_rollover_create_started
+        self._bind_rollover = bind_rollover
         self._complete_rollover, self._fail_rollover = complete_rollover, fail_rollover
         if self._session_id is not None:
             self._protocol_descriptor = load_protocol(self._session_id)
+            self._mutable_settings_descriptor = load_mutable(self._session_id)
+        pending = load_pending_rollover()
+        if pending is not None:
+            self._requested_rollover_reason = pending["reason"]
 
     @property
     def session_id(self) -> str | None:
@@ -475,6 +502,10 @@ class OpenAIAgentsProvider:
                             "PATCH", f"/agents/sessions/{self._session_id}",
                             {"agent": mutable_patch})
                         session = {**session, **patched}
+                        self._lifecycle_call(
+                            self._save_mutable, self._session_id,
+                            self._desired_mutable_settings())
+                        self._mutable_settings_descriptor = self._desired_mutable_settings()
                     self._protocol_descriptor = desired_protocol
                     self._lifecycle_call(self._save_protocol, self._session_id, desired_protocol)
                     self._tool_fingerprint = fingerprint
@@ -500,6 +531,9 @@ class OpenAIAgentsProvider:
         self._protocol_descriptor = desired_protocol
         self._persist_binding(self._session_id, self.agent_id, None)
         self._lifecycle_call(self._save_protocol, self._session_id, desired_protocol)
+        mutable_settings = self._desired_mutable_settings()
+        self._lifecycle_call(self._save_mutable, self._session_id, mutable_settings)
+        self._mutable_settings_descriptor = mutable_settings
         return session, True
 
     def _intentional_rollover(self, reason: str, agent: dict,
@@ -511,29 +545,54 @@ class OpenAIAgentsProvider:
         if initial_input is None:
             raise RuntimeError("Intentional session rollover requires bootstrap input")
         old_session_id = self._session_id
-        rollover_id = self._lifecycle_call(
-            self._begin_rollover, old_session_id, reason, "runtime")
         body: dict = {
             "environment": {"type": "none"}, "agent": agent, "input": initial_input,
             "metadata": {"managed_by": "resident", "rollover_reason": reason},
         }
         if self.agent_id:
             body["agent_id"] = self.agent_id
+        rollover = self._lifecycle_call(
+            self._begin_rollover, old_session_id, reason, "runtime", body)
+        rollover_id = rollover["id"]
+        if rollover.get("creation_state") == "create_uncertain":
+            raise RolloverRecoveryRequired(
+                "Replacement session creation may have succeeded before Resident could "
+                "record its ID. The Agents API exposes no supported create-idempotency or "
+                "lookup-by-rollover-token contract, so automatic re-creation is blocked; "
+                f"rollover {rollover_id} requires operator reconciliation.")
+        if rollover.get("creation_state") != "not_attempted":
+            raise RuntimeError(
+                f"Rollover {rollover_id} is not in a creatable state: "
+                f"{rollover.get('creation_state')}")
+        persisted_body = rollover.get("create_request")
+        if not isinstance(persisted_body, dict):
+            raise RuntimeError(f"Rollover {rollover_id} has no durable create request")
+        self._lifecycle_call(self._mark_rollover_create_started, rollover_id)
         try:
-            session = self._request("POST", "/agents/sessions", body)
+            session = self._request("POST", "/agents/sessions", persisted_body)
             new_session_id = session["id"]
+            mutable_settings = self._desired_mutable_settings()
+            if self._lifecycle_bound:
+                self._lifecycle_call(
+                    self._bind_rollover, rollover_id, new_session_id, self.agent_id,
+                    descriptor, mutable_settings, finalization_status)
             self._session_id, self._last_turn_id = new_session_id, None
             self._unavailable_session_id = None
             self._requested_rollover_reason = None
             self._protocol_descriptor = descriptor
+            self._mutable_settings_descriptor = mutable_settings
             self._tool_fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
-            self._persist_binding(new_session_id, self.agent_id, None)
-            self._lifecycle_call(self._save_protocol, new_session_id, descriptor)
-            self._lifecycle_call(
-                self._complete_rollover, rollover_id, new_session_id, finalization_status)
+            if self._lifecycle_bound:
+                self._pending_binding = None
+                self._lifecycle_call(self._complete_rollover, rollover_id)
+            else:
+                self._persist_binding(new_session_id, self.agent_id, None)
+                self._save_protocol(new_session_id, descriptor)
+                self._save_mutable(new_session_id, mutable_settings)
             return session, True
-        except Exception:
-            self._lifecycle_call(self._fail_rollover, rollover_id, "unavailable")
+        except Exception as exc:
+            if self._definitive_create_rejection(exc):
+                self._lifecycle_call(self._fail_rollover, rollover_id, "create_rejected")
             raise
 
     def _persist_binding(self, session_id: str, agent_id: str | None,
@@ -564,24 +623,37 @@ class OpenAIAgentsProvider:
             agent["service_tier"] = self.service_tier
         return agent
 
+    def _desired_mutable_settings(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "reasoning": ({"effort": self.reasoning_effort}
+                          if self.reasoning_effort is not None else None),
+            "service_tier": self.service_tier,
+        }
+
     def _mutable_patch(self, remote_agent: object) -> dict[str, Any]:
-        if not isinstance(remote_agent, dict):
-            return {}
-        desired = self._agent_config(())
+        remote = remote_agent if isinstance(remote_agent, dict) else {}
+        desired = self._desired_mutable_settings()
+        applied = self._mutable_settings_descriptor or {}
         patch: dict[str, Any] = {}
-        # A partial legacy response cannot prove model drift. Reasoning and
-        # service tier differ: their documented absent state is the default,
-        # so an explicit configured value must be applied on unset -> set and
-        # JSON null must still be sent for set -> unset.
-        if "model" in remote_agent and remote_agent.get("model") != desired.get("model"):
-            patch["model"] = desired.get("model")
-        for key in ("reasoning", "service_tier"):
-            if key in desired:
-                if remote_agent.get(key) != desired[key]:
-                    patch[key] = desired[key]
-            elif key in remote_agent and remote_agent.get(key) is not None:
-                patch[key] = None
+        for key in ("model", "reasoning", "service_tier"):
+            if key in remote:
+                known, current = True, remote.get(key)
+            elif key in applied:
+                known, current = True, applied.get(key)
+            else:
+                known, current = False, None
+            if (known and current != desired[key]) or (
+                    not known and desired[key] is not None
+                    and (key != "model" or self._lifecycle_bound)):
+                patch[key] = desired[key]
         return patch
+
+    @staticmethod
+    def _definitive_create_rejection(exc: Exception) -> bool:
+        message = str(exc)
+        return any(f"HTTP {status}" in message for status in (
+            400, 401, 403, 404, 405, 406, 410, 411, 413, 414, 415, 422))
 
     def protocol_change_requires_rollover(self, tools: Sequence[ToolSpec]) -> bool:
         if self._session_id is None:

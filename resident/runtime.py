@@ -72,16 +72,23 @@ class ResidentRuntime:
             )
         bind_lifecycle_store = getattr(provider, "bind_lifecycle_store", None)
         if bind_lifecycle_store is not None:
+            self.store.recover_session_rollovers("openai_agents")
             bind_lifecycle_store(
                 lambda session_id: self.store.session_protocol("openai_agents", session_id),
                 lambda session_id, descriptor: self.store.save_session_protocol(
                     "openai_agents", session_id, descriptor),
-                lambda old, reason, requested_by: self.store.begin_session_rollover(
-                    "openai_agents", old, reason, requested_by),
+                lambda session_id: self.store.session_mutable_settings(
+                    "openai_agents", session_id),
+                lambda session_id, settings: self.store.save_session_mutable_settings(
+                    "openai_agents", session_id, settings),
+                lambda: self.store.pending_session_rollover("openai_agents"),
+                lambda old, reason, requested_by, request: self.store.begin_session_rollover(
+                    "openai_agents", old, reason, requested_by, request),
+                self.store.mark_session_rollover_create_started,
+                self.store.bind_session_rollover,
                 self.store.complete_session_rollover,
                 self.store.fail_session_rollover,
             )
-            self.store.recover_session_rollovers("openai_agents")
         if config.new_chapter:
             request_rollover = getattr(provider, "request_rollover", None)
             if request_rollover is not None:
@@ -304,11 +311,16 @@ class ResidentRuntime:
             if needs_rollover or unknown_restored_protocol:
                 new_session = True
                 old_session_id = getattr(self.provider, "session_id", None)
-                if self.curator is not None and unavailable_reason is None:
+                pending_handover = (
+                    self.store.pending_handover(old_session_id) if old_session_id else None)
+                if pending_handover is not None:
+                    handover = pending_handover["content"]
+                    handover_id = pending_handover["id"]
+                elif self.curator is not None and unavailable_reason is None:
                     handover = await self.curator.catch_up(final=True)
                 elif unavailable_reason is not None:
                     handover = _DEGRADED_HANDOVER
-                if old_session_id and handover and needs_rollover:
+                if old_session_id and handover and needs_rollover and handover_id is None:
                     handover_id = self.store.create_handover(
                         old_session_id, handover,
                         (datetime.now(UTC) + timedelta(hours=24)).isoformat())
@@ -322,6 +334,7 @@ class ResidentRuntime:
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
+                response_session_id = getattr(self.provider, "session_id", None)
                 try:
                     turn = await self.provider.respond(
                         context, registry.specs, results, continuation_id)
@@ -344,9 +357,9 @@ class ResidentRuntime:
                         context, registry.specs, results, continuation_id)
                 if handover_id is not None:
                     replacement_id = getattr(self.provider, "session_id", None)
-                    if replacement_id:
+                    if replacement_id and replacement_id != response_session_id:
                         self.store.consume_handover(handover_id, replacement_id)
-                    handover_id = None
+                        handover_id = None
                 self._emit("model.responded", {
                     "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
