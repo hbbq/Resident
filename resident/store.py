@@ -426,26 +426,12 @@ class Store:
         # transition excludes every competing create for this provider/session.
         # Its historical reason and snapshots remain authoritative.
         pending = self.connection.execute("""
-            SELECT * FROM session_rollovers WHERE provider=?
-              AND (old_session_id IS ? OR old_session_id IS NULL)
-              AND status='pending' AND creation_state='create_uncertain'
-            ORDER BY CASE WHEN old_session_id IS ? THEN 0 ELSE 1 END,
+            SELECT * FROM session_rollovers
+            WHERE provider=? AND old_session_id IS ? AND status='pending'
+              AND creation_state IN ('create_uncertain','not_attempted')
+            ORDER BY CASE creation_state WHEN 'create_uncertain' THEN 0 ELSE 1 END,
               created_at ASC LIMIT 1
-        """, (provider, old_session_id, old_session_id)).fetchone()
-        if pending is None:
-            pending = self.connection.execute("""
-            SELECT * FROM session_rollovers WHERE provider=? AND old_session_id IS ?
-              AND reason=? AND status='pending' ORDER BY created_at DESC LIMIT 1
-            """, (provider, old_session_id, reason)).fetchone()
-        if pending is None and old_session_id is None:
-            # There can be only one first-session create. A restart may carry a
-            # newly supplied new-chapter reason, but it must resume the already
-            # durable initial request rather than write a competing POST intent.
-            pending = self.connection.execute("""
-                SELECT * FROM session_rollovers
-                WHERE provider=? AND old_session_id IS NULL AND status='pending'
-                ORDER BY created_at ASC LIMIT 1
-            """, (provider,)).fetchone()
+        """, (provider, old_session_id)).fetchone()
         if pending is not None:
             result = dict(pending)
             if result.get("create_request_json"):
