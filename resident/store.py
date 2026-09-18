@@ -348,6 +348,40 @@ class Store:
                   last_turn_id=excluded.last_turn_id, updated_at=excluded.updated_at
             """, (provider, session_id, agent_id, last_turn_id, now, now))
 
+    def bind_initial_agent_session(self, provider: str, session_id: str,
+                                   agent_id: str | None,
+                                   create_request: dict[str, Any],
+                                   protocol_descriptor: dict[str, Any],
+                                   mutable_settings: dict[str, Any]) -> None:
+        """Atomically bind a created session and its exact applied configuration."""
+        request_protocol, request_mutable = _create_request_configuration(create_request)
+        if protocol_descriptor != request_protocol or mutable_settings != request_mutable:
+            raise ValueError(
+                "Initial create request and configuration descriptors must match")
+        descriptor_json = json.dumps(
+            protocol_descriptor, sort_keys=True, separators=(",", ":"))
+        settings_json = json.dumps(
+            mutable_settings, sort_keys=True, separators=(",", ":"))
+        now = utc_now()
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO agent_session_bindings(
+                  provider,session_id,agent_id,last_turn_id,created_at,updated_at)
+                VALUES(?,?,?,NULL,?,?) ON CONFLICT(provider) DO UPDATE SET
+                  session_id=excluded.session_id,agent_id=excluded.agent_id,last_turn_id=NULL,
+                  updated_at=excluded.updated_at
+            """, (provider, session_id, agent_id, now, now))
+            self.connection.execute("""
+                INSERT INTO session_protocol_descriptors(provider,session_id,descriptor_json,created_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  descriptor_json=excluded.descriptor_json
+            """, (provider, session_id, descriptor_json, now))
+            self.connection.execute("""
+                INSERT INTO session_mutable_settings(provider,session_id,settings_json,updated_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  settings_json=excluded.settings_json,updated_at=excluded.updated_at
+            """, (provider, session_id, settings_json, now))
+
     def save_session_protocol(self, provider: str, session_id: str,
                               descriptor: dict[str, Any]) -> None:
         encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
@@ -388,10 +422,19 @@ class Store:
                                create_request: dict[str, Any],
                                protocol_descriptor: dict[str, Any],
                                mutable_settings: dict[str, Any]) -> dict[str, Any]:
+        # Once a create may have crossed the remote boundary, its recorded
+        # transition excludes every competing create for this provider/session.
+        # Its historical reason and snapshots remain authoritative.
         pending = self.connection.execute("""
             SELECT * FROM session_rollovers WHERE provider=? AND old_session_id IS ?
+              AND status='pending' AND creation_state='create_uncertain'
+            ORDER BY created_at ASC LIMIT 1
+        """, (provider, old_session_id)).fetchone()
+        if pending is None:
+            pending = self.connection.execute("""
+            SELECT * FROM session_rollovers WHERE provider=? AND old_session_id IS ?
               AND reason=? AND status='pending' ORDER BY created_at DESC LIMIT 1
-        """, (provider, old_session_id, reason)).fetchone()
+            """, (provider, old_session_id, reason)).fetchone()
         if pending is not None:
             result = dict(pending)
             if result.get("create_request_json"):
@@ -448,8 +491,14 @@ class Store:
     def pending_session_rollover(self, provider: str) -> dict[str, Any] | None:
         row = self.connection.execute("""
             SELECT * FROM session_rollovers WHERE provider=? AND status='pending'
-            ORDER BY created_at DESC LIMIT 1
-        """, (provider,)).fetchone()
+            ORDER BY CASE WHEN creation_state='create_uncertain' AND old_session_id IS (
+                SELECT session_id FROM agent_session_bindings WHERE provider=?
+              ) THEN 0 WHEN old_session_id IS (
+                SELECT session_id FROM agent_session_bindings WHERE provider=?
+              ) THEN 1 ELSE 2 END,
+              CASE WHEN creation_state='create_uncertain' THEN created_at END ASC,
+              created_at DESC LIMIT 1
+        """, (provider, provider, provider)).fetchone()
         if row is None:
             return None
         result = dict(row)

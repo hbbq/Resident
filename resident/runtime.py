@@ -90,6 +90,10 @@ class ResidentRuntime:
                 self.store.bind_session_rollover,
                 self.store.complete_session_rollover,
                 self.store.fail_session_rollover,
+                lambda session_id, agent_id, request, protocol, mutable:
+                    self.store.bind_initial_agent_session(
+                        "openai_agents", session_id, agent_id, request,
+                        protocol, mutable),
             )
         if config.new_chapter:
             request_rollover = getattr(provider, "request_rollover", None)

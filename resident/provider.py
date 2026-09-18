@@ -162,6 +162,7 @@ class OpenAIAgentsProvider:
         self._save_protocol: Callable[[str, dict], None] = lambda *_: None
         self._load_mutable: Callable[[str], dict | None] = lambda _session_id: None
         self._save_mutable: Callable[[str, dict], None] = lambda *_: None
+        self._bind_initial_session: Callable[..., None] = lambda *_: None
         self._load_pending_rollover: Callable[[], dict | None] = lambda: None
         self._begin_rollover: Callable[..., dict] = (
             lambda old, reason, requested_by, request, protocol, mutable: {
@@ -205,7 +206,8 @@ class OpenAIAgentsProvider:
                              mark_rollover_create_started: Callable[[str], None],
                              bind_rollover: Callable[..., None],
                              complete_rollover: Callable[[str], None],
-                             fail_rollover: Callable[[str, str], None]) -> None:
+                             fail_rollover: Callable[[str, str], None],
+                             bind_initial_session: Callable[..., None]) -> None:
         self._lifecycle_bound = True
         self._load_protocol, self._save_protocol = load_protocol, save_protocol
         self._load_mutable, self._save_mutable = load_mutable, save_mutable
@@ -214,6 +216,7 @@ class OpenAIAgentsProvider:
         self._mark_rollover_create_started = mark_rollover_create_started
         self._bind_rollover = bind_rollover
         self._complete_rollover, self._fail_rollover = complete_rollover, fail_rollover
+        self._bind_initial_session = bind_initial_session
         if self._session_id is not None:
             self._protocol_descriptor = load_protocol(self._session_id)
             self._mutable_settings_descriptor = load_mutable(self._session_id)
@@ -503,7 +506,8 @@ class OpenAIAgentsProvider:
                 else:
                     remote_agent = session.get("agent")
                     applied_protocol = self._protocol_descriptor
-                    if applied_protocol is None and isinstance(remote_agent, dict):
+                    if (applied_protocol is None and isinstance(remote_agent, dict)
+                            and {"model", "instructions", "tools"} <= remote_agent.keys()):
                         applied_protocol = self._agent_protocol(remote_agent)
                     if applied_protocol is None and self._tool_fingerprint is not None:
                         try:
@@ -512,6 +516,10 @@ class OpenAIAgentsProvider:
                         except (TypeError, json.JSONDecodeError):
                             pass
                     compatibility = self._protocol_compatibility(applied_protocol, desired_protocol)
+                    if applied_protocol is None and self._lifecycle_bound:
+                        # A legacy binding without an applied descriptor cannot
+                        # prove that today's immutable protocol was used.
+                        compatibility = "rollover"
                     if self._requested_rollover_reason and session.get("status") == "idle":
                         reason = self._requested_rollover_reason
                         result = self._intentional_rollover(
@@ -567,15 +575,25 @@ class OpenAIAgentsProvider:
         }
         if self.agent_id:
             body["agent_id"] = self.agent_id
+        mutable_settings = self._desired_mutable_settings()
         session = self._request("POST", "/agents/sessions", body)
-        self._session_id = session["id"]
+        session_id = session["id"]
+        if self._lifecycle_bound:
+            self._lifecycle_call(
+                self._bind_initial_session, session_id, self.agent_id, body,
+                desired_protocol, mutable_settings)
+            self._pending_binding = None
+        else:
+            # Keep the standalone adapter's retry checkpoint behavior: if its
+            # binding callback fails, the known remote ID is retried before use.
+            self._session_id = session_id
+            self._persist_binding(session_id, self.agent_id, None)
+            self._save_protocol(session_id, desired_protocol)
+            self._save_mutable(session_id, mutable_settings)
+        self._session_id = session_id
         self._last_turn_id = None
         self._tool_fingerprint = fingerprint
         self._protocol_descriptor = desired_protocol
-        self._persist_binding(self._session_id, self.agent_id, None)
-        self._lifecycle_call(self._save_protocol, self._session_id, desired_protocol)
-        mutable_settings = self._desired_mutable_settings()
-        self._lifecycle_call(self._save_mutable, self._session_id, mutable_settings)
         self._mutable_settings_descriptor = mutable_settings
         return session, True
 
@@ -627,7 +645,8 @@ class OpenAIAgentsProvider:
                     finalization_status)
             self._session_id, self._last_turn_id = new_session_id, None
             self._unavailable_session_id = None
-            self._requested_rollover_reason = None
+            self._requested_rollover_reason = (
+                reason if rollover.get("reason") != reason else None)
             self._protocol_descriptor = persisted_descriptor
             self._mutable_settings_descriptor = persisted_mutable
             self._tool_fingerprint = json.dumps(
