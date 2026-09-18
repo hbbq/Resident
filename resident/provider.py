@@ -318,14 +318,27 @@ class OpenAIAgentsProvider:
                         self._bound_agent_id = resolved_agent_id
                         self._persist_binding(
                             self._session_id, resolved_agent_id, self._last_turn_id)
+                    remote_agent = session.get("agent")
+                    if self._tool_fingerprint is None:
+                        if (not isinstance(remote_agent, dict)
+                                or not {"model", "instructions", "tools"} <= remote_agent.keys()
+                                or self._agent_config_matches(remote_agent, agent)):
+                            # A restored provider has no in-memory fingerprint.
+                            # Recognize a matching persisted session from its
+                            # returned config. A partial legacy response cannot
+                            # prove a mismatch, so avoid replacing it eagerly.
+                            self._tool_fingerprint = fingerprint
                     if self._tool_fingerprint != fingerprint and session.get("status") == "idle":
-                        session = self._request(
-                            "POST", f"/agents/sessions/{self._session_id}", {"agent": agent})
-                        # Track only configuration the session accepted. If the
-                        # session is active, the mismatch remains pending here and
-                        # a later idle call retries the current configuration.
-                        self._tool_fingerprint = fingerprint
-                    return session
+                        # Session updates only accept model, reasoning, and
+                        # service-tier overrides. Instructions and tools are part
+                        # of session creation, so replace an idle session when the
+                        # Resident configuration actually changes.
+                        self._session_id = None
+                        self._last_turn_id = None
+                    else:
+                        # If the session is active, leave the mismatch pending and
+                        # retry once it becomes idle.
+                        return session
         body: dict = {
             "environment": {"type": "none"},
             "agent": agent,
@@ -360,13 +373,25 @@ class OpenAIAgentsProvider:
     def _agent_config(self, tools: Sequence[ToolSpec]) -> dict:
         return {
             "model": self.model,
-            "name": "Resident",
             "instructions": RESIDENT_AGENT_INSTRUCTIONS,
             "tools": [{
                 "type": "function", "name": tool.name,
                 "description": tool.description, "parameters": tool.input_schema,
             } for tool in tools],
         }
+
+    @staticmethod
+    def _agent_config_matches(remote: object, expected: dict) -> bool:
+        if not isinstance(remote, dict):
+            return False
+        remote_tools = [{key: tool.get(key) for key in (
+            "type", "name", "description", "parameters")}
+            for tool in remote.get("tools", []) if isinstance(tool, dict)]
+        return {
+            "model": remote.get("model"),
+            "instructions": remote.get("instructions"),
+            "tools": remote_tools,
+        } == expected
 
     def _wait_for_turn(self, session_id: str, expected_turn_id: str | None) -> ModelTurn:
         if not expected_turn_id:
