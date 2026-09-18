@@ -33,6 +33,27 @@ MAX_ACTIVE_OWNER_GUIDANCE_COUNT = 16
 MAX_ACTIVE_OWNER_GUIDANCE_BYTES = 32768
 
 
+def _create_request_configuration(request: dict[str, Any]) -> tuple[dict, dict]:
+    """Reconstruct the applied descriptors solely from a durable create request."""
+    agent = request.get("agent") if isinstance(request.get("agent"), dict) else {}
+    protocol = {
+        "version": 1,
+        "instructions": agent.get("instructions"),
+        "tools": [{key: tool.get(key) for key in
+                   ("type", "name", "description", "parameters")}
+                  for tool in agent.get("tools", []) if isinstance(tool, dict)],
+        "saved_agent_id": request.get("agent_id"),
+        "environment": request.get("environment"),
+        "security_policy_revision": 1,
+    }
+    mutable = {
+        "model": agent.get("model"),
+        "reasoning": agent.get("reasoning"),
+        "service_tier": agent.get("service_tier"),
+    }
+    return protocol, mutable
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -157,6 +178,7 @@ class Store:
           finalization_status TEXT NOT NULL, status TEXT NOT NULL,
           creation_state TEXT NOT NULL DEFAULT 'not_attempted', create_token TEXT,
           create_request_json TEXT, create_request_hash TEXT, handover_id TEXT,
+          protocol_descriptor_json TEXT, mutable_settings_json TEXT,
           created_at TEXT NOT NULL, create_started_at TEXT, bound_at TEXT, completed_at TEXT);
         CREATE TABLE IF NOT EXISTS agent_tool_actions(
           provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
@@ -253,6 +275,8 @@ class Store:
             "create_request_json": "TEXT",
             "create_request_hash": "TEXT",
             "handover_id": "TEXT",
+            "protocol_descriptor_json": "TEXT",
+            "mutable_settings_json": "TEXT",
             "create_started_at": "TEXT",
             "bound_at": "TEXT",
         }
@@ -269,7 +293,24 @@ class Store:
                 WHERE status='pending' AND create_request_json IS NULL
                   AND creation_state='not_attempted'
             """)
-        self.connection.execute("UPDATE schema_version SET version=14")
+            legacy_snapshots = self.connection.execute("""
+                SELECT id,create_request_json FROM session_rollovers
+                WHERE status='pending' AND creation_state='not_attempted'
+                  AND create_request_json IS NOT NULL
+                  AND (protocol_descriptor_json IS NULL OR mutable_settings_json IS NULL)
+            """).fetchall()
+            for row in legacy_snapshots:
+                request = json.loads(row["create_request_json"])
+                protocol, mutable = _create_request_configuration(request)
+                self.connection.execute("""
+                    UPDATE session_rollovers
+                    SET protocol_descriptor_json=?,mutable_settings_json=? WHERE id=?
+                """, (
+                    json.dumps(protocol, sort_keys=True, separators=(",", ":")),
+                    json.dumps(mutable, sort_keys=True, separators=(",", ":")),
+                    row["id"],
+                ))
+        self.connection.execute("UPDATE schema_version SET version=15")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -344,7 +385,9 @@ class Store:
 
     def begin_session_rollover(self, provider: str, old_session_id: str | None,
                                reason: str, requested_by: str,
-                               create_request: dict[str, Any]) -> dict[str, Any]:
+                               create_request: dict[str, Any],
+                               protocol_descriptor: dict[str, Any],
+                               mutable_settings: dict[str, Any]) -> dict[str, Any]:
         pending = self.connection.execute("""
             SELECT * FROM session_rollovers WHERE provider=? AND old_session_id IS ?
               AND reason=? AND status='pending' ORDER BY created_at DESC LIMIT 1
@@ -353,6 +396,11 @@ class Store:
             result = dict(pending)
             if result.get("create_request_json"):
                 result["create_request"] = json.loads(result["create_request_json"])
+            if result.get("protocol_descriptor_json"):
+                result["protocol_descriptor"] = json.loads(
+                    result["protocol_descriptor_json"])
+            if result.get("mutable_settings_json"):
+                result["mutable_settings"] = json.loads(result["mutable_settings_json"])
             return result
         rollover_id = str(uuid.uuid4())
         create_token = str(uuid.uuid4())
@@ -360,6 +408,13 @@ class Store:
         request.setdefault("metadata", {})["rollover_token"] = create_token
         encoded = json.dumps(request, sort_keys=True, separators=(",", ":"))
         request_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        request_protocol, request_mutable = _create_request_configuration(request)
+        if protocol_descriptor != request_protocol or mutable_settings != request_mutable:
+            raise ValueError(
+                "Rollover create request and configuration descriptors must match")
+        descriptor_json = json.dumps(
+            protocol_descriptor, sort_keys=True, separators=(",", ":"))
+        settings_json = json.dumps(mutable_settings, sort_keys=True, separators=(",", ":"))
         handover = self.pending_handover(old_session_id) if old_session_id else None
         if handover is not None:
             try:
@@ -374,17 +429,20 @@ class Store:
                 INSERT INTO session_rollovers(
                   id,provider,old_session_id,reason,requested_by,finalization_status,status,
                   creation_state,create_token,create_request_json,create_request_hash,
-                  handover_id,created_at)
-                VALUES(?,?,?,?,?,'pending','pending','not_attempted',?,?,?,?,?)
+                  handover_id,protocol_descriptor_json,mutable_settings_json,created_at)
+                VALUES(?,?,?,?,?,'pending','pending','not_attempted',?,?,?,?,?,?,?)
             """, (rollover_id, provider, old_session_id, reason, requested_by,
                   create_token, encoded, request_hash,
-                  handover["id"] if handover else None, utc_now()))
+                  handover["id"] if handover else None, descriptor_json, settings_json,
+                  utc_now()))
         return {
             "id": rollover_id, "provider": provider, "old_session_id": old_session_id,
             "reason": reason, "status": "pending", "creation_state": "not_attempted",
             "create_token": create_token, "create_request": request,
             "create_request_hash": request_hash,
             "handover_id": handover["id"] if handover else None,
+            "protocol_descriptor": json.loads(descriptor_json),
+            "mutable_settings": json.loads(settings_json),
         }
 
     def pending_session_rollover(self, provider: str) -> dict[str, Any] | None:
@@ -397,6 +455,10 @@ class Store:
         result = dict(row)
         if result.get("create_request_json"):
             result["create_request"] = json.loads(result["create_request_json"])
+        if result.get("protocol_descriptor_json"):
+            result["protocol_descriptor"] = json.loads(result["protocol_descriptor_json"])
+        if result.get("mutable_settings_json"):
+            result["mutable_settings"] = json.loads(result["mutable_settings_json"])
         return result
 
     def mark_session_rollover_create_started(self, rollover_id: str) -> None:
@@ -409,18 +471,20 @@ class Store:
             raise RuntimeError("Rollover remote creation is not safe to start again")
 
     def bind_session_rollover(self, rollover_id: str, new_session_id: str,
-                              agent_id: str | None, descriptor: dict[str, Any],
-                              mutable_settings: dict[str, Any],
+                              agent_id: str | None,
                               finalization_status: str) -> None:
         now = utc_now()
-        descriptor_json = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
-        settings_json = json.dumps(mutable_settings, sort_keys=True, separators=(",", ":"))
         row = self.connection.execute(
-            "SELECT provider FROM session_rollovers WHERE id=? AND status='pending' "
+            "SELECT provider,protocol_descriptor_json,mutable_settings_json "
+            "FROM session_rollovers WHERE id=? AND status='pending' "
             "AND creation_state='create_uncertain'", (rollover_id,)).fetchone()
         if row is None:
             raise RuntimeError("Rollover is not awaiting a remote create result")
         provider = row["provider"]
+        descriptor_json = row["protocol_descriptor_json"]
+        settings_json = row["mutable_settings_json"]
+        if descriptor_json is None or settings_json is None:
+            raise RuntimeError("Rollover has no durable configuration snapshot")
         with self.connection:
             self.connection.execute("""
                 INSERT INTO agent_session_bindings(
@@ -705,6 +769,15 @@ class Store:
     def create_handover(self, old_session_id: str, content: str, expires_at: str) -> str:
         pending = self.pending_handover(old_session_id)
         if pending is not None:
+            bound = self.connection.execute(
+                "SELECT 1 FROM session_rollovers WHERE handover_id=? AND status='pending'",
+                (pending["id"],)).fetchone()
+            if bound is None:
+                with self.connection:
+                    self.connection.execute(
+                        "UPDATE session_handovers SET content=?,created_at=?,expires_at=? "
+                        "WHERE id=? AND consumed_at IS NULL",
+                        (content, utc_now(), expires_at, pending["id"]))
             return pending["id"]
         handover_id = str(uuid.uuid4())
         with self.connection:

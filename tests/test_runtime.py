@@ -543,7 +543,7 @@ class StoreTests(unittest.TestCase):
             store = Store(path)
             action = store.begin_agent_tool_action(
                 "openai_agents", "session", "turn", "call", "clock", {})
-            self.assertEqual(14, store.connection.execute(
+            self.assertEqual(15, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertFalse(action["attachments_ephemeral"])
             self.assertEqual({"ok": True}, action["output"])
@@ -569,7 +569,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(14, store.connection.execute(
+            self.assertEqual(15, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
@@ -1076,7 +1076,8 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "openai_agents", "session-old", "explicit_new_chapter", "runtime", {
                     "environment": {"type": "none"}, "agent": seed._agent_config([]),
                     "input": "durable bootstrap", "metadata": {"managed_by": "resident"},
-                })
+                }, seed._agent_protocol(seed._agent_config([])),
+                seed._desired_mutable_settings())
             store.mark_session_rollover_create_started(rollover["id"])
             store.close()
 
@@ -1153,11 +1154,10 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "input": json.dumps({"new_session_bootstrap": {
                         "handover": "durable handover"}}),
                     "metadata": {"managed_by": "resident"},
-                })
+                }, descriptor, provider._desired_mutable_settings())
             store.mark_session_rollover_create_started(rollover["id"])
             store.bind_session_rollover(
-                rollover["id"], "session-new", None, descriptor,
-                provider._desired_mutable_settings(), "completed")
+                rollover["id"], "session-new", None, "completed")
             store.close()
 
             reopened = Store(path)
@@ -1194,7 +1194,8 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "resident.sqlite3"
             store = Store(path)
-            seed = OpenAIAgentsProvider("test-key", "model")
+            seed = OpenAIAgentsProvider(
+                "test-key", "model-a", reasoning_effort="low", service_tier="flex")
             descriptor = seed._agent_protocol(seed._agent_config([]))
             store.save_agent_session_binding("openai_agents", "session-old", None, None)
             store.save_session_protocol("openai_agents", "session-old", descriptor)
@@ -1203,20 +1204,25 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "environment": {"type": "none"}, "agent": seed._agent_config([]),
                     "input": "bootstrap-before-crash",
                     "metadata": {"managed_by": "resident"},
-                })
+                }, descriptor, seed._desired_mutable_settings())
             self.assertEqual("not_attempted", rollover["creation_state"])
             store.close()
 
             reopened = Store(path)
-            provider = OpenAIAgentsProvider("test-key", "model")
+            provider = OpenAIAgentsProvider(
+                "test-key", "model-b", reasoning_effort="high", service_tier="priority")
             creates = []
+            patches = []
 
             def fake_request(method, request_path, body=None, **_):
                 if method == "GET":
-                    return {"id": "session-old", "status": "idle",
-                            "agent": provider._agent_config([])}
+                    session_id = request_path.rsplit("/", 1)[-1]
+                    return {"id": session_id, "status": "idle", "agent": {}}
                 if method == "POST":
                     creates.append(body)
+                    return {"id": "session-new", "status": "idle"}
+                if method == "PATCH":
+                    patches.append(body)
                     return {"id": "session-new", "status": "idle"}
                 raise AssertionError((method, request_path, body))
 
@@ -1228,8 +1234,119 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(1, len(creates))
             self.assertEqual("bootstrap-before-crash", creates[0]["input"])
+            self.assertEqual("model-a", creates[0]["agent"]["model"])
             self.assertEqual(rollover["create_token"],
                              creates[0]["metadata"]["rollover_token"])
+            self.assertEqual(descriptor, reopened.session_protocol(
+                "openai_agents", "session-new"))
+            self.assertEqual(seed._desired_mutable_settings(),
+                             reopened.session_mutable_settings(
+                                 "openai_agents", "session-new"))
+
+            provider._ensure_session([], initial_input="reconcile-current-config")
+
+            self.assertEqual([{"agent": provider._desired_mutable_settings()}], patches)
+            self.assertEqual(provider._desired_mutable_settings(),
+                             reopened.session_mutable_settings(
+                                 "openai_agents", "session-new"))
+            runtime.close()
+
+    def test_recovered_rollover_keeps_immutable_snapshot_then_rolls_again(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            seed = OpenAIAgentsProvider("test-key", "model", agent_id="agent-a")
+            old_descriptor = seed._agent_protocol(seed._agent_config([]))
+            store.save_agent_session_binding(
+                "openai_agents", "session-old", "agent-a", None)
+            store.save_session_protocol("openai_agents", "session-old", old_descriptor)
+            first = store.begin_session_rollover(
+                "openai_agents", "session-old", "explicit_new_chapter", "runtime", {
+                    "environment": {"type": "none"}, "agent": seed._agent_config([]),
+                    "agent_id": "agent-a",
+                    "input": "bootstrap-a", "metadata": {"managed_by": "resident"},
+                }, old_descriptor, seed._desired_mutable_settings())
+            store.close()
+
+            reopened = Store(path)
+            provider = OpenAIAgentsProvider("test-key", "model", agent_id="agent-b")
+            new_tool = ToolSpec("new_contract", "New contract", {"type": "object"})
+            creates = []
+
+            def fake_request(method, request_path, body=None, **_):
+                if method == "GET":
+                    session_id = request_path.rsplit("/", 1)[-1]
+                    return {"id": session_id, "status": "idle", "agent": {}}
+                if method == "POST":
+                    creates.append(body)
+                    return {"id": f"session-new-{len(creates)}", "status": "idle"}
+                raise AssertionError((method, request_path, body))
+
+            provider._request = fake_request
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=reopened, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            provider._ensure_session([new_tool], initial_input="current-b")
+
+            self.assertEqual("bootstrap-a", creates[0]["input"])
+            self.assertEqual([], creates[0]["agent"]["tools"])
+            self.assertEqual(old_descriptor, reopened.session_protocol(
+                "openai_agents", "session-new-1"))
+            self.assertEqual("agent-a", reopened.agent_session_binding(
+                "openai_agents")["agent_id"])
+            self.assertTrue(provider.protocol_change_requires_rollover([new_tool]))
+
+            provider._ensure_session([new_tool], initial_input="bootstrap-b")
+
+            self.assertEqual(2, len(creates))
+            self.assertEqual("agent-b", creates[1]["agent_id"])
+            self.assertEqual("new_contract", creates[1]["agent"]["tools"][0]["name"])
+            self.assertNotEqual(first["id"], reopened.connection.execute(
+                "SELECT id FROM session_rollovers ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()[0])
+            runtime.close()
+
+    def test_recovered_rollover_with_unchanged_config_needs_no_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            seed = OpenAIAgentsProvider("test-key", "model")
+            descriptor = seed._agent_protocol(seed._agent_config([]))
+            store.save_agent_session_binding("openai_agents", "session-old", None, None)
+            store.save_session_protocol("openai_agents", "session-old", descriptor)
+            store.begin_session_rollover(
+                "openai_agents", "session-old", "explicit_new_chapter", "runtime", {
+                    "environment": {"type": "none"}, "agent": seed._agent_config([]),
+                    "input": "bootstrap-a", "metadata": {"managed_by": "resident"},
+                }, descriptor, seed._desired_mutable_settings())
+            store.close()
+
+            reopened = Store(path)
+            provider = OpenAIAgentsProvider("test-key", "model")
+            requests = []
+
+            def fake_request(method, request_path, body=None, **_):
+                requests.append((method, request_path, body))
+                if method == "GET":
+                    session_id = request_path.rsplit("/", 1)[-1]
+                    return {"id": session_id, "status": "idle",
+                            "agent": provider._agent_config([])}
+                if method == "POST":
+                    return {"id": "session-new", "status": "idle"}
+                raise AssertionError((method, request_path, body))
+
+            provider._request = fake_request
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=reopened, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            provider._ensure_session([], initial_input="ignored-current-input")
+            provider._ensure_session([], initial_input="ordinary-next-wake")
+
+            self.assertEqual(1, sum(
+                method == "POST" and request_path == "/agents/sessions"
+                for method, request_path, _ in requests))
+            self.assertFalse(any(method == "PATCH" for method, _, _ in requests))
+            self.assertFalse(provider.protocol_change_requires_rollover([]))
             runtime.close()
 
     def test_definitive_rollover_create_rejection_is_audited_as_failed(self):
@@ -1270,6 +1387,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 seed._agent_protocol(seed._agent_config([])))
             state = {"old_status": "in_progress", "items": {}}
             creates = []
+            submitted_contexts = []
 
             def fake_request(method, request_path, body=None, **_):
                 if request_path == "/agents/sessions/session-old" and method == "GET":
@@ -1289,6 +1407,9 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 if request_path.endswith("/events"):
                     session_id = request_path.split("/")[3]
                     event = body["events"][0]
+                    if event["type"] == "agent.session.input.message":
+                        submitted_contexts.append(
+                            event["input"][0]["content"][0]["text"])
                     turn_id = "turn-old-wake" if session_id == "session-old" else "turn-new"
                     state["items"][session_id] = [{
                         "id": f"{session_id}-input", "type": "message", "role": "user",
@@ -1298,6 +1419,8 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 if "/items?" in request_path:
                     session_id = request_path.split("/")[3]
                     return {"data": state["items"].get(session_id, [])}
+                if "/turns?" in request_path:
+                    return {"data": [{"id": "turn-new", "status": "completed"}]}
                 if "/turns/" in request_path:
                     return {"id": request_path.rsplit("/", 1)[-1], "status": "completed"}
                 raise AssertionError((method, request_path, body))
@@ -1310,18 +1433,29 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 diagnostic_output=lambda _: None)
 
             class Curator:
-                async def catch_up(self, final=False):
-                    return "carry this working context"
+                def __init__(self):
+                    self.calls = []
 
-            first_runtime.bind_curator(Curator())
+                async def catch_up(self, final=False):
+                    self.calls.append(final)
+                    if final:
+                        raise AssertionError("handover must not finalize while old session is active")
+                    return "draft after additional old-session activity"
+
+            first_curator = Curator()
+            first_runtime.bind_curator(first_curator)
             await first_runtime.process(WakeEvent(
                 "wake-old", "owner", "message", utc_now(), {"message_id": "message-old"}))
 
             handover = store.pending_handover("session-old")
-            self.assertIsNotNone(handover)
+            self.assertIsNone(handover)
             self.assertEqual("session-old", first_provider.session_id)
             self.assertEqual(0, len(creates))
-            handover_id = handover["id"]
+            self.assertEqual([False], first_curator.calls)
+            self.assertNotIn("new_session_bootstrap", json.loads(submitted_contexts[0]))
+            stale_handover_id = store.create_handover(
+                "session-old", "stale handover prepared before deferred activity",
+                (datetime.now(UTC) + timedelta(hours=1)).isoformat())
             first_runtime.close()
 
             state["old_status"] = "idle"
@@ -1333,24 +1467,50 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 capabilities=[], owner_output=lambda _: None,
                 diagnostic_output=lambda _: None)
 
-            class NoDuplicateCuration:
-                async def catch_up(self, final=False):
-                    raise AssertionError("durable handover must be reused")
+            class FinalCurator:
+                def __init__(self):
+                    self.calls = []
 
-            restarted.bind_curator(NoDuplicateCuration())
+                async def catch_up(self, final=False):
+                    self.calls.append(final)
+                    if final:
+                        self.assert_old_activity_curated()
+                    return ("final handover including additional old-session activity"
+                            if final else None)
+
+                @staticmethod
+                def assert_old_activity_curated():
+                    if not any(item["id"] == "session-old-input"
+                               for item in state["items"].get("session-old", [])):
+                        raise AssertionError("final catch-up missed deferred old-session activity")
+
+            final_curator = FinalCurator()
+            restarted.bind_curator(final_curator)
             await restarted.process(WakeEvent(
                 "wake-new", "connector", "changed", utc_now(), {}))
 
             self.assertEqual("session-new", replacement.session_id)
             self.assertEqual(1, len(creates))
             self.assertEqual(
-                "carry this working context",
+                "final handover including additional old-session activity",
                 json.loads(creates[0]["input"])["new_session_bootstrap"]["handover"])
+            self.assertTrue(final_curator.calls[0])
+            handover = reopened.connection.execute(
+                "SELECT id,new_session_id,consumed_at FROM session_handovers "
+                "WHERE old_session_id='session-old'").fetchone()
+            handover_id = handover["id"]
+            self.assertEqual(stale_handover_id, handover_id)
             consumed = reopened.connection.execute(
                 "SELECT new_session_id,consumed_at FROM session_handovers WHERE id=?",
                 (handover_id,)).fetchone()
             self.assertEqual("session-new", consumed["new_session_id"])
             self.assertIsNotNone(consumed["consumed_at"])
+            await restarted.process(WakeEvent(
+                "wake-after", "connector", "changed", utc_now(), {}))
+            self.assertEqual(1, len(creates))
+            self.assertEqual(1, reopened.connection.execute(
+                "SELECT COUNT(*) FROM session_handovers WHERE id=? AND consumed_at IS NOT NULL",
+                (handover_id,)).fetchone()[0])
             restarted.close()
 
     async def test_remote_404_replacement_receives_degraded_new_session_bootstrap(self):
@@ -2091,7 +2251,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             store = Store(path)
 
-            self.assertEqual(14, store.connection.execute(
+            self.assertEqual(15, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertIsNone(store.connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone())

@@ -82,8 +82,10 @@ class ResidentRuntime:
                 lambda session_id, settings: self.store.save_session_mutable_settings(
                     "openai_agents", session_id, settings),
                 lambda: self.store.pending_session_rollover("openai_agents"),
-                lambda old, reason, requested_by, request: self.store.begin_session_rollover(
-                    "openai_agents", old, reason, requested_by, request),
+                lambda old, reason, requested_by, request, protocol, mutable:
+                    self.store.begin_session_rollover(
+                        "openai_agents", old, reason, requested_by, request,
+                        protocol, mutable),
                 self.store.mark_session_rollover_create_started,
                 self.store.bind_session_rollover,
                 self.store.complete_session_rollover,
@@ -300,30 +302,40 @@ class ResidentRuntime:
                 current_run_id=run_id,
                 owner_communication_enabled=self.config.owner_communication_enabled)
             protocol_rollover = getattr(self.provider, "protocol_change_requires_rollover", None)
-            new_session = (getattr(self.provider, "session_id", None) is None or
-                           not getattr(self.provider, "session_protocol_known", True))
+            new_session = getattr(self.provider, "session_id", None) is None
             handover = None
             handover_id = None
             needs_rollover = protocol_rollover is not None and protocol_rollover(registry.specs)
             unknown_restored_protocol = (
                 getattr(self.provider, "session_id", None) is not None and
                 not getattr(self.provider, "session_protocol_known", True))
-            if needs_rollover or unknown_restored_protocol:
-                new_session = True
+            rollover_ready = bool(getattr(self.provider, "rollover_ready", True))
+            if needs_rollover and (rollover_ready or unavailable_reason is not None):
                 old_session_id = getattr(self.provider, "session_id", None)
-                pending_handover = (
-                    self.store.pending_handover(old_session_id) if old_session_id else None)
-                if pending_handover is not None:
+                pending_rollover = self.store.pending_session_rollover("openai_agents")
+                pending_handover = self.store.pending_handover(old_session_id) if (
+                    old_session_id and pending_rollover is not None) else None
+                if pending_rollover is not None and pending_handover is not None:
+                    # This handover is already final for a durable create snapshot.
                     handover = pending_handover["content"]
                     handover_id = pending_handover["id"]
                 elif self.curator is not None and unavailable_reason is None:
                     handover = await self.curator.catch_up(final=True)
                 elif unavailable_reason is not None:
                     handover = _DEGRADED_HANDOVER
-                if old_session_id and handover and needs_rollover and handover_id is None:
-                    handover_id = self.store.create_handover(
-                        old_session_id, handover,
-                        (datetime.now(UTC) + timedelta(hours=24)).isoformat())
+                confirm_rollover = getattr(self.provider, "confirm_rollover_ready", None)
+                confirmed = (unavailable_reason is not None or confirm_rollover is None
+                             or await confirm_rollover())
+                if confirmed:
+                    new_session = True
+                    if old_session_id and handover and handover_id is None:
+                        handover_id = self.store.create_handover(
+                            old_session_id, handover,
+                            (datetime.now(UTC) + timedelta(hours=24)).isoformat())
+                else:
+                    handover = None
+            elif unknown_restored_protocol:
+                new_session = True
             if new_session:
                 context_document["new_session_bootstrap"] = {
                     "durable_memory_awareness": self.store.memory_awareness(limit=8),

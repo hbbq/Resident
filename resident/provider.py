@@ -163,16 +163,19 @@ class OpenAIAgentsProvider:
         self._load_mutable: Callable[[str], dict | None] = lambda _session_id: None
         self._save_mutable: Callable[[str, dict], None] = lambda *_: None
         self._load_pending_rollover: Callable[[], dict | None] = lambda: None
-        self._begin_rollover: Callable[[str | None, str, str, dict], dict] = (
-            lambda old, reason, requested_by, request: {
+        self._begin_rollover: Callable[..., dict] = (
+            lambda old, reason, requested_by, request, protocol, mutable: {
                 "id": "", "old_session_id": old, "reason": reason,
-                "creation_state": "not_attempted", "create_request": request})
+                "creation_state": "not_attempted", "create_request": request,
+                "protocol_descriptor": protocol, "mutable_settings": mutable})
         self._mark_rollover_create_started: Callable[[str], None] = lambda *_: None
         self._bind_rollover: Callable[..., None] = lambda *_: None
         self._complete_rollover: Callable[[str], None] = lambda *_: None
         self._fail_rollover: Callable[[str, str], None] = lambda *_: None
         self._requested_rollover_reason: str | None = None
         self._unavailable_session_id: str | None = None
+        self._preflight_session_status: str | None = None
+        self._confirmed_rollover_session: dict[str, Any] | None = None
         self._lifecycle_bound = False
 
     def bind_session_store(self, load: Callable[[], dict | None],
@@ -216,6 +219,13 @@ class OpenAIAgentsProvider:
             self._mutable_settings_descriptor = load_mutable(self._session_id)
         pending = load_pending_rollover()
         if pending is not None:
+            if self._session_id is None and pending.get("old_session_id") is not None:
+                # A durable create attempt takes precedence over a newly desired
+                # saved Agent ID until its recorded configuration is replayed.
+                self._session_id = pending["old_session_id"]
+                self._last_turn_id = None
+                self._protocol_descriptor = load_protocol(self._session_id)
+                self._mutable_settings_descriptor = load_mutable(self._session_id)
             self._requested_rollover_reason = pending["reason"]
 
     @property
@@ -231,21 +241,50 @@ class OpenAIAgentsProvider:
             raise ValueError("Session rollover reason must be nonempty")
         self._requested_rollover_reason = reason.strip()
 
+    @property
+    def rollover_ready(self) -> bool:
+        """Whether the most recent preflight found the old session idle."""
+        return (self._session_id is None or self._unavailable_session_id == self._session_id
+                or self._preflight_session_status == "idle")
+
     async def preflight_session(self) -> str | None:
         """Detect an unavailable restored session before wake context is built."""
         session_id = self._session_id
         if session_id is None:
+            self._preflight_session_status = None
             return None
         try:
-            await asyncio.to_thread(
+            session = await asyncio.to_thread(
                 self._request, "GET", f"/agents/sessions/{session_id}")
         except RuntimeError as exc:
             if "HTTP 404" not in str(exc):
                 raise
             self._unavailable_session_id = session_id
+            self._preflight_session_status = None
             self._requested_rollover_reason = "remote_session_missing"
             return "remote_session_missing"
+        self._preflight_session_status = session.get("status")
         return None
+
+    async def confirm_rollover_ready(self) -> bool:
+        """Recheck idleness and preserve that exact observation for creation."""
+        session_id = self._session_id
+        if session_id is None or self._unavailable_session_id == session_id:
+            return True
+        try:
+            session = await asyncio.to_thread(
+                self._request, "GET", f"/agents/sessions/{session_id}")
+        except RuntimeError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+            self._unavailable_session_id = session_id
+            self._preflight_session_status = None
+            self._confirmed_rollover_session = None
+            self._requested_rollover_reason = "remote_session_missing"
+            return True
+        self._preflight_session_status = session.get("status")
+        self._confirmed_rollover_session = session if session.get("status") == "idle" else None
+        return self._confirmed_rollover_session is not None
 
     async def session_items(self, cursor: str | None, limit: int = 50) -> SessionItemPage:
         if self._session_id is None:
@@ -441,7 +480,11 @@ class OpenAIAgentsProvider:
                     "remote_session_missing", agent, desired_protocol,
                     initial_input, allow_create, finalization_status="unavailable")
             try:
-                session = self._request("GET", f"/agents/sessions/{self._session_id}")
+                confirmed = self._confirmed_rollover_session
+                self._confirmed_rollover_session = None
+                session = (confirmed if confirmed is not None
+                           and confirmed.get("id") == self._session_id else
+                           self._request("GET", f"/agents/sessions/{self._session_id}"))
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
@@ -551,8 +594,10 @@ class OpenAIAgentsProvider:
         }
         if self.agent_id:
             body["agent_id"] = self.agent_id
+        mutable_settings = self._desired_mutable_settings()
         rollover = self._lifecycle_call(
-            self._begin_rollover, old_session_id, reason, "runtime", body)
+            self._begin_rollover, old_session_id, reason, "runtime", body,
+            descriptor, mutable_settings)
         rollover_id = rollover["id"]
         if rollover.get("creation_state") == "create_uncertain":
             raise RolloverRecoveryRequired(
@@ -567,28 +612,34 @@ class OpenAIAgentsProvider:
         persisted_body = rollover.get("create_request")
         if not isinstance(persisted_body, dict):
             raise RuntimeError(f"Rollover {rollover_id} has no durable create request")
+        persisted_descriptor = rollover.get("protocol_descriptor")
+        persisted_mutable = rollover.get("mutable_settings")
+        if not isinstance(persisted_descriptor, dict) or not isinstance(persisted_mutable, dict):
+            raise RuntimeError(f"Rollover {rollover_id} has no durable configuration snapshot")
         self._lifecycle_call(self._mark_rollover_create_started, rollover_id)
         try:
             session = self._request("POST", "/agents/sessions", persisted_body)
             new_session_id = session["id"]
-            mutable_settings = self._desired_mutable_settings()
             if self._lifecycle_bound:
                 self._lifecycle_call(
-                    self._bind_rollover, rollover_id, new_session_id, self.agent_id,
-                    descriptor, mutable_settings, finalization_status)
+                    self._bind_rollover, rollover_id, new_session_id,
+                    persisted_descriptor.get("saved_agent_id"),
+                    finalization_status)
             self._session_id, self._last_turn_id = new_session_id, None
             self._unavailable_session_id = None
             self._requested_rollover_reason = None
-            self._protocol_descriptor = descriptor
-            self._mutable_settings_descriptor = mutable_settings
-            self._tool_fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
+            self._protocol_descriptor = persisted_descriptor
+            self._mutable_settings_descriptor = persisted_mutable
+            self._tool_fingerprint = json.dumps(
+                persisted_body.get("agent", {}), sort_keys=True, separators=(",", ":"))
             if self._lifecycle_bound:
                 self._pending_binding = None
                 self._lifecycle_call(self._complete_rollover, rollover_id)
             else:
-                self._persist_binding(new_session_id, self.agent_id, None)
-                self._save_protocol(new_session_id, descriptor)
-                self._save_mutable(new_session_id, mutable_settings)
+                self._persist_binding(
+                    new_session_id, persisted_descriptor.get("saved_agent_id"), None)
+                self._save_protocol(new_session_id, persisted_descriptor)
+                self._save_mutable(new_session_id, persisted_mutable)
             return session, True
         except Exception as exc:
             if self._definitive_create_rejection(exc):
