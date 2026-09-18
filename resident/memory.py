@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
@@ -17,26 +18,81 @@ _AUTHORIZATION = re.compile(
     r"(?:[^\r\n]+)"
 )
 _BEARER = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+")
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*?"
+    r"-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
+    re.DOTALL,
+)
+_URL = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"']+")
 _LABELED_SECRET = re.compile(
-    r"(?i)(\b(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|auth[-_ ]?token|"
-    r"token|password|passwd|client[-_ ]?secret|secret|cookie|credentials?)"
-    r"\s*(?::|=|\bis\b|\bare\b)\s*)"
+    r"(?i)((?<![A-Za-z0-9])(?:aws[-_ ]?|azure[-_ ]?|gcp[-_ ]?|google[-_ ]?)?"
+    r"(?:api[-_ ]?key|access[-_ ]?key(?:[-_ ]?id)?|secret[-_ ]?access[-_ ]?key|"
+    r"access[-_ ]?token|refresh[-_ ]?token|auth[-_ ]?token|token|password|passwd|pwd|"
+    r"client[-_ ]?secret|private[-_ ]?key|secret|cookie|credentials?|account[-_ ]?key|"
+    r"shared[-_ ]?access[-_ ]?signature|sas[-_ ]?token|connection[-_ ]?string)"
+    r"[\"']?\s*(?::|=|\bis\b|\bare\b)\s*)"
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n}\]]+)"
 )
 _COMMON_TOKEN = re.compile(
     r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{8,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|"
     r"(?:AKIA|ASIA)[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{8,}|"
     r"github_pat_[A-Za-z0-9_]{12,}|glpat-[A-Za-z0-9_-]{8,}|"
-    r"xox[a-z]-[A-Za-z0-9-]{8,}|npm_[A-Za-z0-9]{8,}|"
+    r"xox[a-z]-[A-Za-z0-9-]{8,}|npm_[A-Za-z0-9]{8,}|ya29\.[A-Za-z0-9_-]{8,}|"
     r"pypi-[A-Za-z0-9_-]{12,}|hf_[A-Za-z0-9]{12,}|"
     r"AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\."
     r"[A-Za-z0-9_-]+)"
 )
 _REDACTED = "[REDACTED]"
+_CREDENTIAL_FIELD_NAMES = {
+    "accountkey", "apikey", "authentication", "authorization", "clientsecret",
+    "connectionstring", "cookie", "credential", "credentials", "password", "passwd",
+    "privatekey", "pwd", "refreshtoken", "sas", "sastoken", "secret",
+    "secretaccesskey", "sharedaccesssignature", "token",
+}
+
+
+def _redact_connection_structures(value: str) -> str:
+    """Drop complete semicolon-delimited credential-bearing structures."""
+    protected: list[str] = []
+    for line in value.splitlines(keepends=True):
+        ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        body = line[:-len(ending)] if ending else line
+        assignments = []
+        for field in body.split(";"):
+            if "=" not in field:
+                continue
+            key, _ = field.split("=", 1)
+            # A display label may precede the first connection-string key.
+            key = key.rsplit(":", 1)[-1]
+            assignments.append("".join(character for character in key.lower()
+                                       if character.isalnum()))
+        if len(assignments) >= 2 and any(
+                key in _CREDENTIAL_FIELD_NAMES or key.endswith("password")
+                or key.endswith("secret") or key.endswith("token")
+                or key.endswith("apikey") for key in assignments):
+            protected.append("[REDACTED CREDENTIAL STRUCTURE]" + ending)
+        else:
+            protected.append(line)
+    return "".join(protected)
 
 
 def _redact_text(value: str) -> str:
-    """Redact common complete credentials without retaining their values."""
+    """Protect recognizable credential structures while retaining benign prose."""
+    value = _PRIVATE_KEY_BLOCK.sub("[REDACTED PRIVATE KEY]", value)
+    value = _redact_connection_structures(value)
+
+    def redact_credential_url(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+        except ValueError:
+            return "[REDACTED CREDENTIAL URL]" if "@" in candidate else candidate
+        # A password-bearing userinfo component is itself a credential. Drop the
+        # complete URL so neither the password nor a potentially sensitive user,
+        # host, path, or query survives in excerpts or hashes.
+        return "[REDACTED CREDENTIAL URL]" if parsed.password is not None else candidate
+
+    value = _URL.sub(redact_credential_url, value)
     value = _AUTHORIZATION.sub(r"\1[REDACTED]", value)
     value = _BEARER.sub(r"\1[REDACTED]", value)
     value = _LABELED_SECRET.sub(r"\1[REDACTED]", value)
@@ -313,17 +369,24 @@ class MemoryCurator:
                 clean["confidence"] = mutation["confidence"]
             provenance = []
             proposed_provenance = mutation.get("provenance", [])
-            if not isinstance(proposed_provenance, list):
-                proposed_provenance = []
+            if not isinstance(proposed_provenance, list) or not proposed_provenance:
+                continue
             referenced_ids: set[str] = set()
+            valid = True
             for evidence in proposed_provenance:
                 if not isinstance(evidence, dict):
-                    continue
+                    valid = False
+                    break
                 item_id = evidence.get("item_id")
-                if item_id not in known_items or item_id in referenced_ids:
+                if item_id not in known_items:
+                    valid = False
+                    break
+                if item_id in referenced_ids:
                     continue
                 referenced_ids.add(item_id)
                 provenance.append(_source_evidence(session_id, known_items[item_id]))
+            if not valid or not provenance:
+                continue
             clean["provenance"] = provenance
             accepted.append(clean)
         return accepted

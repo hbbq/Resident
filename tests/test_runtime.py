@@ -922,6 +922,56 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"agent": {"reasoning": None, "service_tier": None}},
                          requests[-1][2])
 
+    def test_agents_mutable_settings_cover_all_transitions(self):
+        cases = (
+            ("unset to set", {}, "high", "priority",
+             {"reasoning": {"effort": "high"}, "service_tier": "priority"}),
+            ("set to different", {"reasoning": {"effort": "low"},
+                                  "service_tier": "default"}, "high", "priority",
+             {"reasoning": {"effort": "high"}, "service_tier": "priority"}),
+            ("set to unset", {"reasoning": {"effort": "high"},
+                              "service_tier": "priority"}, None, None,
+             {"reasoning": None, "service_tier": None}),
+            ("unchanged", {"reasoning": {"effort": "high"},
+                           "service_tier": "priority"}, "high", "priority", {}),
+            ("unset unchanged", {}, None, None, {}),
+        )
+        for name, remote_settings, reasoning, service_tier, expected in cases:
+            with self.subTest(name=name):
+                provider = OpenAIAgentsProvider(
+                    "test-key", "gpt-5.6-luna", reasoning_effort=reasoning,
+                    service_tier=service_tier)
+                remote = {"model": "gpt-5.6-luna", **remote_settings}
+                self.assertEqual(expected, provider._mutable_patch(remote))
+
+    def test_agents_missing_mutable_settings_are_patched_without_rollover(self):
+        provider = OpenAIAgentsProvider(
+            "test-key", "gpt-5.6-luna", reasoning_effort="high",
+            service_tier="priority")
+        provider._session_id = "session-1"
+        remote_agent = provider._agent_config([])
+        remote_agent.pop("reasoning")
+        remote_agent.pop("service_tier")
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path, body))
+            if method == "GET":
+                return {"id": "session-1", "status": "idle", "agent": remote_agent}
+            if method == "PATCH":
+                return {"id": "session-1", "status": "idle"}
+            raise AssertionError((method, path, body))
+
+        provider._request = fake_request
+        session, created = provider._ensure_session([], initial_input="wake")
+
+        self.assertFalse(created)
+        self.assertEqual("session-1", session["id"])
+        self.assertEqual(["GET", "PATCH"], [request[0] for request in requests])
+        self.assertEqual({"agent": {
+            "reasoning": {"effort": "high"}, "service_tier": "priority",
+        }}, requests[-1][2])
+
     async def test_remote_404_replacement_receives_degraded_new_session_bootstrap(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
@@ -935,7 +985,8 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             store.apply_curator_batch(
                 "openai_agents", "session-missing", "item-1", "item-1", "memory-1",
                 [{"memory_id": "memory-1", "operation": "create", "kind": "place",
-                  "content": "The greenhouse has a north bed."}])
+                  "content": "The greenhouse has a north bed.",
+                  "provenance": [{"item_id": "item-1"}]}])
             creates = []
 
             def fake_request(method, path, body=None, **_):

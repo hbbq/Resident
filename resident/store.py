@@ -27,10 +27,31 @@ _SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "wakeup.scheduled": ("schedule_id", "due_at"),
 }
 _SAFE_JOURNAL_EVENT_LIMIT = 50
+MAX_OWNER_GUIDANCE_ENTRY_BYTES = 4096
+MAX_ACTIVE_OWNER_GUIDANCE_COUNT = 16
+MAX_ACTIVE_OWNER_GUIDANCE_BYTES = 32768
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _validate_owner_guidance_projection(entries: list[dict[str, Any]]) -> None:
+    if len(entries) > MAX_ACTIVE_OWNER_GUIDANCE_COUNT:
+        raise ValueError(
+            f"Active Owner guidance exceeds {MAX_ACTIVE_OWNER_GUIDANCE_COUNT} entries; "
+            "replace or remove an existing entry")
+    if any(len(entry["content"].encode("utf-8")) > MAX_OWNER_GUIDANCE_ENTRY_BYTES
+           for entry in entries):
+        raise ValueError(
+            f"Owner guidance exceeds {MAX_OWNER_GUIDANCE_ENTRY_BYTES} UTF-8 bytes")
+    encoded = json.dumps(
+        entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if len(encoded) > MAX_ACTIVE_OWNER_GUIDANCE_BYTES:
+        raise ValueError(
+            f"Active Owner guidance exceeds {MAX_ACTIVE_OWNER_GUIDANCE_BYTES} "
+            "serialized UTF-8 bytes; replace or remove an existing entry")
 
 
 class Store:
@@ -333,6 +354,8 @@ class Store:
                             mutations: list[dict[str, Any]],
                             handover_draft: str | None = None) -> bool:
         """Atomically apply validated curator decisions and advance its source checkpoint."""
+        if any(not mutation.get("provenance") for mutation in mutations):
+            raise ValueError("Durable Curator memory requires verified provenance")
         now = utc_now()
         with self.connection:
             claimed = self.connection.execute("""
@@ -463,28 +486,43 @@ class Store:
         return result
 
     def active_owner_guidance(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.connection.execute("""
+        entries = [dict(row) for row in self.connection.execute("""
             SELECT id,content,revision,updated_at FROM owner_guidance
             WHERE status='active' ORDER BY updated_at,id
         """)]
+        _validate_owner_guidance_projection(entries)
+        return entries
 
     def set_owner_guidance(self, content: str, *, guidance_id: str | None = None,
                            source_session_id: str | None = None,
                            source_item_id: str | None = None) -> str:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Owner guidance must be nonempty text")
+        if len(content.encode("utf-8")) > MAX_OWNER_GUIDANCE_ENTRY_BYTES:
+            raise ValueError(
+                f"Owner guidance exceeds {MAX_OWNER_GUIDANCE_ENTRY_BYTES} UTF-8 bytes")
         guidance_id = guidance_id or str(uuid.uuid4())
         now = utc_now()
-        current = self.connection.execute(
-            "SELECT revision FROM owner_guidance WHERE id=?", (guidance_id,)).fetchone()
         with self.connection:
+            current = self.connection.execute(
+                "SELECT revision FROM owner_guidance WHERE id=?", (guidance_id,)).fetchone()
+            revision = (current["revision"] + 1) if current else 1
+            prospective = [dict(row) for row in self.connection.execute("""
+                SELECT id,content,revision,updated_at FROM owner_guidance
+                WHERE status='active' AND id<>? ORDER BY updated_at,id
+            """, (guidance_id,))]
+            prospective.append({"id": guidance_id, "content": content,
+                                "revision": revision, "updated_at": now})
+            prospective.sort(key=lambda entry: (entry["updated_at"], entry["id"]))
+            _validate_owner_guidance_projection(prospective)
             self.connection.execute("""
                 INSERT INTO owner_guidance(id,content,status,revision,source_session_id,
                   source_item_id,created_at,updated_at) VALUES(?,?,'active',?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET content=excluded.content,status='active',
                   revision=excluded.revision,source_session_id=excluded.source_session_id,
                   source_item_id=excluded.source_item_id,updated_at=excluded.updated_at
-            """, (guidance_id, content, (current["revision"] + 1) if current else 1,
+            """, (guidance_id, content, revision,
                   source_session_id, source_item_id, now, now))
-            revision = (current["revision"] + 1) if current else 1
             self.connection.execute("""
                 INSERT INTO owner_guidance_revisions(
                   guidance_id,revision,operation,content,source_session_id,source_item_id,created_at)

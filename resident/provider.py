@@ -569,12 +569,18 @@ class OpenAIAgentsProvider:
             return {}
         desired = self._agent_config(())
         patch: dict[str, Any] = {}
-        for key in ("model", "reasoning", "service_tier"):
-            # A partial legacy session response cannot prove mutable drift.
-            # The session update contract clears reasoning/service tier with
-            # JSON null, so absence from the desired config remains meaningful.
-            if key in remote_agent and remote_agent.get(key) != desired.get(key):
-                patch[key] = desired.get(key)
+        # A partial legacy response cannot prove model drift. Reasoning and
+        # service tier differ: their documented absent state is the default,
+        # so an explicit configured value must be applied on unset -> set and
+        # JSON null must still be sent for set -> unset.
+        if "model" in remote_agent and remote_agent.get("model") != desired.get("model"):
+            patch["model"] = desired.get("model")
+        for key in ("reasoning", "service_tier"):
+            if key in desired:
+                if remote_agent.get(key) != desired[key]:
+                    patch[key] = desired[key]
+            elif key in remote_agent and remote_agent.get(key) is not None:
+                patch[key] = None
         return patch
 
     def protocol_change_requires_rollover(self, tools: Sequence[ToolSpec]) -> bool:

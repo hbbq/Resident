@@ -6,8 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from resident.context import ContextBuilder
+from resident.domain import Identity, WakeEvent
 from resident.memory import MemoryCurator, SessionItemPage
-from resident.store import Store
+from resident.store import (MAX_ACTIVE_OWNER_GUIDANCE_BYTES,
+                            MAX_ACTIVE_OWNER_GUIDANCE_COUNT,
+                            MAX_OWNER_GUIDANCE_ENTRY_BYTES, Store, utc_now)
 
 
 class FakeSource:
@@ -191,9 +195,16 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
 
             async def session_items(self, cursor, limit):
                 text = ("Owner prefers jasmine tea. " + " ".join(secrets) +
+                        "\nUseful link: https://example.com/gardening?topic=tea"
+                        "\nDatabase: postgresql://alice:correct-horse@db.example/app"
                         "\nAuthentication: opaque-auth-value"
                         "\nBearer opaque-bearer-value"
-                        "\nAPI token=opaque-api-token")
+                        "\nAPI token=opaque-api-token"
+                        "\nAWS_SECRET_ACCESS_KEY=cloud-secret-value"
+                        "\nConnection: Server=db.internal;User Id=resident;Password=connection-secret"
+                        "\nConfig: {\"client_secret\":\"json-secret\",\"region\":\"north\"}"
+                        "\n-----BEGIN PRIVATE KEY-----\nprivate-key-material"
+                        "\n-----END PRIVATE KEY-----")
                 return SessionItemPage(({
                     "id": "message-1", "type": "message", "role": "user",
                     "content": [{"type": "input_text", "text": text}],
@@ -207,11 +218,96 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
 
             model_input = json.dumps(model.pages)
             self.assertIn("Owner prefers jasmine tea.", model_input)
+            self.assertIn("https://example.com/gardening?topic=tea", model_input)
             self.assertNotIn("must not cross", model_input)
             for secret in (*secrets, "opaque-auth-value", "opaque-bearer-value",
-                           "opaque-api-token"):
+                           "opaque-api-token", "correct-horse", "alice", "db.example",
+                           "cloud-secret-value", "connection-secret", "db.internal",
+                           "json-secret", "private-key-material"):
                 self.assertNotIn(secret, model_input)
-            self.assertGreaterEqual(model_input.count("[REDACTED]"), len(secrets) + 3)
+            self.assertIn("[REDACTED CREDENTIAL URL]", model_input)
+            self.assertIn("[REDACTED CREDENTIAL STRUCTURE]", model_input)
+            self.assertIn("[REDACTED PRIVATE KEY]", model_input)
+            self.assertIn("region", model_input)
+            self.assertGreaterEqual(model_input.count("[REDACTED]"), len(secrets) + 4)
+            store.close()
+
+    async def test_curator_output_credentials_are_removed_before_durable_persistence(self):
+        private_key = ("-----BEGIN PRIVATE KEY-----\ncurator-private-material\n"
+                       "-----END PRIVATE KEY-----")
+        secrets = ("db-password", "bearer-output", "cloud-output", "api-output",
+                   "curator-private-material")
+
+        class OutputSource:
+            session_id = "output-session"
+
+            async def session_items(self, cursor, limit):
+                return SessionItemPage(({
+                    "id": "observed-1", "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "The greenhouse needs water."}],
+                },), "observed-1", False)
+
+        class CredentialOutputModel:
+            async def curate(self, session_id, items, existing):
+                return {"mutations": [{
+                    "operation": "create", "kind": "fact",
+                    "content": ("Water plants; postgresql://resident:db-password@db.local/home; "
+                                "Authorization: Bearer bearer-output; "
+                                "AWS_SECRET_ACCESS_KEY=cloud-output; "
+                                "api_key=api-output; " + private_key),
+                    "rationale": "Authorization: Bearer bearer-output",
+                    "provenance": [{"item_id": "observed-1"}],
+                }], "handover": "Continue safely. " + private_key + " api_key=api-output"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            handover = await MemoryCurator(
+                store, OutputSource(), CredentialOutputModel()).catch_up()
+            persisted = "\n".join(store.connection.iterdump()) + str(handover)
+            for secret in secrets:
+                self.assertNotIn(secret, persisted)
+            self.assertIn("The greenhouse needs water.",
+                          store.memory(store.search_memories()[0]["id"])["provenance"][0]["excerpt"])
+            store.close()
+
+    async def test_only_fully_grounded_mutations_are_persisted_and_checkpointed(self):
+        class GroundingSource:
+            session_id = "grounding-session"
+
+            async def session_items(self, cursor, limit):
+                if cursor is not None:
+                    return SessionItemPage((), cursor, False)
+                return SessionItemPage(({
+                    "id": "real-1", "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "I grow basil."}],
+                },), "real-1", False)
+
+        class GroundingModel:
+            async def curate(self, session_id, items, existing):
+                base = {"operation": "create", "kind": "fact"}
+                return {"mutations": [
+                    {**base, "memory_id": "missing", "content": "missing"},
+                    {**base, "memory_id": "nonexistent", "content": "nonexistent",
+                     "provenance": [{"item_id": "invented"}]},
+                    {**base, "memory_id": "mixed", "content": "mixed",
+                     "provenance": [{"item_id": "real-1"}, {"item_id": "invented"}]},
+                    {**base, "memory_id": "grounded", "content": "Owner grows basil",
+                     "provenance": [{"item_id": "real-1"}]},
+                ]}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            curator = MemoryCurator(store, GroundingSource(), GroundingModel())
+            await curator.catch_up()
+            await curator.catch_up()
+
+            self.assertEqual(["grounded"], [memory["id"] for memory in store.search_memories()])
+            self.assertEqual("real-1", store.memory("grounded")["provenance"][0][
+                "source_item_id"])
+            self.assertEqual("real-1", store.curator_checkpoint(
+                "openai_agents", "grounding-session")["cursor"])
+            self.assertEqual(1, store.connection.execute(
+                "SELECT count(*) FROM curator_operations").fetchone()[0])
             store.close()
 
     async def test_repeated_cursor_fails_without_looping(self):
@@ -317,11 +413,14 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
             store.apply_curator_batch("openai_agents", "s", "one", "one", "batch-1", [{
-                "memory_id": "m", "operation": "create", "kind": "fact", "content": "old"}])
+                "memory_id": "m", "operation": "create", "kind": "fact", "content": "old",
+                "provenance": [{"item_id": "one"}]}])
             store.apply_curator_batch("openai_agents", "s", "two", "two", "batch-2", [{
-                "memory_id": "m", "operation": "update", "content": "new"}])
+                "memory_id": "m", "operation": "update", "content": "new",
+                "provenance": [{"item_id": "two"}]}])
             store.apply_curator_batch("openai_agents", "s", "three", "three", "batch-3", [{
-                "memory_id": "m", "operation": "invalidate", "content": "incorrect"}])
+                "memory_id": "m", "operation": "invalidate", "content": "incorrect",
+                "provenance": [{"item_id": "three"}]}])
 
             self.assertEqual([], store.search_memories())
             self.assertEqual(3, store.connection.execute(
@@ -340,6 +439,62 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(3, store.connection.execute(
                 "SELECT count(*) FROM owner_guidance_revisions WHERE guidance_id=?",
                 (guidance_id,)).fetchone()[0])
+            store.close()
+
+    async def test_owner_guidance_enforces_entry_and_active_set_bounds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                store.set_owner_guidance("x" * (MAX_OWNER_GUIDANCE_ENTRY_BYTES + 1))
+            self.assertEqual(0, store.connection.execute(
+                "SELECT count(*) FROM owner_guidance_revisions").fetchone()[0])
+
+            ids = [store.set_owner_guidance(f"guidance-{index}")
+                   for index in range(MAX_ACTIVE_OWNER_GUIDANCE_COUNT)]
+            with self.assertRaisesRegex(ValueError, "replace or remove"):
+                store.set_owner_guidance("one too many")
+
+            store.set_owner_guidance("replacement", guidance_id=ids[0])
+            self.assertEqual(2, store.connection.execute(
+                "SELECT count(*) FROM owner_guidance_revisions WHERE guidance_id=?",
+                (ids[0],)).fetchone()[0])
+            self.assertTrue(store.remove_owner_guidance(ids[1]))
+            replacement_id = store.set_owner_guidance("replacement after removal")
+            self.assertEqual(MAX_ACTIVE_OWNER_GUIDANCE_COUNT,
+                             len(store.active_owner_guidance()))
+            self.assertEqual(2, store.connection.execute(
+                "SELECT count(*) FROM owner_guidance_revisions WHERE guidance_id=?",
+                (ids[1],)).fetchone()[0])
+            self.assertIn(replacement_id,
+                          {entry["id"] for entry in store.active_owner_guidance()})
+
+            context = json.loads(ContextBuilder(store).build(
+                Identity("resident", "Resident"), Identity("owner", "Owner"),
+                WakeEvent("wake", "test", "bounded", utc_now(), {}), []))
+            projection = context["standing_owner_guidance"]
+            self.assertEqual(MAX_ACTIVE_OWNER_GUIDANCE_COUNT, len(projection))
+            self.assertLessEqual(len(json.dumps(
+                projection, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")),
+                MAX_ACTIVE_OWNER_GUIDANCE_BYTES)
+            store.close()
+
+    async def test_owner_guidance_enforces_total_serialized_size(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            content = "å" * 1800
+            created = 0
+            with self.assertRaisesRegex(ValueError, "serialized UTF-8 bytes"):
+                for _ in range(MAX_ACTIVE_OWNER_GUIDANCE_COUNT):
+                    store.set_owner_guidance(content)
+                    created += 1
+            self.assertGreater(created, 1)
+            self.assertLess(created, MAX_ACTIVE_OWNER_GUIDANCE_COUNT)
+            projection = store.active_owner_guidance()
+            self.assertLessEqual(len(json.dumps(
+                projection, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")),
+                MAX_ACTIVE_OWNER_GUIDANCE_BYTES)
             store.close()
 
 
