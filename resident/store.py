@@ -180,6 +180,9 @@ class Store:
           create_request_json TEXT, create_request_hash TEXT, handover_id TEXT,
           protocol_descriptor_json TEXT, mutable_settings_json TEXT,
           created_at TEXT NOT NULL, create_started_at TEXT, bound_at TEXT, completed_at TEXT);
+        CREATE TABLE IF NOT EXISTS session_rollover_requests(
+          provider TEXT PRIMARY KEY, old_session_id TEXT NOT NULL, reason TEXT NOT NULL,
+          requested_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_tool_actions(
           provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
           call_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL,
@@ -310,7 +313,7 @@ class Store:
                     json.dumps(mutable, sort_keys=True, separators=(",", ":")),
                     row["id"],
                 ))
-        self.connection.execute("UPDATE schema_version SET version=15")
+        self.connection.execute("UPDATE schema_version SET version=16")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -484,6 +487,33 @@ class Store:
             "protocol_descriptor": json.loads(descriptor_json),
             "mutable_settings": json.loads(settings_json),
         }
+
+    def request_session_rollover(self, provider: str, old_session_id: str,
+                                 reason: str, requested_by: str = "runtime") -> None:
+        """Durably retain a pre-create request while final consolidation runs."""
+        now = utc_now()
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO session_rollover_requests(
+                  provider,old_session_id,reason,requested_by,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(provider) DO UPDATE SET
+                  old_session_id=excluded.old_session_id,reason=excluded.reason,
+                  requested_by=excluded.requested_by,updated_at=excluded.updated_at
+            """, (provider, old_session_id, reason, requested_by, now, now))
+
+    def pending_session_rollover_request(self, provider: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM session_rollover_requests WHERE provider=?", (provider,)).fetchone()
+        return None if row is None else dict(row)
+
+    def clear_session_rollover_request(self, provider: str,
+                                       old_session_id: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                DELETE FROM session_rollover_requests
+                WHERE provider=? AND old_session_id=?
+            """, (provider, old_session_id))
 
     def pending_session_rollover(self, provider: str) -> dict[str, Any] | None:
         row = self.connection.execute("""
@@ -805,7 +835,9 @@ class Store:
             """, (guidance_id, revision, content, source_session_id, source_item_id, now))
         return guidance_id
 
-    def remove_owner_guidance(self, guidance_id: str) -> bool:
+    def remove_owner_guidance(self, guidance_id: str, *,
+                              source_session_id: str | None = None,
+                              source_item_id: str | None = None) -> bool:
         with self.connection:
             current = self.connection.execute("""
                 SELECT content,revision,source_session_id,source_item_id FROM owner_guidance
@@ -822,8 +854,20 @@ class Store:
                   guidance_id,revision,operation,content,source_session_id,source_item_id,created_at)
                 VALUES(?,?,'remove',?,?,?,?)
             """, (guidance_id, current["revision"] + 1, current["content"],
-                  current["source_session_id"], current["source_item_id"], utc_now()))
+                  source_session_id, source_item_id, utc_now()))
         return result.rowcount == 1
+
+    def is_pending_owner_message(self, message_id: str, owner_id: str) -> bool:
+        """Verify the durable message created by the authenticated Owner transport."""
+        if not isinstance(message_id, str) or not message_id:
+            return False
+        return self.connection.execute("""
+            SELECT 1
+            FROM owner_message_processing
+            JOIN messages ON messages.id=owner_message_processing.message_id
+            WHERE messages.id=? AND messages.direction='inbound'
+              AND messages.sender_id=? AND owner_message_processing.status='pending'
+        """, (message_id, owner_id)).fetchone() is not None
 
     def create_handover(self, old_session_id: str, content: str, expires_at: str) -> str:
         pending = self.pending_handover(old_session_id)

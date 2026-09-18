@@ -13,6 +13,14 @@ from typing import Any, Protocol, Sequence
 from .store import Store
 
 
+class FinalCatchUpIncomplete(RuntimeError):
+    """Final consolidation reached its operational page limit and must resume later."""
+
+
+class SessionHistoryUnavailable(RuntimeError):
+    """The old session's item history is definitively unavailable."""
+
+
 _AUTHORIZATION = re.compile(
     r"(?im)(\b(?:authorization|authentication|proxy-authorization)\s*[:=]\s*)"
     r"(?:[^\r\n]+)"
@@ -347,7 +355,7 @@ class MemoryCurator:
                 if not page.has_more:
                     break
             if final and more_pages:
-                raise RuntimeError(
+                raise FinalCatchUpIncomplete(
                     f"Final Curator consolidation incomplete after {self.max_batches} pages")
             return handover
 

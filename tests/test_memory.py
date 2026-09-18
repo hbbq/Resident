@@ -456,6 +456,60 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
                 "openai_agents", source.session_id)["cursor"])
             store.close()
 
+    async def test_final_catch_up_retry_resumes_checkpoint_without_duplicate_mutation(self):
+        class TwoPageSource:
+            session_id = "session-retry"
+
+            def __init__(self):
+                self.cursors = []
+
+            async def session_items(self, cursor, limit):
+                self.cursors.append(cursor)
+                if cursor is None:
+                    return SessionItemPage(({
+                        "id": "one", "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "remember this"}],
+                    },), "one", True)
+                return SessionItemPage(({
+                    "id": "two", "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "acknowledged"}],
+                },), "two", False)
+
+        class OneMutationModel:
+            async def curate(self, session_id, items, existing, current_handover):
+                mutations = []
+                if items[0]["id"] == "one":
+                    mutations.append({
+                        "memory_id": "durable-one", "operation": "create",
+                        "kind": "fact", "content": "remember this",
+                        "provenance": [{"item_id": "one"}],
+                    })
+                return {"mutations": mutations,
+                        "handover": {"operation": "keep"}}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source = TwoPageSource()
+            curator = MemoryCurator(
+                store, source, OneMutationModel(), max_batches=1)
+
+            with self.assertRaisesRegex(RuntimeError, "consolidation incomplete"):
+                await curator.catch_up(final=True)
+            self.assertEqual("one", store.curator_checkpoint(
+                "openai_agents", source.session_id)["cursor"])
+            self.assertEqual(1, store.connection.execute("""
+                SELECT COUNT(*) FROM memory_revisions WHERE memory_id='durable-one'
+            """).fetchone()[0])
+
+            await curator.catch_up(final=True)
+            self.assertEqual([None, "one"], source.cursors)
+            self.assertEqual("two", store.curator_checkpoint(
+                "openai_agents", source.session_id)["cursor"])
+            self.assertEqual(1, store.connection.execute("""
+                SELECT COUNT(*) FROM memory_revisions WHERE memory_id='durable-one'
+            """).fetchone()[0])
+            store.close()
+
     async def test_handover_operations_track_the_curators_current_view(self):
         class AdvancingSource:
             session_id = "handover-session"

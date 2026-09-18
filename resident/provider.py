@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from typing import Any, Callable, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
-from .memory import SessionItemPage
+from .memory import SessionHistoryUnavailable, SessionItemPage
 
 
 class ModelProvider(Protocol):
@@ -259,6 +259,10 @@ class OpenAIAgentsProvider:
         return (self._session_id is None or self._unavailable_session_id == self._session_id
                 or self._preflight_session_status == "idle")
 
+    @property
+    def requested_rollover_reason(self) -> str | None:
+        return self._requested_rollover_reason
+
     @staticmethod
     def _session_usability(session: dict[str, Any]) -> str:
         """Classify only session states represented by the Agents adapter contract."""
@@ -347,7 +351,13 @@ class OpenAIAgentsProvider:
         path = f"/agents/sessions/{session_id}/items?order=asc&limit={max(1, min(limit, 100))}"
         if cursor:
             path += f"&after={quote(cursor, safe='')}"
-        page = self._request("GET", path)
+        try:
+            page = self._request("GET", path)
+        except RuntimeError as exc:
+            if "HTTP 404" in str(exc) or "HTTP 410" in str(exc):
+                raise SessionHistoryUnavailable(
+                    f"Session item history for {session_id} is unavailable") from exc
+            raise
         data = tuple(item for item in (page.get("data") or []) if isinstance(item, dict))
         next_cursor = page.get("last_id") or (data[-1].get("id") if data else cursor)
         return SessionItemPage(data, next_cursor, bool(page.get("has_more")))

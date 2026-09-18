@@ -13,10 +13,10 @@ from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider, RemoteSessionUnavailable
-from .memory import MemoryCurator
+from .memory import MemoryCurator, SessionHistoryUnavailable
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
-from .tools import CORE_TOOL_NAMES, ToolRegistry
+from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
 
 
 _DEGRADED_HANDOVER = (
@@ -95,7 +95,18 @@ class ResidentRuntime:
                         "openai_agents", session_id, agent_id, request,
                         protocol, mutable),
             )
-        if config.new_chapter:
+        deferred_request = self.store.pending_session_rollover_request("openai_agents")
+        restored_deferred_request = False
+        if deferred_request is not None and getattr(provider, "session_id", None) is not None:
+            if deferred_request["old_session_id"] != provider.session_id:
+                self.store.clear_session_rollover_request(
+                    "openai_agents", deferred_request["old_session_id"])
+            elif self.store.pending_session_rollover("openai_agents") is None:
+                request_rollover = getattr(provider, "request_rollover", None)
+                if request_rollover is not None:
+                    request_rollover(deferred_request["reason"])
+                    restored_deferred_request = True
+        if config.new_chapter and not restored_deferred_request:
             request_rollover = getattr(provider, "request_rollover", None)
             if request_rollover is not None:
                 request_rollover("explicit_new_chapter")
@@ -124,6 +135,7 @@ class ResidentRuntime:
             role=config.role)
         self._active_run_id: str | None = None
         self._active_event: WakeEvent | None = None
+        self._owner_event_authorizations: dict[str, str] = {}
         self.curator: MemoryCurator | None = None
 
     def bind_curator(self, curator: MemoryCurator) -> None:
@@ -208,11 +220,13 @@ class ResidentRuntime:
         message_id = self.store.ingest_owner_message(self.owner.id, content)
         return self._owner_message_wake(message_id, content)
 
-    @staticmethod
-    def _owner_message_wake(message_id: str, content: str,
+    def _owner_message_wake(self, message_id: str, content: str,
                             occurred_at: str | None = None) -> WakeEvent:
-        return WakeEvent(str(uuid.uuid4()), "owner", "owner_message", occurred_at or utc_now(),
-                         {"message_id": message_id, "content": content})
+        event = WakeEvent(str(uuid.uuid4()), "owner", "owner_message",
+                          occurred_at or utc_now(),
+                          {"message_id": message_id, "content": content})
+        self._owner_event_authorizations[event.id] = message_id
+        return event
 
     def telegram_owner_message_event(self, bot_identity: str, update_id: int,
                                      content: str) -> WakeEvent | None:
@@ -301,22 +315,39 @@ class ResidentRuntime:
                 "pending_intentions": len(self.store.pending_intentions()),
                 "recent_messages": len(self.store.recent_messages(self.config.context_messages)),
             })
+            owner_guidance_authorization = None
+            if event.source == "owner" and event.reason == "owner_message":
+                message_id = event.payload.get("message_id")
+                if (self._owner_event_authorizations.get(event.id) == message_id
+                        and self.store.is_pending_owner_message(message_id, self.owner.id)):
+                    owner_guidance_authorization = OwnerGuidanceAuthorization(
+                        message_id, getattr(self.provider, "session_id", None))
             registry = ToolRegistry(
                 self.store, capabilities, self._send_owner_message, self._emit,
                 current_run_id=run_id,
-                owner_communication_enabled=self.config.owner_communication_enabled)
+                owner_communication_enabled=self.config.owner_communication_enabled,
+                owner_guidance_authorization=owner_guidance_authorization)
             protocol_rollover = getattr(self.provider, "protocol_change_requires_rollover", None)
             new_session = getattr(self.provider, "session_id", None) is None
             handover = None
             handover_id = None
-            needs_rollover = protocol_rollover is not None and protocol_rollover(registry.specs)
             unknown_restored_protocol = (
                 getattr(self.provider, "session_id", None) is not None and
                 not getattr(self.provider, "session_protocol_known", True))
+            needs_rollover = (
+                protocol_rollover is not None and protocol_rollover(registry.specs)
+            ) or unknown_restored_protocol
             rollover_ready = bool(getattr(self.provider, "rollover_ready", True))
             if needs_rollover and (rollover_ready or unavailable_reason is not None):
                 old_session_id = getattr(self.provider, "session_id", None)
                 pending_rollover = self.store.pending_session_rollover("openai_agents")
+                if old_session_id:
+                    rollover_reason = (
+                        pending_rollover["reason"] if pending_rollover is not None else
+                        getattr(self.provider, "requested_rollover_reason", None) or
+                        "function_or_immutable_protocol_changed")
+                    self.store.request_session_rollover(
+                        "openai_agents", old_session_id, rollover_reason)
                 pending_handover = self.store.pending_handover(old_session_id) if (
                     old_session_id and pending_rollover is not None) else None
                 if pending_rollover is not None and pending_handover is not None:
@@ -326,10 +357,16 @@ class ResidentRuntime:
                 elif self.curator is not None and unavailable_reason != "remote_session_missing":
                     try:
                         handover = await self.curator.catch_up(final=True)
+                    except SessionHistoryUnavailable as exc:
+                        self._emit("curator.failed", {
+                            "phase": "final", "error_type": type(exc).__name__,
+                            "history_status": "unavailable"})
+                        handover = _DEGRADED_HANDOVER
                     except Exception as exc:
                         self._emit("curator.failed", {
-                            "phase": "final", "error_type": type(exc).__name__})
-                        handover = _DEGRADED_HANDOVER
+                            "phase": "final", "error_type": type(exc).__name__,
+                            "history_status": "reachable"})
+                        raise
                 elif unavailable_reason is not None:
                     handover = _DEGRADED_HANDOVER
                 confirm_rollover = getattr(self.provider, "confirm_rollover_ready", None)
@@ -343,8 +380,6 @@ class ResidentRuntime:
                             (datetime.now(UTC) + timedelta(hours=24)).isoformat())
                 else:
                     handover = None
-            elif unknown_restored_protocol:
-                new_session = True
             if new_session:
                 context_document["new_session_bootstrap"] = {
                     "durable_memory_awareness": self.store.memory_awareness(limit=8),
@@ -365,14 +400,24 @@ class ResidentRuntime:
                     old_session_id = getattr(self.provider, "session_id", None)
                     unavailable_reason = getattr(
                         self.provider, "unavailable_session_reason", None)
+                    if old_session_id:
+                        self.store.request_session_rollover(
+                            "openai_agents", old_session_id,
+                            unavailable_reason or "remote_session_unavailable")
                     if (self.curator is not None
                             and unavailable_reason != "remote_session_missing"):
                         try:
                             handover = await self.curator.catch_up(final=True)
+                        except SessionHistoryUnavailable as exc:
+                            self._emit("curator.failed", {
+                                "phase": "final", "error_type": type(exc).__name__,
+                                "history_status": "unavailable"})
+                            handover = _DEGRADED_HANDOVER
                         except Exception as exc:
                             self._emit("curator.failed", {
-                                "phase": "final", "error_type": type(exc).__name__})
-                            handover = _DEGRADED_HANDOVER
+                                "phase": "final", "error_type": type(exc).__name__,
+                                "history_status": "reachable"})
+                            raise
                     else:
                         handover = _DEGRADED_HANDOVER
                     if old_session_id:
@@ -392,6 +437,10 @@ class ResidentRuntime:
                     if replacement_id and replacement_id != response_session_id:
                         self.store.consume_handover(handover_id, replacement_id)
                         handover_id = None
+                if (response_session_id is not None
+                        and getattr(self.provider, "session_id", None) != response_session_id):
+                    self.store.clear_session_rollover_request(
+                        "openai_agents", response_session_id)
                 self._emit("model.responded", {
                     "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
@@ -474,10 +523,13 @@ class ResidentRuntime:
             schedule_id = event.payload.get("schedule_id") if event.source == "scheduler" else None
             owner_message_id = (
                 event.payload.get("message_id")
-                if event.source == "owner" and event.reason == "owner_message" else None
+                if (event.source == "owner" and event.reason == "owner_message"
+                    and self._owner_event_authorizations.get(event.id)
+                    == event.payload.get("message_id")) else None
             )
             self.store.finish_run(
                 run_id, status, duration, calls, schedule_id, owner_message_id)
+            self._owner_event_authorizations.pop(event.id, None)
             self._active_run_id, self._active_event = None, None
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
