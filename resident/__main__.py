@@ -9,7 +9,7 @@ from .agentcontroller import AgentControllerConnector
 from .camera import CameraConnector
 from .display import DisplayConnector
 from .homeops import HomeOpsConnector
-from .provider import OpenAIResponsesProvider
+from .provider import OpenAIAgentsProvider, OpenAIResponsesProvider
 from .runtime import ResidentRuntime
 from .telegram import TelegramTransport
 
@@ -44,7 +44,14 @@ def main() -> int:
     if not config.openai_api_key:
         print("OPENAI_API_KEY must be set for the OpenAI provider.", file=sys.stderr)
         return 2
-    provider = OpenAIResponsesProvider(config.openai_api_key, config.model, config.openai_base_url)
+    if config.provider == "openai-agents":
+        provider = OpenAIAgentsProvider(
+            config.openai_api_key, config.model, config.openai_base_url,
+            agent_id=config.openai_agent_id,
+        )
+    else:
+        provider = OpenAIResponsesProvider(
+            config.openai_api_key, config.model, config.openai_base_url)
     connectors = []
     capabilities = diagnostic_capabilities()
     terminal_diagnostics = TerminalDiagnostics(config.verbose)

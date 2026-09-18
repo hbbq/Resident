@@ -49,6 +49,19 @@ class ResidentRuntime:
         self.store = store or Store(config.data_dir / "resident.sqlite3")
         self.resident, self.owner = self.store.provision(
             config.resident_name, config.owner_name, config.personality)
+        bind_session_store = getattr(provider, "bind_session_store", None)
+        if bind_session_store is not None:
+            bind_session_store(
+                lambda: self.store.agent_session_binding("openai_agents"),
+                lambda session_id, agent_id, last_turn_id: self.store.save_agent_session_binding(
+                    "openai_agents", session_id, agent_id, last_turn_id),
+            )
+        bind_action_store = getattr(provider, "bind_action_store", None)
+        if bind_action_store is not None:
+            bind_action_store(
+                self.store.begin_agent_tool_action,
+                self.store.complete_agent_tool_action,
+            )
         self._event_queue: asyncio.Queue[WakeEvent | None] | None = None
         self._capability_event_states: dict[
             str, tuple[tuple[Capability, ...], dict[str, dict]]
@@ -264,14 +277,40 @@ class ResidentRuntime:
                 results = []
                 for call in turn.tool_calls:
                     self._emit("tool.called", {"call_id": call.id, "name": call.name, "arguments": call.arguments})
-                    execution = await registry.execute(call.name, call.arguments)
-                    results.append(ToolResult(call.id, execution.output, execution.attachments))
-                    completion = {"call_id": call.id, "name": call.name, "result": execution.output}
-                    if execution.attachments:
+                    prepare = getattr(self.provider, "prepare_tool_call", None)
+                    action = prepare(call) if prepare is not None else None
+                    if action is not None and not action["claimed"]:
+                        ephemeral_result = action.get("ephemeral_result")
+                        if ephemeral_result is not None:
+                            result = ephemeral_result
+                        elif action.get("attachments_ephemeral"):
+                            # Attachment payloads (for example camera frames) are
+                            # intentionally not persisted. Reacquire them after a
+                            # restart instead of submitting an incomplete replay.
+                            execution = await registry.execute(call.name, call.arguments)
+                            result = ToolResult(call.id, execution.output, execution.attachments)
+                            record = getattr(self.provider, "record_tool_result", None)
+                            if record is not None:
+                                record(result)
+                        else:
+                            output = action["output"] or {
+                                "ok": False,
+                                "error": "Previous local action outcome is unknown; action was not repeated",
+                            }
+                            result = ToolResult(call.id, output)
+                    else:
+                        execution = await registry.execute(call.name, call.arguments)
+                        result = ToolResult(call.id, execution.output, execution.attachments)
+                        record = getattr(self.provider, "record_tool_result", None)
+                        if record is not None:
+                            record(result)
+                    results.append(result)
+                    completion = {"call_id": call.id, "name": call.name, "result": result.output}
+                    if result.attachments:
                         completion["attachments"] = [{
                             "type": "image", "mime_type": attachment.mime_type,
                             "byte_count": len(attachment.data), "ephemeral": True,
-                        } for attachment in execution.attachments]
+                        } for attachment in result.attachments]
                     self._emit("tool.completed", completion)
                 if not continuation_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")
