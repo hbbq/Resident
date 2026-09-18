@@ -323,8 +323,13 @@ class ResidentRuntime:
                     # This handover is already final for a durable create snapshot.
                     handover = pending_handover["content"]
                     handover_id = pending_handover["id"]
-                elif self.curator is not None and unavailable_reason is None:
-                    handover = await self.curator.catch_up(final=True)
+                elif self.curator is not None and unavailable_reason != "remote_session_missing":
+                    try:
+                        handover = await self.curator.catch_up(final=True)
+                    except Exception as exc:
+                        self._emit("curator.failed", {
+                            "phase": "final", "error_type": type(exc).__name__})
+                        handover = _DEGRADED_HANDOVER
                 elif unavailable_reason is not None:
                     handover = _DEGRADED_HANDOVER
                 confirm_rollover = getattr(self.provider, "confirm_rollover_ready", None)
@@ -358,7 +363,18 @@ class ResidentRuntime:
                     if results or continuation_id is not None:
                         raise
                     old_session_id = getattr(self.provider, "session_id", None)
-                    handover = _DEGRADED_HANDOVER
+                    unavailable_reason = getattr(
+                        self.provider, "unavailable_session_reason", None)
+                    if (self.curator is not None
+                            and unavailable_reason != "remote_session_missing"):
+                        try:
+                            handover = await self.curator.catch_up(final=True)
+                        except Exception as exc:
+                            self._emit("curator.failed", {
+                                "phase": "final", "error_type": type(exc).__name__})
+                            handover = _DEGRADED_HANDOVER
+                    else:
+                        handover = _DEGRADED_HANDOVER
                     if old_session_id:
                         handover_id = self.store.create_handover(
                             old_session_id, handover,

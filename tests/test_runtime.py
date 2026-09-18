@@ -1533,8 +1533,8 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT COUNT(*) FROM session_rollovers").fetchone()[0])
             store.close()
 
-    def test_new_chapter_saved_agent_and_404_cannot_bypass_uncertain_rollover(self):
-        for trigger in ("new_chapter", "saved_agent", "remote_404"):
+    def test_rollover_triggers_cannot_bypass_uncertain_rollover(self):
+        for trigger in ("new_chapter", "saved_agent", "remote_404", "remote_failed"):
             with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as temporary:
                 store = Store(Path(temporary) / "resident.sqlite3")
                 seed = OpenAIAgentsProvider(
@@ -1570,6 +1570,10 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     diagnostic_output=lambda _: None)
                 if trigger == "remote_404":
                     provider._unavailable_session_id = "session-old"
+                    provider._unavailable_session_reason = "remote_session_missing"
+                elif trigger == "remote_failed":
+                    provider._unavailable_session_id = "session-old"
+                    provider._unavailable_session_reason = "remote_session_failed"
                 with self.assertRaises(RolloverRecoveryRequired):
                     provider._ensure_session([], initial_input="new bootstrap")
                 self.assertFalse(any(method == "POST" for method, _, _ in requests))
@@ -2086,6 +2090,123 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 ("session-missing", "session-replacement", "remote_session_missing",
                  "unavailable", "completed"), tuple(rollover))
+            runtime.close()
+
+    async def test_restored_session_statuses_are_classified_explicitly(self):
+        for status, expected in (("idle", None), ("in_progress", None),
+                                 ("requires_action", None)):
+            with self.subTest(status=status):
+                provider = OpenAIAgentsProvider("test-key", "model")
+                provider._session_id = "session-old"
+                provider._request = lambda *_args, **_kwargs: {
+                    "id": "session-old", "status": status}
+                self.assertEqual(expected, await provider.preflight_session())
+                self.assertEqual(status == "idle", provider.rollover_ready)
+                self.assertIsNone(provider._requested_rollover_reason)
+
+        provider = OpenAIAgentsProvider("test-key", "model")
+        provider._session_id = "session-old"
+        provider._request = lambda *_args, **_kwargs: {
+            "id": "session-old", "status": "future_state"}
+        with self.assertRaisesRegex(RuntimeError, "unsupported status 'future_state'"):
+            await provider.preflight_session()
+        self.assertIsNone(provider._requested_rollover_reason)
+
+    async def test_terminal_restored_session_rolls_over_with_final_handover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            provider = OpenAIAgentsProvider("test-key", "model", poll_seconds=0)
+            store.save_agent_session_binding(
+                "openai_agents", "session-failed", None, "turn-old")
+            store.save_session_protocol(
+                "openai_agents", "session-failed",
+                provider._agent_protocol(provider._agent_config([])))
+            creates = []
+
+            def fake_request(method, path, body=None, **_):
+                if method == "GET" and path == "/agents/sessions/session-failed":
+                    return {"id": "session-failed", "status": "failed",
+                            "error": {"message": "terminal remote failure"}}
+                if method == "POST" and path == "/agents/sessions":
+                    creates.append(body)
+                    return {"id": "session-replacement", "status": "idle"}
+                raise AssertionError((method, path, body))
+
+            class FinalCurator:
+                def __init__(self):
+                    self.calls = []
+
+                async def catch_up(self, final=False):
+                    self.calls.append(final)
+                    return "authoritative final handover" if final else None
+
+            provider._request = fake_request
+            provider._wait_for_submitted_wake = lambda *_: ModelTurn("turn-new", "ready")
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            curator = FinalCurator()
+            runtime.curator = curator
+
+            await runtime.process(WakeEvent(
+                "wake-terminal", "scheduler", "due", utc_now(), {}))
+
+            self.assertEqual([True, False], curator.calls)
+            self.assertEqual(1, len(creates))
+            bootstrap = json.loads(creates[0]["input"])["new_session_bootstrap"]
+            self.assertEqual("authoritative final handover", bootstrap["handover"])
+            rollover = store.connection.execute(
+                "SELECT old_session_id,new_session_id,reason,finalization_status,status "
+                "FROM session_rollovers").fetchone()
+            self.assertEqual(
+                ("session-failed", "session-replacement", "remote_session_failed",
+                 "unavailable", "completed"), tuple(rollover))
+            history = store.connection.execute(
+                "SELECT content,new_session_id,consumed_at FROM session_handovers"
+            ).fetchone()
+            self.assertEqual("authoritative final handover", history["content"])
+            self.assertEqual("session-replacement", history["new_session_id"])
+            self.assertIsNotNone(history["consumed_at"])
+            runtime.close()
+
+    async def test_terminal_session_with_unavailable_source_uses_degraded_handover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            provider = OpenAIAgentsProvider("test-key", "model", poll_seconds=0)
+            store.save_agent_session_binding(
+                "openai_agents", "session-failed", None, "turn-old")
+            store.save_session_protocol(
+                "openai_agents", "session-failed",
+                provider._agent_protocol(provider._agent_config([])))
+            creates = []
+
+            def fake_request(method, path, body=None, **_):
+                if method == "GET" and path == "/agents/sessions/session-failed":
+                    return {"id": "session-failed", "status": "failed"}
+                if method == "POST" and path == "/agents/sessions":
+                    creates.append(body)
+                    return {"id": "session-replacement", "status": "idle"}
+                raise AssertionError((method, path, body))
+
+            class UnavailableCurator:
+                async def catch_up(self, final=False):
+                    if final:
+                        raise RuntimeError("old session items unavailable")
+                    return None
+
+            provider._request = fake_request
+            provider._wait_for_submitted_wake = lambda *_: ModelTurn("turn-new", "ready")
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime.curator = UnavailableCurator()
+
+            await runtime.process(WakeEvent(
+                "wake-terminal-degraded", "scheduler", "due", utc_now(), {}))
+
+            bootstrap = json.loads(creates[0]["input"])["new_session_bootstrap"]
+            self.assertIn("previous remote session was unavailable", bootstrap["handover"])
+            self.assertEqual(1, len(creates))
             runtime.close()
 
     def test_agents_missing_session_ignores_legacy_agent_id_and_saves_replacement(self):

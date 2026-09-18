@@ -36,20 +36,20 @@ class FakeModel:
     def __init__(self):
         self.items = []
 
-    async def curate(self, session_id, items, existing):
+    async def curate(self, session_id, items, existing, current_handover):
         self.items.extend(items)
         return {"mutations": [{
             "operation": "create", "kind": "preference", "content": "Owner prefers tea",
             "confidence": .9, "provenance": [{"item_id": "item-1", "source_type": "message",
                                                 "excerpt": "token=secret; prefers tea"}],
-        }], "handover": "Continue discussing tea."}
+        }], "handover": {"operation": "replace", "content": "Continue discussing tea."}}
 
 
 class EmptyModel:
     def __init__(self):
         self.calls = 0
 
-    async def curate(self, session_id, items, existing):
+    async def curate(self, session_id, items, existing, current_handover):
         self.calls += 1
         return {"mutations": []}
 
@@ -59,7 +59,7 @@ class RecordingModel(EmptyModel):
         super().__init__()
         self.pages = []
 
-    async def curate(self, session_id, items, existing):
+    async def curate(self, session_id, items, existing, current_handover):
         self.calls += 1
         self.pages.append(tuple(items))
         return {"mutations": []}
@@ -177,7 +177,7 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.items = []
 
-            async def curate(self, session_id, items, existing):
+            async def curate(self, session_id, items, existing, current_handover):
                 self.items.extend(items)
                 return {"mutations": [{
                     "operation": "create", "kind": "fact",
@@ -188,7 +188,8 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
                         "source_type": "invented-type", "timestamp": "invented-time",
                         "excerpt": "invented excerpt", "content_hash": "invented-hash",
                     }],
-                }], "handover": f"Bearer {raw_secrets[4]}"}
+                }], "handover": {
+                    "operation": "replace", "content": f"Bearer {raw_secrets[4]}"}}
 
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
@@ -293,7 +294,7 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
                 },), "observed-1", False)
 
         class CredentialOutputModel:
-            async def curate(self, session_id, items, existing):
+            async def curate(self, session_id, items, existing, current_handover):
                 return {"mutations": [{
                     "operation": "create", "kind": "fact",
                     "content": ("Water plants; postgresql://resident:db-password@db.local/home; "
@@ -302,7 +303,8 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
                                 "api_key=api-output; " + private_key),
                     "rationale": "Authorization: Bearer bearer-output",
                     "provenance": [{"item_id": "observed-1"}],
-                }], "handover": "Continue safely. " + private_key + " api_key=api-output"}
+                }], "handover": {"operation": "replace", "content":
+                                  "Continue safely. " + private_key + " api_key=api-output"}}
 
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
@@ -328,7 +330,7 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
                 },), "real-1", False)
 
         class GroundingModel:
-            async def curate(self, session_id, items, existing):
+            async def curate(self, session_id, items, existing, current_handover):
                 base = {"operation": "create", "kind": "fact"}
                 return {"mutations": [
                     {**base, "memory_id": "missing", "content": "missing"},
@@ -452,6 +454,178 @@ class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, model.calls)
             self.assertEqual("item-2", store.curator_checkpoint(
                 "openai_agents", source.session_id)["cursor"])
+            store.close()
+
+    async def test_handover_operations_track_the_curators_current_view(self):
+        class AdvancingSource:
+            session_id = "handover-session"
+
+            async def session_items(self, cursor, limit):
+                index = 1 if cursor is None else int(cursor.rsplit("-", 1)[1]) + 1
+                if index > 6:
+                    return SessionItemPage((), cursor, False)
+                item_id = f"item-{index}"
+                return SessionItemPage(({
+                    "id": item_id, "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": f"event {index}"}],
+                },), item_id, False)
+
+        class HandoverModel:
+            def __init__(self):
+                self.current = []
+                self.operations = [
+                    {"operation": "keep"},
+                    {"operation": "replace", "content": "first draft"},
+                    {"operation": "keep"},
+                    {"operation": "replace", "content": "authoritative second draft"},
+                    {"operation": "clear"},
+                    {"operation": "keep"},
+                ]
+
+            async def curate(self, session_id, items, existing, current_handover):
+                self.current.append(current_handover)
+                return {"mutations": [], "handover": self.operations.pop(0)}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            model = HandoverModel()
+            curator = MemoryCurator(store, AdvancingSource(), model)
+
+            observed = [await curator.catch_up() for _ in range(6)]
+
+            self.assertEqual([
+                None, "first draft", "first draft", "authoritative second draft",
+                None, None,
+            ], observed)
+            self.assertEqual([
+                None, None, "first draft", "first draft",
+                "authoritative second draft", None,
+            ], model.current)
+            self.assertIsNone(store.curator_checkpoint(
+                "openai_agents", "handover-session")["handover_draft"])
+            store.close()
+
+    async def test_cleared_handover_survives_retry_without_touching_finalized_history(self):
+        class ClearSource:
+            session_id = "session-old"
+
+            async def session_items(self, cursor, limit):
+                if cursor == "seed":
+                    return SessionItemPage(({
+                        "id": "clear-item", "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "Work is resolved."}],
+                    },), "clear-item", False)
+                return SessionItemPage((), cursor, False)
+
+        class ClearModel:
+            def __init__(self):
+                self.current = []
+
+            async def curate(self, session_id, items, existing, current_handover):
+                self.current.append(current_handover)
+                return {"mutations": [], "handover": {"operation": "clear"}}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            store.apply_curator_batch(
+                "openai_agents", "session-old", "seed", "seed", "seed-operation", [],
+                "replace", "stale mutable draft")
+            finalized_id = store.create_handover(
+                "session-old", "finalized historical bridge", "9999-12-31T23:59:59+00:00")
+            store.consume_handover(finalized_id, "session-new")
+            model = ClearModel()
+            curator = MemoryCurator(store, ClearSource(), model)
+            finish = store.finish_curator_job
+            failed_once = False
+
+            def crash_after_batch(job_id):
+                nonlocal failed_once
+                if not failed_once:
+                    failed_once = True
+                    raise RuntimeError("simulated checkpoint-adjacent crash")
+                finish(job_id)
+
+            store.finish_curator_job = crash_after_batch
+            with self.assertRaisesRegex(RuntimeError, "simulated"):
+                await curator.catch_up()
+            store.finish_curator_job = finish
+
+            self.assertIsNone(await curator.catch_up())
+            self.assertEqual(["stale mutable draft"], model.current)
+            self.assertIsNone(store.curator_checkpoint(
+                "openai_agents", "session-old")["handover_draft"])
+            finalized = store.connection.execute(
+                "SELECT content,new_session_id,consumed_at FROM session_handovers WHERE id=?",
+                (finalized_id,)).fetchone()
+            self.assertEqual("finalized historical bridge", finalized["content"])
+            self.assertEqual("session-new", finalized["new_session_id"])
+            self.assertIsNotNone(finalized["consumed_at"])
+            store.close()
+
+    async def test_duplicate_create_is_rejected_for_every_existing_lifecycle_state(self):
+        for status_operation in (None, "supersede", "invalidate"):
+            with self.subTest(status_operation=status_operation), tempfile.TemporaryDirectory() as temporary:
+                store = Store(Path(temporary) / "resident.sqlite3")
+                store.apply_curator_batch("openai_agents", "s", "one", "one", "create", [{
+                    "memory_id": "existing", "operation": "create", "kind": "fact",
+                    "content": "original", "provenance": [{"item_id": "one"}],
+                }])
+                if status_operation is not None:
+                    store.apply_curator_batch(
+                        "openai_agents", "s", "retire", "retire", "retire", [{
+                            "memory_id": "existing", "operation": status_operation,
+                            "content": "retired", "provenance": [{"item_id": "retire"}],
+                        }])
+                before = store.memory("existing")
+                revision_count = store.connection.execute(
+                    "SELECT count(*) FROM memory_revisions WHERE memory_id='existing'"
+                ).fetchone()[0]
+
+                with self.assertRaisesRegex(ValueError, "create targets an existing record"):
+                    store.apply_curator_batch(
+                        "openai_agents", "s", "duplicate", "duplicate", "duplicate", [{
+                            "memory_id": "existing", "operation": "create", "kind": "fact",
+                            "content": "must not reactivate",
+                            "provenance": [{"item_id": "duplicate"}],
+                        }])
+
+                after = store.memory("existing")
+                self.assertEqual(before["status"], after["status"])
+                self.assertEqual(before["content"], after["content"])
+                self.assertEqual(revision_count, store.connection.execute(
+                    "SELECT count(*) FROM memory_revisions WHERE memory_id='existing'"
+                ).fetchone()[0])
+                self.assertEqual(0, store.connection.execute(
+                    "SELECT count(*) FROM curator_operations WHERE operation_key='duplicate'"
+                ).fetchone()[0])
+                store.close()
+
+    async def test_duplicate_create_rolls_back_the_entire_curator_batch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            store.apply_curator_batch("openai_agents", "s", "seed", "seed", "seed", [{
+                "memory_id": "existing", "operation": "create", "kind": "fact",
+                "content": "original", "provenance": [{"item_id": "seed"}],
+            }])
+
+            with self.assertRaisesRegex(ValueError, "create targets an existing record"):
+                store.apply_curator_batch(
+                    "openai_agents", "s", "bad", "bad", "bad-batch", [{
+                        "memory_id": "new-first", "operation": "create", "kind": "fact",
+                        "content": "must roll back", "provenance": [{"item_id": "bad"}],
+                    }, {
+                        "memory_id": "existing", "operation": "create", "kind": "fact",
+                        "content": "duplicate", "provenance": [{"item_id": "bad"}],
+                    }], "replace", "must also roll back")
+
+            self.assertIsNone(store.memory("new-first"))
+            self.assertEqual("seed", store.curator_checkpoint(
+                "openai_agents", "s")["cursor"])
+            self.assertIsNone(store.curator_checkpoint(
+                "openai_agents", "s")["handover_draft"])
+            self.assertEqual(0, store.connection.execute(
+                "SELECT count(*) FROM curator_operations WHERE operation_key='bad-batch'"
+            ).fetchone()[0])
             store.close()
 
     async def test_memory_updates_invalidate_without_destroying_revision_history(self):

@@ -628,10 +628,17 @@ class Store:
     def apply_curator_batch(self, provider: str, session_id: str, cursor: str | None,
                             last_item_id: str | None, operation_key: str,
                             mutations: list[dict[str, Any]],
+                            handover_operation: str = "keep",
                             handover_draft: str | None = None) -> bool:
         """Atomically apply validated curator decisions and advance its source checkpoint."""
         if any(not mutation.get("provenance") for mutation in mutations):
             raise ValueError("Durable Curator memory requires verified provenance")
+        if handover_operation not in {"keep", "replace", "clear"}:
+            raise ValueError("Unsupported Curator handover operation")
+        if handover_operation == "replace" and not handover_draft:
+            raise ValueError("Replacement Curator handover must be nonempty")
+        if handover_operation != "replace" and handover_draft is not None:
+            raise ValueError("Only handover replacement may provide draft content")
         now = utc_now()
         with self.connection:
             claimed = self.connection.execute("""
@@ -646,6 +653,8 @@ class Store:
                 existing = self.connection.execute(
                     "SELECT current_revision FROM memory_records WHERE id=?", (memory_id,)
                 ).fetchone()
+                if operation == "create" and existing is not None:
+                    raise ValueError(f"Memory create targets an existing record: {memory_id}")
                 revision = (existing["current_revision"] + 1) if existing else 1
                 if operation != "create" and existing is None:
                     raise ValueError(f"Memory mutation targets an unknown record: {memory_id}")
@@ -681,9 +690,13 @@ class Store:
                   provider,session_id,cursor,last_item_id,handover_draft,updated_at)
                 VALUES(?,?,?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
                   cursor=excluded.cursor,last_item_id=excluded.last_item_id,
-                  handover_draft=COALESCE(excluded.handover_draft,curator_checkpoints.handover_draft),
+                  handover_draft=CASE ?
+                    WHEN 'keep' THEN curator_checkpoints.handover_draft
+                    WHEN 'replace' THEN excluded.handover_draft
+                    WHEN 'clear' THEN NULL END,
                   updated_at=excluded.updated_at
-            """, (provider, session_id, cursor, last_item_id, handover_draft, now))
+            """, (provider, session_id, cursor, last_item_id, handover_draft, now,
+                  handover_operation))
         return True
 
     def claim_curator_job(self, job_id: str, session_id: str,

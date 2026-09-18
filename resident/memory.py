@@ -131,7 +131,8 @@ class SessionItemSource(Protocol):
 
 class CuratorModel(Protocol):
     async def curate(self, session_id: str, items: Sequence[dict[str, Any]],
-                     existing: Sequence[dict[str, Any]]) -> dict[str, Any]: ...
+                     existing: Sequence[dict[str, Any]],
+                     current_handover: str | None) -> dict[str, Any]: ...
 
 
 def _safe_item(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -221,9 +222,11 @@ class OpenAICuratorModel:
         self.base_url, self.timeout_seconds = base_url.rstrip("/"), timeout_seconds
 
     async def curate(self, session_id: str, items: Sequence[dict[str, Any]],
-                     existing: Sequence[dict[str, Any]]) -> dict[str, Any]:
+                     existing: Sequence[dict[str, Any]],
+                     current_handover: str | None) -> dict[str, Any]:
         document = {"session_id": session_id,
                     "existing_memories": list(existing),
+                    "current_handover_draft": current_handover,
                     "new_session_items": list(items)}
         return await asyncio.to_thread(self._post, document)
 
@@ -234,7 +237,9 @@ class OpenAICuratorModel:
             "instructions": (
                 "Curate only durable, useful experience into memory. Temporary work belongs in handover, "
                 "not memory. Never retain credentials, authentication material, private reasoning, or "
-                "attachment payloads. Return JSON with mutations and optional handover. Each mutation has "
+                "attachment payloads. Return JSON with mutations and a handover object whose operation is "
+                "keep, replace, or clear. Replace also has nonempty content and makes it authoritative; keep "
+                "retains the supplied current_handover_draft; clear removes it. Each mutation has "
                 "operation (create/update/supersede/invalidate), optional memory_id, kind, content, rationale, "
                 "confidence, and provenance entries referencing supplied item_id values."
             ),
@@ -316,18 +321,24 @@ class MemoryCurator:
                     continue
                 try:
                     mutations: list[dict[str, Any]] = []
+                    handover_operation = "keep"
+                    proposed_handover = None
                     if safe_items:
                         existing = tuple(_safe_existing_memory(memory) for memory in
                                          self.store.search_memories(limit=20))
-                        decision = await self.model.curate(session_id, safe_items, existing)
+                        decision = await self.model.curate(
+                            session_id, safe_items, existing, handover)
                         mutations = self._validate_mutations(
                             decision.get("mutations", []), session_id, safe_items)
-                        proposed_handover = decision.get("handover")
-                        if isinstance(proposed_handover, str) and proposed_handover.strip():
-                            handover = _redact_text(proposed_handover.strip())[:8000]
+                        handover_operation, proposed_handover = self._validate_handover(
+                            decision.get("handover", {"operation": "keep"}))
+                        if handover_operation == "replace":
+                            handover = proposed_handover
+                        elif handover_operation == "clear":
+                            handover = None
                     self.store.apply_curator_batch(
                         "openai_agents", session_id, next_cursor, last_item_id,
-                        operation_key, mutations, handover)
+                        operation_key, mutations, handover_operation, proposed_handover)
                     self.store.finish_curator_job(job_id)
                 except BaseException as exc:
                     self.store.fail_curator_job(job_id, type(exc).__name__)
@@ -339,6 +350,22 @@ class MemoryCurator:
                 raise RuntimeError(
                     f"Final Curator consolidation incomplete after {self.max_batches} pages")
             return handover
+
+    @staticmethod
+    def _validate_handover(value: object) -> tuple[str, str | None]:
+        if not isinstance(value, dict):
+            raise RuntimeError("Curator handover must be an operation object")
+        operation = value.get("operation")
+        if operation not in {"keep", "replace", "clear"}:
+            raise RuntimeError("Curator returned an unsupported handover operation")
+        if operation == "replace":
+            content = value.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError("Curator replacement handover must be nonempty")
+            return operation, _redact_text(content.strip())[:8000]
+        if "content" in value and value.get("content") not in (None, ""):
+            raise RuntimeError(f"Curator handover {operation} cannot include content")
+        return operation, None
 
     @staticmethod
     def _validate_mutations(value: object,

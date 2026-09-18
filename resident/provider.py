@@ -175,6 +175,7 @@ class OpenAIAgentsProvider:
         self._fail_rollover: Callable[[str, str], None] = lambda *_: None
         self._requested_rollover_reason: str | None = None
         self._unavailable_session_id: str | None = None
+        self._unavailable_session_reason: str | None = None
         self._preflight_session_status: str | None = None
         self._confirmed_rollover_session: dict[str, Any] | None = None
         self._lifecycle_bound = False
@@ -239,6 +240,10 @@ class OpenAIAgentsProvider:
     def session_protocol_known(self) -> bool:
         return self._session_id is None or self._protocol_descriptor is not None
 
+    @property
+    def unavailable_session_reason(self) -> str | None:
+        return self._unavailable_session_reason
+
     def request_rollover(self, reason: str = "explicit_new_chapter") -> None:
         if not reason.strip():
             raise ValueError("Session rollover reason must be nonempty")
@@ -249,6 +254,26 @@ class OpenAIAgentsProvider:
         """Whether the most recent preflight found the old session idle."""
         return (self._session_id is None or self._unavailable_session_id == self._session_id
                 or self._preflight_session_status == "idle")
+
+    @staticmethod
+    def _session_usability(session: dict[str, Any]) -> str:
+        """Classify only session states represented by the Agents adapter contract."""
+        status = session.get("status")
+        if status == "idle":
+            return "usable"
+        if status in {"in_progress", "requires_action"}:
+            return "busy"
+        if status == "failed":
+            return "terminal"
+        raise RuntimeError(
+            f"OpenAI Agents session returned unsupported status {status!r}")
+
+    def _mark_session_unavailable(self, session_id: str, reason: str) -> None:
+        self._unavailable_session_id = session_id
+        self._unavailable_session_reason = reason
+        self._preflight_session_status = None
+        self._confirmed_rollover_session = None
+        self._requested_rollover_reason = reason
 
     async def preflight_session(self) -> str | None:
         """Detect an unavailable restored session before wake context is built."""
@@ -262,11 +287,12 @@ class OpenAIAgentsProvider:
         except RuntimeError as exc:
             if "HTTP 404" not in str(exc):
                 raise
-            self._unavailable_session_id = session_id
-            self._preflight_session_status = None
-            self._requested_rollover_reason = "remote_session_missing"
+            self._mark_session_unavailable(session_id, "remote_session_missing")
             return "remote_session_missing"
         self._preflight_session_status = session.get("status")
+        if self._session_usability(session) == "terminal":
+            self._mark_session_unavailable(session_id, "remote_session_failed")
+            return "remote_session_failed"
         return None
 
     async def confirm_rollover_ready(self) -> bool:
@@ -280,13 +306,14 @@ class OpenAIAgentsProvider:
         except RuntimeError as exc:
             if "HTTP 404" not in str(exc):
                 raise
-            self._unavailable_session_id = session_id
-            self._preflight_session_status = None
-            self._confirmed_rollover_session = None
-            self._requested_rollover_reason = "remote_session_missing"
+            self._mark_session_unavailable(session_id, "remote_session_missing")
             return True
         self._preflight_session_status = session.get("status")
-        self._confirmed_rollover_session = session if session.get("status") == "idle" else None
+        usability = self._session_usability(session)
+        if usability == "terminal":
+            self._mark_session_unavailable(session_id, "remote_session_failed")
+            return True
+        self._confirmed_rollover_session = session if usability == "usable" else None
         return self._confirmed_rollover_session is not None
 
     async def session_items(self, cursor: str | None, limit: int = 50) -> SessionItemPage:
@@ -452,10 +479,11 @@ class OpenAIAgentsProvider:
     def _reconcile_before_wake(self, session_id: str, session: dict) -> ModelTurn | None:
         """Finish remote work without attributing it to the next ordinary wake."""
         status = session.get("status")
-        if status == "failed":
+        usability = self._session_usability(session)
+        if usability == "terminal":
             raise RuntimeError(
                 f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
-        if status == "idle":
+        if usability == "usable":
             latest = self._latest_turn(session_id)
             if latest is not None and latest.get("id") != self._last_turn_id:
                 self._completed_turn(session_id, session, latest)
@@ -480,7 +508,8 @@ class OpenAIAgentsProvider:
         if self._session_id is not None:
             if self._unavailable_session_id == self._session_id:
                 return self._intentional_rollover(
-                    "remote_session_missing", agent, desired_protocol,
+                    self._unavailable_session_reason or "remote_session_missing",
+                    agent, desired_protocol,
                     initial_input, allow_create, finalization_status="unavailable")
             try:
                 confirmed = self._confirmed_rollover_session
@@ -491,10 +520,15 @@ class OpenAIAgentsProvider:
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
-                self._unavailable_session_id = self._session_id
-                self._requested_rollover_reason = "remote_session_missing"
+                self._mark_session_unavailable(
+                    self._session_id, "remote_session_missing")
                 raise RemoteSessionUnavailable(str(exc)) from exc
             else:
+                if self._session_usability(session) == "terminal":
+                    self._mark_session_unavailable(
+                        self._session_id, "remote_session_failed")
+                    raise RemoteSessionUnavailable(
+                        "OpenAI Agents session is terminal and cannot accept another wake")
                 remote_agent_id = (session.get("agent") or {}).get("id")
                 if (self.agent_id is not None and remote_agent_id is not None
                         and remote_agent_id != self.agent_id):
@@ -698,6 +732,7 @@ class OpenAIAgentsProvider:
                     finalization_status)
             self._session_id, self._last_turn_id = new_session_id, None
             self._unavailable_session_id = None
+            self._unavailable_session_reason = None
             self._requested_rollover_reason = (
                 reason if rollover.get("reason") != reason else None)
             self._protocol_descriptor = persisted_descriptor
@@ -844,7 +879,7 @@ class OpenAIAgentsProvider:
         while time.monotonic() < expires:
             session = self._request("GET", f"/agents/sessions/{session_id}")
             status = session.get("status")
-            if status == "failed":
+            if self._session_usability(session) == "terminal":
                 raise RuntimeError(f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
             if status == "requires_action":
                 turn = self._required_actions_turn(session)
