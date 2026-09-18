@@ -576,14 +576,13 @@ class OpenAIAgentsProvider:
         if self.agent_id:
             body["agent_id"] = self.agent_id
         mutable_settings = self._desired_mutable_settings()
-        session = self._request("POST", "/agents/sessions", body)
-        session_id = session["id"]
         if self._lifecycle_bound:
-            self._lifecycle_call(
-                self._bind_initial_session, session_id, self.agent_id, body,
-                desired_protocol, mutable_settings)
-            self._pending_binding = None
+            reason = self._requested_rollover_reason or "initial_session"
+            return self._create_initial_session(
+                reason, body, desired_protocol, mutable_settings, fingerprint)
         else:
+            session = self._request("POST", "/agents/sessions", body)
+            session_id = session["id"]
             # Keep the standalone adapter's retry checkpoint behavior: if its
             # binding callback fails, the known remote ID is retried before use.
             self._session_id = session_id
@@ -596,6 +595,60 @@ class OpenAIAgentsProvider:
         self._protocol_descriptor = desired_protocol
         self._mutable_settings_descriptor = mutable_settings
         return session, True
+
+    def _create_initial_session(self, reason: str, body: dict[str, Any],
+                                descriptor: dict[str, Any],
+                                mutable_settings: dict[str, Any],
+                                fingerprint: str) -> tuple[dict, bool]:
+        """Create the first session only after its exact request is durable."""
+        attempt = self._lifecycle_call(
+            self._begin_rollover, None, reason, "runtime", body,
+            descriptor, mutable_settings)
+        attempt_id = attempt["id"]
+        if attempt.get("creation_state") == "create_uncertain":
+            raise RolloverRecoveryRequired(
+                "Initial session creation may have succeeded before Resident could "
+                "record its ID. The Agents API exposes no supported create-idempotency "
+                "or reconciliation contract, so automatic re-creation is blocked; "
+                f"create attempt {attempt_id} requires operator reconciliation.")
+        if attempt.get("creation_state") != "not_attempted":
+            raise RuntimeError(
+                f"Initial create attempt {attempt_id} is not in a creatable state: "
+                f"{attempt.get('creation_state')}")
+        persisted_body = attempt.get("create_request")
+        persisted_descriptor = attempt.get("protocol_descriptor")
+        persisted_mutable = attempt.get("mutable_settings")
+        if not isinstance(persisted_body, dict):
+            raise RuntimeError(
+                f"Initial create attempt {attempt_id} has no durable create request")
+        if (not isinstance(persisted_descriptor, dict)
+                or not isinstance(persisted_mutable, dict)):
+            raise RuntimeError(
+                f"Initial create attempt {attempt_id} has no durable configuration snapshot")
+        self._lifecycle_call(self._mark_rollover_create_started, attempt_id)
+        try:
+            session = self._request("POST", "/agents/sessions", persisted_body)
+            session_id = session["id"]
+            self._lifecycle_call(
+                self._bind_rollover, attempt_id, session_id,
+                persisted_descriptor.get("saved_agent_id"), "not_applicable")
+            # The binding and exact create-time descriptors are now one durable
+            # transaction. That is the point at which a new-chapter request for
+            # a previously sessionless Resident has been satisfied.
+            self._requested_rollover_reason = None
+            self._session_id, self._last_turn_id = session_id, None
+            self._pending_binding = None
+            self._protocol_descriptor = persisted_descriptor
+            self._mutable_settings_descriptor = persisted_mutable
+            self._tool_fingerprint = json.dumps(
+                persisted_body.get("agent", {}), sort_keys=True, separators=(",", ":"))
+            self._lifecycle_call(self._complete_rollover, attempt_id)
+            return session, True
+        except Exception as exc:
+            if self._definitive_create_rejection(exc):
+                self._lifecycle_call(
+                    self._fail_rollover, attempt_id, "create_rejected")
+            raise
 
     def _intentional_rollover(self, reason: str, agent: dict,
                               descriptor: dict[str, Any], initial_input: str | None,

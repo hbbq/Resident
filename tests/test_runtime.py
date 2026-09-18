@@ -78,6 +78,12 @@ class ThreadRecordingStore(Store):
             provider, session_id, agent_id, create_request,
             protocol_descriptor, mutable_settings)
 
+    def bind_session_rollover(self, rollover_id, new_session_id, agent_id,
+                              finalization_status):
+        self.binding_save_threads.append(threading.get_ident())
+        return super().bind_session_rollover(
+            rollover_id, new_session_id, agent_id, finalization_status)
+
 
 class ContinuationLifecycleProvider:
     def __init__(self, *, cancel=False):
@@ -1151,6 +1157,258 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(store.session_protocol("openai_agents", "session-1"))
             self.assertIsNone(store.session_mutable_settings("openai_agents", "session-1"))
             store.close()
+
+    def test_new_chapter_without_binding_is_satisfied_by_one_initial_create(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            provider = OpenAIAgentsProvider("test-key", "model")
+            requests = []
+
+            def fake_request(method, path, body=None, **_):
+                requests.append((method, path, body))
+                if method == "POST":
+                    return {"id": "session-initial", "status": "idle"}
+                if method == "GET":
+                    return {"id": "session-initial", "status": "idle",
+                            "agent": provider._agent_config([])}
+                raise AssertionError((method, path, body))
+
+            provider._request = fake_request
+            runtime = ResidentRuntime(
+                Config(Path(temporary), new_chapter=True), provider, store=store,
+                capabilities=[], owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+
+            first, created = provider._ensure_session(
+                [], initial_input="initial bootstrap")
+            second, reused_create = provider._ensure_session(
+                [], initial_input="following wake")
+
+            self.assertTrue(created)
+            self.assertFalse(reused_create)
+            self.assertEqual("session-initial", first["id"])
+            self.assertEqual("session-initial", second["id"])
+            self.assertEqual(1, sum(method == "POST" for method, _, _ in requests))
+            self.assertIsNone(provider._requested_rollover_reason)
+            attempt = store.connection.execute("""
+                SELECT old_session_id,reason,creation_state,status
+                FROM session_rollovers
+            """).fetchone()
+            self.assertEqual(
+                (None, "explicit_new_chapter", "bound", "completed"), tuple(attempt))
+            runtime.close()
+
+    def test_initial_create_intent_is_durable_before_remote_post(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            provider = OpenAIAgentsProvider("test-key", "model")
+            observed = []
+
+            def fake_request(method, path, body=None, **_):
+                row = store.connection.execute("""
+                    SELECT old_session_id,creation_state,create_request_json,
+                           protocol_descriptor_json,mutable_settings_json
+                    FROM session_rollovers WHERE status='pending'
+                """).fetchone()
+                observed.append((method, path, body, dict(row) if row else None))
+                return {"id": "session-initial", "status": "idle"}
+
+            provider._request = fake_request
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            provider._ensure_session([], initial_input="bootstrap-identity")
+
+            _, _, posted, durable = observed[0]
+            self.assertIsNone(durable["old_session_id"])
+            self.assertEqual("create_uncertain", durable["creation_state"])
+            self.assertEqual(posted, json.loads(durable["create_request_json"]))
+            self.assertIsNotNone(durable["protocol_descriptor_json"])
+            self.assertIsNotNone(durable["mutable_settings_json"])
+            runtime.close()
+
+    def test_initial_create_failure_before_post_preserves_exact_request_for_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            seed = OpenAIAgentsProvider(
+                "test-key", "model-a", reasoning_effort="low")
+
+            def fail_before_post(_):
+                raise sqlite3.OperationalError("simulated pre-POST failure")
+
+            store.mark_session_rollover_create_started = fail_before_post
+            seed._request = lambda *_args, **_kwargs: self.fail("POST must not run")
+            runtime = ResidentRuntime(
+                Config(Path(temporary), new_chapter=True), seed, store=store,
+                capabilities=[], owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            with self.assertRaisesRegex(sqlite3.OperationalError, "pre-POST"):
+                seed._ensure_session([], initial_input="bootstrap-a")
+            pending = store.pending_session_rollover("openai_agents")
+            self.assertEqual("not_attempted", pending["creation_state"])
+            self.assertEqual("bootstrap-a", pending["create_request"]["input"])
+            runtime.close()
+
+            reopened = Store(path)
+            restarted = OpenAIAgentsProvider(
+                "test-key", "model-b", reasoning_effort="high")
+            requests = []
+
+            def fake_request(method, request_path, body=None, **_):
+                requests.append((method, request_path, body))
+                if method == "POST":
+                    return {"id": "session-initial", "status": "idle"}
+                if method == "GET":
+                    return {"id": "session-initial", "status": "idle", "agent": {}}
+                if method == "PATCH":
+                    return {"id": "session-initial", "status": "idle"}
+                raise AssertionError((method, request_path, body))
+
+            restarted._request = fake_request
+            resumed_runtime = ResidentRuntime(
+                Config(Path(temporary), new_chapter=True), restarted, store=reopened,
+                capabilities=[], owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            restarted._ensure_session([], initial_input="bootstrap-b")
+            self.assertEqual("bootstrap-a", requests[0][2]["input"])
+            self.assertEqual("model-a", requests[0][2]["agent"]["model"])
+            self.assertIsNone(restarted._requested_rollover_reason)
+
+            restarted._ensure_session([], initial_input="following wake")
+            self.assertEqual({"agent": {
+                "model": "model-b", "reasoning": {"effort": "high"},
+            }}, requests[-1][2])
+            self.assertEqual(1, sum(method == "POST" for method, _, _ in requests))
+            resumed_runtime.close()
+
+    def test_definitive_initial_create_rejection_is_retryable_and_keeps_new_chapter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            provider = OpenAIAgentsProvider("test-key", "model")
+            attempts = 0
+
+            def fake_request(method, path, body=None, **_):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("OpenAI Agents API returned HTTP 400: rejected")
+                return {"id": "session-retried", "status": "idle"}
+
+            provider._request = fake_request
+            runtime = ResidentRuntime(
+                Config(Path(temporary), new_chapter=True), provider, store=store,
+                capabilities=[], owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+                provider._ensure_session([], initial_input="bootstrap")
+            failed = store.connection.execute("""
+                SELECT creation_state,status FROM session_rollovers
+            """).fetchone()
+            self.assertEqual(("rejected", "failed"), tuple(failed))
+            self.assertEqual("explicit_new_chapter", provider._requested_rollover_reason)
+
+            provider._ensure_session([], initial_input="bootstrap")
+            self.assertEqual(2, attempts)
+            self.assertIsNone(provider._requested_rollover_reason)
+            runtime.close()
+
+    def test_uncertain_initial_create_blocks_restart_and_does_not_duplicate_bootstrap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            original_bind = store.bind_session_rollover
+
+            def fail_binding(*_):
+                raise sqlite3.OperationalError("simulated post-POST crash")
+
+            store.bind_session_rollover = fail_binding
+            provider = OpenAIAgentsProvider("test-key", "model")
+            posted = []
+
+            def create(method, request_path, body=None, **_):
+                posted.append(body)
+                return {"id": "unknown-to-store", "status": "idle"}
+
+            provider._request = create
+            runtime = ResidentRuntime(
+                Config(Path(temporary), new_chapter=True), provider, store=store,
+                capabilities=[], owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            with self.assertRaisesRegex(sqlite3.OperationalError, "post-POST"):
+                provider._ensure_session([], initial_input="one bootstrap")
+            self.assertEqual(1, len(posted))
+            self.assertEqual("create_uncertain", store.pending_session_rollover(
+                "openai_agents")["creation_state"])
+            store.bind_session_rollover = original_bind
+            runtime.close()
+
+            reopened = Store(path)
+            restarted = OpenAIAgentsProvider("test-key", "model")
+            restarted._request = lambda *_args, **_kwargs: self.fail(
+                "uncertain create must exclude another POST")
+            resumed_runtime = ResidentRuntime(
+                Config(Path(temporary), new_chapter=True), restarted, store=reopened,
+                capabilities=[], owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+            with self.assertRaisesRegex(RolloverRecoveryRequired,
+                                       "Initial session creation may have succeeded"):
+                restarted._ensure_session([], initial_input="different bootstrap")
+            durable = reopened.pending_session_rollover("openai_agents")
+            self.assertEqual("one bootstrap", durable["create_request"]["input"])
+            self.assertEqual("explicit_new_chapter", durable["reason"])
+            resumed_runtime.close()
+
+    def test_recovered_initial_create_keeps_immutable_snapshot_then_rolls_over(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            seed = OpenAIAgentsProvider("test-key", "model")
+            original_tool = ToolSpec(
+                "original_contract", "Original contract", {"type": "object"})
+            original_agent = seed._agent_config([original_tool])
+            original_protocol = seed._agent_protocol(original_agent)
+            attempt = store.begin_session_rollover(
+                "openai_agents", None, "initial_session", "runtime", {
+                    "environment": {"type": "none"}, "agent": original_agent,
+                    "input": "bootstrap-a", "metadata": {"managed_by": "resident"},
+                }, original_protocol, seed._desired_mutable_settings())
+            store.close()
+
+            reopened = Store(path)
+            restarted = OpenAIAgentsProvider("test-key", "model")
+            changed_tool = ToolSpec(
+                "changed_contract", "Changed contract", {"type": "object"})
+            creates = []
+
+            def fake_request(method, request_path, body=None, **_):
+                if method == "POST":
+                    creates.append(body)
+                    return {"id": f"session-{len(creates)}", "status": "idle"}
+                if method == "GET":
+                    session_id = request_path.rsplit("/", 1)[-1]
+                    return {"id": session_id, "status": "idle", "agent": {}}
+                raise AssertionError((method, request_path, body))
+
+            restarted._request = fake_request
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), restarted, store=reopened, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            restarted._ensure_session([changed_tool], initial_input="ignored-bootstrap-b")
+
+            self.assertEqual("bootstrap-a", creates[0]["input"])
+            self.assertEqual("original_contract", creates[0]["agent"]["tools"][0]["name"])
+            self.assertEqual(original_protocol, reopened.session_protocol(
+                "openai_agents", "session-1"))
+            self.assertTrue(restarted.protocol_change_requires_rollover([changed_tool]))
+
+            restarted._ensure_session([changed_tool], initial_input="bootstrap-b")
+            self.assertEqual(2, len(creates))
+            self.assertEqual("changed_contract", creates[1]["agent"]["tools"][0]["name"])
+            self.assertNotEqual(attempt["id"], reopened.connection.execute("""
+                SELECT id FROM session_rollovers ORDER BY created_at DESC LIMIT 1
+            """).fetchone()[0])
+            runtime.close()
 
     def test_legacy_binding_with_partial_remote_protocol_rolls_over_conservatively(self):
         with tempfile.TemporaryDirectory() as temporary:
