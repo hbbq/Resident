@@ -123,7 +123,8 @@ def build_host(config: Config) -> RuntimeHost:
     policies = {}
     private_producers = {}
     resolved_tokens: dict[str, str] = {}
-    recipients = lambda: frozenset((*runtimes, "owner"))
+    recipient_addresses = frozenset(definition.id for definition in catalog.residents)
+    recipients = lambda: recipient_addresses
     try:
         for definition in catalog.residents:
             instance_config = replace(

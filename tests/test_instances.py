@@ -120,6 +120,8 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_durable_message_handoff_and_reply_are_independent(self):
         send_a = messaging_capability(self.mailbox, "a", lambda: self.host.recipients)
+        self.assertEqual(["a", "b"],
+                         send_a.input_schema["properties"]["recipient"]["enum"])
         result = await send_a.handler({"recipient": "b", "content": "hello"})
         self.assertEqual("pending", result["status"])
         await self.host.deliver_mailbox()
@@ -132,6 +134,13 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         await self.host.deliver_mailbox()
         reply_event = await self.host.queues["a"].get()
         self.assertEqual(reply["message_id"], reply_event.payload["message_id"])
+
+    async def test_generic_messaging_does_not_address_owner(self):
+        self.assertEqual(frozenset({"a", "b"}), self.host.recipients)
+        send_a = messaging_capability(self.mailbox, "a", lambda: self.host.recipients)
+
+        with self.assertRaisesRegex(ValueError, "Unknown message recipient: owner"):
+            await send_a.handler({"recipient": "owner", "content": "hello"})
 
     async def test_mailbox_does_not_deliver_or_wake_a_non_subscriber(self):
         self.host.policies["b"] = InstancePolicy(frozenset({"homeops"}))

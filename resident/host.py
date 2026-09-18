@@ -26,9 +26,11 @@ class InstancePolicy:
 
 def messaging_capability(mailbox: Mailbox, sender: str,
                          recipients: Callable[[], Iterable[str]]) -> Capability:
+    recipient_addresses = frozenset(recipients())
+
     async def send(arguments: dict) -> dict:
         recipient = arguments["recipient"]
-        if recipient not in set(recipients()):
+        if recipient not in recipient_addresses:
             raise ValueError(f"Unknown message recipient: {recipient}")
         message = mailbox.send(
             sender, recipient, arguments["content"],
@@ -42,7 +44,7 @@ def messaging_capability(mailbox: Mailbox, sender: str,
         "messaging_send",
         "Send an asynchronous message to a logical recipient. This does not wait for a reply.",
         {"type": "object", "properties": {
-            "recipient": {"type": "string"},
+            "recipient": {"type": "string", "enum": sorted(recipient_addresses)},
             "content": {"type": "string"},
             "ttl_seconds": {"type": ["integer", "null"], "minimum": 1, "maximum": 86400},
         }, "required": ["recipient", "content"], "additionalProperties": False},
@@ -82,7 +84,7 @@ class RuntimeHost:
 
     @property
     def recipients(self) -> frozenset[str]:
-        return frozenset((*self.runtimes, "owner"))
+        return frozenset(self.runtimes)
 
     async def route(self, event: WakeEvent) -> tuple[str, ...]:
         delivered: list[str] = []
@@ -104,15 +106,6 @@ class RuntimeHost:
                 )
                 if self.policies[recipient].receives(event):
                     await self.queues[recipient].put(event)
-                    delivered += int(self.mailbox.delivered(message["id"]))
-            elif recipient == "owner" and message["sender"] in self.runtimes:
-                runtime = self.runtimes[message["sender"]]
-                try:
-                    await runtime.owner_transport.send_text(message["content"])
-                except Exception as exc:
-                    self.diagnostic_output(
-                        f"Mailbox delivery {message['id']} failed: {type(exc).__name__}")
-                else:
                     delivered += int(self.mailbox.delivered(message["id"]))
             # Unknown/offline logical addresses remain pending until TTL expiry.
         return delivered
