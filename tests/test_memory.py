@@ -12,6 +12,7 @@ from resident.memory import MemoryCurator, SessionItemPage
 from resident.store import (MAX_ACTIVE_OWNER_GUIDANCE_BYTES,
                             MAX_ACTIVE_OWNER_GUIDANCE_COUNT,
                             MAX_OWNER_GUIDANCE_ENTRY_BYTES, Store, utc_now)
+from resident.tools import ToolRegistry
 
 
 class FakeSource:
@@ -77,6 +78,50 @@ class PageSource:
 
 
 class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resident_memory_tools_expose_only_active_knowledge(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            for memory_id, content in (("active", "current fact"),
+                                       ("superseded", "retired fact"),
+                                       ("invalidated", "incorrect fact")):
+                store.apply_curator_batch(
+                    "openai_agents", "s", memory_id, memory_id, f"create-{memory_id}", [{
+                        "memory_id": memory_id, "operation": "create", "kind": "fact",
+                        "content": content, "provenance": [{"item_id": memory_id}],
+                    }])
+            store.apply_curator_batch(
+                "openai_agents", "s", "supersede", "supersede", "supersede", [{
+                    "memory_id": "superseded", "operation": "supersede",
+                    "content": "retired fact", "provenance": [{"item_id": "supersede"}],
+                }])
+            store.apply_curator_batch(
+                "openai_agents", "s", "invalidate", "invalidate", "invalidate", [{
+                    "memory_id": "invalidated", "operation": "invalidate",
+                    "content": "incorrect fact", "provenance": [{"item_id": "invalidate"}],
+                }])
+            registry = ToolRegistry(store, [], lambda _: {}, lambda *_: None)
+
+            active = await registry.execute("get_long_term_memory", {"id": "active"})
+            superseded = await registry.execute(
+                "get_long_term_memory", {"id": "superseded"})
+            invalidated = await registry.execute(
+                "get_long_term_memory", {"id": "invalidated"})
+            unknown = await registry.execute("get_long_term_memory", {"id": "unknown"})
+            search = await registry.execute("search_long_term_memory", {})
+
+            self.assertEqual("current fact", active.output["memory"]["content"])
+            unavailable = {"ok": True, "memory": None}
+            self.assertEqual(unavailable, superseded.output)
+            self.assertEqual(unavailable, invalidated.output)
+            self.assertEqual(unavailable, unknown.output)
+            self.assertEqual(
+                ["active"], [memory["id"] for memory in search.output["memories"]])
+            self.assertEqual("retired fact", store.memory("superseded")["content"])
+            self.assertEqual("superseded", store.memory("superseded")["status"])
+            self.assertEqual("incorrect fact", store.memory("invalidated")["content"])
+            self.assertEqual("invalidated", store.memory("invalidated")["status"])
+            store.close()
+
     async def test_curator_checkpoint_and_idempotent_memory_with_redacted_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")

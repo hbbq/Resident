@@ -71,7 +71,7 @@ class ToolRegistry:
                         offset={"type": "integer", "minimum": 0, "maximum": 1000})),
                 self._search_long_term_memory),
             "get_long_term_memory": Tool(ToolSpec("get_long_term_memory",
-                "Read one curated memory and its audit provenance by id. This is read-only.",
+                "Read one active curated memory and its audit provenance by id. This is read-only.",
                 _schema(("id",), id={"type": "string"})), self._get_long_term_memory),
             "set_owner_guidance": Tool(ToolSpec("set_owner_guidance",
                 "Persist an instruction only when the Owner explicitly intends it to remain in force. "
@@ -187,7 +187,8 @@ class ToolRegistry:
             a.get("query", ""), limit=a.get("limit", 10), offset=a.get("offset", 0))}
 
     def _get_long_term_memory(self, a: dict[str, Any]) -> dict[str, Any]:
-        return {"memory": self.store.memory(a["id"])}
+        memory = self.store.memory(a["id"])
+        return {"memory": memory if memory is not None and memory["status"] == "active" else None}
 
     def _set_owner_guidance(self, a: dict[str, Any]) -> dict[str, Any]:
         guidance_id = self.store.set_owner_guidance(a["content"], guidance_id=a.get("id"))
