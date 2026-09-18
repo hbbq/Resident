@@ -124,11 +124,10 @@ class OpenAIAgentsProvider:
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required for the OpenAI provider")
         self.api_key, self.model, self.base_url = api_key, model, base_url.rstrip("/")
-        # Keep the operator-supplied identity separate from the identity learned
-        # from the durable session binding. The former always wins; the latter
-        # supplies continuity when no current override is configured.
+        # Only an operator-supplied ID is known to name a saved reusable Agent.
+        # The ID nested in an inline-created session describes that session's
+        # resolved agent, but is not valid as agent_id on a later session create.
         self.agent_id = agent_id
-        self._bound_agent_id: str | None = None
         self.poll_seconds = poll_seconds
         self.timeout_seconds = timeout_seconds
         self._session_id: str | None = None
@@ -155,7 +154,11 @@ class OpenAIAgentsProvider:
             if self.agent_id is None or self.agent_id == persisted_agent_id:
                 self._session_id = binding["session_id"]
                 self._last_turn_id = binding.get("last_turn_id")
-                self._bound_agent_id = persisted_agent_id
+                if self.agent_id is None and persisted_agent_id is not None:
+                    # Older versions persisted session-local agent IDs. Keep the
+                    # recoverable session and turn, but migrate away from ever
+                    # presenting that ID as a saved Agent resource.
+                    save(self._session_id, None, self._last_turn_id)
 
     def bind_action_store(self, begin: Callable[..., dict], complete: Callable[..., None]) -> None:
         self._begin_action, self._complete_action = begin, complete
@@ -334,11 +337,6 @@ class OpenAIAgentsProvider:
                     self._session_id = None
                     self._last_turn_id = None
                 else:
-                    resolved_agent_id = self.agent_id or remote_agent_id or self._bound_agent_id
-                    if resolved_agent_id != self._bound_agent_id:
-                        self._bound_agent_id = resolved_agent_id
-                        self._persist_binding(
-                            self._session_id, resolved_agent_id, self._last_turn_id)
                     remote_agent = session.get("agent")
                     if self._tool_fingerprint is None:
                         if (not isinstance(remote_agent, dict)
@@ -372,17 +370,13 @@ class OpenAIAgentsProvider:
             "input": initial_input,
             "metadata": {"managed_by": "resident"},
         }
-        intended_agent_id = self.agent_id or self._bound_agent_id
-        if intended_agent_id:
-            body["agent_id"] = intended_agent_id
+        if self.agent_id:
+            body["agent_id"] = self.agent_id
         session = self._request("POST", "/agents/sessions", body)
         self._session_id = session["id"]
-        resolved_agent_id = (
-            self.agent_id or (session.get("agent") or {}).get("id") or self._bound_agent_id)
-        self._bound_agent_id = resolved_agent_id
         self._last_turn_id = None
         self._tool_fingerprint = fingerprint
-        self._persist_binding(self._session_id, resolved_agent_id, None)
+        self._persist_binding(self._session_id, self.agent_id, None)
         return session, True
 
     def _persist_binding(self, session_id: str, agent_id: str | None,
@@ -460,9 +454,7 @@ class OpenAIAgentsProvider:
         if self._active_turn_id == turn_id:
             self._active_turn_id = None
         self._last_turn_id = turn_id
-        agent_id = self.agent_id or (session.get("agent") or {}).get("id") or self._bound_agent_id
-        self._bound_agent_id = agent_id
-        self._persist_binding(session_id, agent_id, turn_id)
+        self._persist_binding(session_id, self.agent_id, turn_id)
         usage = turn.get("usage") or session.get("usage") or {}
         return ModelTurn(turn_id, message=message,
                          input_tokens=usage.get("input_tokens"),

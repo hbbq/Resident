@@ -736,7 +736,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual("turn-1", first.response_id)
             self.assertEqual("session-1", store.agent_session_binding("openai_agents")["session_id"])
-            self.assertEqual("agent-1", store.agent_session_binding("openai_agents")["agent_id"])
+            self.assertIsNone(store.agent_session_binding("openai_agents")["agent_id"])
             self.assertIsNone(store.agent_session_binding("openai_agents")["last_turn_id"])
             completed = await provider.respond(
                 first_context, [], [ToolResult("call-1", {"ok": True})], first.response_id)
@@ -757,7 +757,6 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 owner_output=lambda _: None, diagnostic_output=lambda _: None)
             self.assertEqual("session-1", recovered._session_id)
             self.assertEqual("turn-1", recovered._last_turn_id)
-            self.assertEqual("agent-1", recovered._bound_agent_id)
 
             second_context = json.dumps({
                 "wake_event": {"id": "wake-2", "source": "connector", "payload": {}}})
@@ -781,7 +780,92 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 [reopened_store.owner_thread_id], reopened_store.binding_save_threads)
             reopened_runtime.close()
 
-    def test_agents_binding_restores_persisted_agent_identity_without_override(self):
+    async def test_agents_restart_replaces_missing_session_without_reusing_session_agent_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            sessions = {}
+            creates = []
+
+            def fake_request(method, request_path, body=None, **_):
+                if request_path == "/agents/sessions" and method == "POST":
+                    if "agent_id" in body:
+                        raise RuntimeError(
+                            f"No persisted agent found: {body['agent_id']}. "
+                            "Session-local agent IDs cannot be reused")
+                    number = len(creates) + 1
+                    session_id, turn_id = f"session-{number}", f"turn-{number}"
+                    creates.append(body)
+                    sessions[session_id] = {
+                        "turn_id": turn_id,
+                        "agent_id": f"agent-session-{number}",
+                        "input": body["input"],
+                    }
+                    return {
+                        "id": session_id, "status": "idle",
+                        "agent": {"id": f"agent-session-{number}"},
+                    }
+                if method == "GET" and request_path.startswith("/agents/sessions/"):
+                    parts = request_path.split("/")
+                    session_id = parts[3].split("?", 1)[0]
+                    if session_id not in sessions:
+                        raise RuntimeError("OpenAI Agents API returned HTTP 404: gone")
+                    state = sessions[session_id]
+                    if "/items?" in request_path:
+                        return {"data": [{
+                            "id": f"input-{state['turn_id']}", "type": "message",
+                            "role": "user", "turn_id": state["turn_id"],
+                            "content": [{"type": "input_text", "text": state["input"]}],
+                        }]}
+                    if "/turns/" in request_path:
+                        return {"id": state["turn_id"], "status": "completed"}
+                    return {
+                        "id": session_id, "status": "idle",
+                        "agent": {"id": state["agent_id"]},
+                    }
+                raise AssertionError((method, request_path, body))
+
+            store = Store(path)
+            first_provider = OpenAIAgentsProvider(
+                "test-key", "gpt-5.6-luna", poll_seconds=0)
+            first_provider._request = fake_request
+            first_runtime = ResidentRuntime(
+                Config(Path(temporary)), first_provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            first = await first_provider.respond(json.dumps({
+                "wake_event": {"id": "wake-1", "source": "connector", "payload": {}},
+            }), [], [])
+            self.assertEqual("turn-1", first.response_id)
+
+            # Reproduce a binding written by the broken implementation, then
+            # make the original remote session unavailable before restart.
+            store.save_agent_session_binding(
+                "openai_agents", "session-1", "agent-session-1", "turn-1")
+            first_runtime.close()
+            sessions.pop("session-1")
+
+            reopened_store = Store(path)
+            restarted_provider = OpenAIAgentsProvider(
+                "test-key", "gpt-5.6-luna", poll_seconds=0)
+            restarted_provider._request = fake_request
+            restarted_runtime = ResidentRuntime(
+                Config(Path(temporary)), restarted_provider, store=reopened_store,
+                capabilities=[], owner_output=lambda _: None,
+                diagnostic_output=lambda _: None)
+
+            second = await restarted_provider.respond(json.dumps({
+                "wake_event": {"id": "wake-2", "source": "connector", "payload": {}},
+            }), [], [])
+
+            self.assertEqual("turn-2", second.response_id)
+            self.assertEqual(2, len(creates))
+            self.assertTrue(all("agent_id" not in body for body in creates))
+            binding = reopened_store.agent_session_binding("openai_agents")
+            self.assertEqual("session-2", binding["session_id"])
+            self.assertIsNone(binding["agent_id"])
+            self.assertEqual("turn-2", binding["last_turn_id"])
+            restarted_runtime.close()
+
+    def test_agents_binding_migrates_legacy_session_local_agent_id(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
         binding = {
             "session_id": "session-persisted",
@@ -789,11 +873,15 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             "last_turn_id": "turn-persisted",
         }
 
-        provider.bind_session_store(lambda: binding, lambda *_: None)
+        provider.bind_session_store(
+            lambda: dict(binding),
+            lambda session_id, agent_id, last_turn_id: binding.update(
+                session_id=session_id, agent_id=agent_id, last_turn_id=last_turn_id),
+        )
 
         self.assertEqual("session-persisted", provider._session_id)
-        self.assertEqual("agent-persisted", provider._bound_agent_id)
         self.assertEqual("turn-persisted", provider._last_turn_id)
+        self.assertIsNone(binding["agent_id"])
 
     def test_agents_restored_matching_session_needs_no_configuration_update(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
@@ -821,7 +909,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("GET", "/agents/sessions/session-1", None)], requests)
         self.assertIsNotNone(provider._tool_fingerprint)
 
-    def test_agents_missing_session_reuses_persisted_agent_and_saves_replacement(self):
+    def test_agents_missing_session_ignores_legacy_agent_id_and_saves_replacement(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
         binding = {
             "session_id": "session-missing",
@@ -850,13 +938,13 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("session-replacement", session["id"])
         self.assertTrue(created)
         create_body = requests[-1][2]
-        self.assertEqual("agent-persisted", create_body["agent_id"])
+        self.assertNotIn("agent_id", create_body)
         self.assertEqual("gpt-5.6-luna", create_body["agent"]["model"])
         self.assertEqual("replacement wake", create_body["input"])
         self.assertNotIn("name", create_body["agent"])
         self.assertEqual({
             "session_id": "session-replacement",
-            "agent_id": "agent-persisted",
+            "agent_id": None,
             "last_turn_id": None,
         }, binding)
 
@@ -954,8 +1042,8 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(create_calls))
         self.assertEqual([owner_thread_id] * 3, [call[0] for call in save_calls])
         self.assertEqual(
-            [("session-1", "agent-1", None), ("session-1", "agent-1", None),
-             ("session-1", "agent-1", "turn-1")],
+            [("session-1", None, None), ("session-1", None, None),
+             ("session-1", None, "turn-1")],
             [call[1:] for call in save_calls])
 
     def test_agents_configuration_change_is_deferred_until_session_is_idle(self):
