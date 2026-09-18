@@ -19,7 +19,7 @@ from resident.store import Store, utc_now
 
 
 class LifecycleProvider:
-    """Deterministic provider that exercises durable state, capability, and communication tools."""
+    """Deterministic provider that exercises capability and communication tools."""
 
     def __init__(self):
         self.contexts: list[dict] = []
@@ -32,11 +32,6 @@ class LifecycleProvider:
             self.round += 1
             content = document["wake_event"]["payload"].get("content", document["wake_event"]["reason"])
             return ModelTurn(f"response-{self.round}", tool_calls=(
-                ToolCall(f"remember-{self.round}", "remember", {
-                    "content": f"Wake observed: {content}", "kind": "experience",
-                    "importance": "low", "confidence": "high", "provenance": "resident",
-                    "standing": False,
-                }),
                 ToolCall(f"time-{self.round}", "diagnostics_current_time", {}),
                 ToolCall(f"message-{self.round}", "send_owner_message", {"content": f"I observed {content}"}),
             ))
@@ -84,11 +79,8 @@ class ContinuationLifecycleProvider:
 
     async def respond(self, context, tools, results, previous_response_id=None):
         if previous_response_id is None:
-            return ModelTurn("continuation", tool_calls=(ToolCall("call", "remember", {
-                "content": "work", "kind": "experience", "importance": "low",
-                "confidence": "medium", "provenance": "resident",
-                "standing": False,
-            }),))
+            return ModelTurn("continuation", tool_calls=(ToolCall(
+                "call", "create_intention", {"content": "work"}),))
         if self.cancel:
             await self.release.wait()
         raise RuntimeError("continuation failed")
@@ -170,10 +162,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dynamic_capability_cannot_shadow_core_tool(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(ValueError, "conflicts with a core tool: remember"):
+            with self.assertRaisesRegex(ValueError, "conflicts with a core tool: create_intention"):
                 ResidentRuntime(
                     Config(Path(temporary)), MessageOnlyProvider(),
-                    capabilities=[self.capability("remember")],
+                    capabilities=[self.capability("create_intention")],
                     owner_output=lambda _: None, diagnostic_output=lambda _: None)
 
     async def test_default_diagnostics_hide_successful_spontaneous_wake_but_keep_journal(self):
@@ -335,7 +327,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("model.message", event_types)
             runtime.close()
 
-    async def test_full_lifecycle_retains_identity_and_memory_across_restart(self):
+    async def test_full_lifecycle_retains_identity_and_communication_across_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))
             delivered: list[str] = []
@@ -348,10 +340,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             second_provider = LifecycleProvider()
             second = ResidentRuntime(config, second_provider, owner_output=delivered.append, diagnostic_output=lambda _: None)
             self.assertEqual(identity, second.resident.id)
-            await second.process(second.owner_message_event("what do you remember about hello home?"))
+            await second.process(second.owner_message_event("what did I say before?"))
 
             context = second_provider.contexts[0]
-            self.assertTrue(any("hello home" in m["content"] for m in context["retrieved_memories"]))
             self.assertTrue(any(m["content"] == "hello home" for m in context["recent_communication"]))
             self.assertEqual(2, len(delivered))
             statuses = [r[0] for r in second.store.connection.execute("SELECT status FROM wake_runs")]
@@ -407,17 +398,15 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_context_is_bounded_and_trigger_is_complete(self):
         with tempfile.TemporaryDirectory() as temporary:
-            config = Config(Path(temporary), context_memories=2, context_messages=2)
+            config = Config(Path(temporary), context_messages=2)
             provider = LifecycleProvider()
             runtime = ResidentRuntime(config, provider, owner_output=lambda _: None, diagnostic_output=lambda _: None)
             for number in range(6):
-                runtime.store.remember(f"bounded topic {number}", "test")
                 runtime.store.add_message("inbound", runtime.owner.id, f"older {number}")
             event = runtime.owner_message_event("bounded topic with full payload")
             await runtime.process(event)
             context = provider.contexts[0]
             self.assertEqual("bounded topic with full payload", context["wake_event"]["payload"]["content"])
-            self.assertLessEqual(len(context["retrieved_memories"]), 2)
             self.assertLessEqual(len(context["recent_communication"]), 2)
             runtime.close()
 
@@ -553,7 +542,7 @@ class StoreTests(unittest.TestCase):
             store = Store(path)
             action = store.begin_agent_tool_action(
                 "openai_agents", "session", "turn", "call", "clock", {})
-            self.assertEqual(11, store.connection.execute(
+            self.assertEqual(12, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertFalse(action["attachments_ephemeral"])
             self.assertEqual({"ok": True}, action["output"])
@@ -579,7 +568,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(11, store.connection.execute(
+            self.assertEqual(12, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
@@ -1572,6 +1561,29 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(replay["attachments_ephemeral"])
             store.close()
 
+    def test_legacy_memories_table_is_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript("""
+                CREATE TABLE schema_version(version INTEGER NOT NULL);
+                INSERT INTO schema_version VALUES(11);
+                CREATE TABLE memories(
+                  id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT NOT NULL,
+                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                INSERT INTO memories VALUES('legacy','obsolete','resident','now','now');
+            """)
+            connection.commit()
+            connection.close()
+
+            store = Store(path)
+
+            self.assertEqual(12, store.connection.execute(
+                "SELECT version FROM schema_version").fetchone()[0])
+            self.assertIsNone(store.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone())
+            store.close()
+
     def test_restart_restores_session_and_replays_completed_action_without_reclaiming(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "resident.sqlite3"
@@ -1714,7 +1726,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("all intentional communication", requests[0]["instructions"])
         self.assertIn("final response message is wake-result diagnostic text only",
                       requests[0]["instructions"])
-        self.assertIn("supplied owner_guidance", requests[0]["instructions"])
+        self.assertIn("Local events are factual observations", requests[0]["instructions"])
 
     async def test_image_tool_result_is_sent_as_multimodal_ephemeral_content(self):
         provider = OpenAIResponsesProvider("test-key", "vision-model")

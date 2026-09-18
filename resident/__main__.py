@@ -131,8 +131,6 @@ def build_host(config: Config) -> RuntimeHost:
                 config, data_dir=config.data_dir / "instances" / definition.id,
                 instance_id=definition.id, resident_name=definition.name,
                 personality=definition.personality, role=definition.role,
-                memory_enabled=definition.memory.get("enabled", True),
-                context_memories=definition.memory.get("context_limit", config.context_memories),
                 owner_communication_enabled=(
                     definition.owner_transport is not None or definition.id == catalog.default_id),
                 provider=definition.agent.provider, model=definition.agent.model,

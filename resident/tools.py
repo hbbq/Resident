@@ -11,14 +11,9 @@ from .store import Store
 
 
 CORE_TOOL_NAMES = frozenset({
-    "remember", "recall", "update_memory", "forget", "create_intention",
-    "update_intention", "send_owner_message", "schedule_wakeup",
+    "create_intention", "update_intention", "send_owner_message", "schedule_wakeup",
     "search_communication", "list_wake_history",
 })
-
-MEMORY_KINDS = ["fact", "preference", "rule", "hypothesis", "experience", "unknown"]
-MEMORY_LEVELS = ["low", "medium", "high"]
-MEMORY_PROVENANCES = ["owner", "resident", "connector", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -35,35 +30,9 @@ class ToolRegistry:
     def __init__(self, store: Store, capabilities: Sequence[Capability],
                  send_message: Callable[[str], Awaitable[dict[str, Any]] | dict[str, Any]],
                  emit: Callable[[str, dict[str, Any]], None], *,
-                 current_run_id: str | None = None, memory_enabled: bool = True,
-                 owner_communication_enabled: bool = True):
+                 current_run_id: str | None = None, owner_communication_enabled: bool = True):
         self.store, self.emit, self.current_run_id = store, emit, current_run_id
         self.tools: dict[str, Tool] = {
-            "remember": Tool(ToolSpec("remember",
-                "Persist a selective autobiographical memory with your own descriptive assessment. "
-                "Provenance describes the underlying information source; it does not enact policy. "
-                "Set standing true only for an Owner-derived preference or rule that should be supplied "
-                "as durable guidance across future wakes, even without textual relevance.",
-                _schema(("content", "kind", "importance", "confidence", "provenance", "standing"),
-                        content={"type": "string"}, kind={"type": "string", "enum": MEMORY_KINDS},
-                        importance={"type": "string", "enum": MEMORY_LEVELS},
-                        confidence={"type": "string", "enum": MEMORY_LEVELS},
-                        provenance={"type": "string", "enum": MEMORY_PROVENANCES},
-                        standing={"type": "boolean"})), self._remember),
-            "recall": Tool(ToolSpec("recall", "Search persistent memories by words, ranked by relevance and semantic metadata, or list the most durable memories.",
-                _schema(("query",), query={"type": "string"}, limit={"type": "integer", "minimum": 1, "maximum": 20})), self._recall),
-            "update_memory": Tool(ToolSpec("update_memory",
-                "Refine an existing memory's content or assessment instead of accumulating avoidable "
-                "contradictions, especially when the Owner changes standing guidance.",
-                _schema(("id",), id={"type": "string"}, content={"type": "string"},
-                        kind={"type": "string", "enum": MEMORY_KINDS},
-                        importance={"type": "string", "enum": MEMORY_LEVELS},
-                        confidence={"type": "string", "enum": MEMORY_LEVELS},
-                        provenance={"type": "string", "enum": MEMORY_PROVENANCES},
-                        standing={"type": "boolean"}) |
-                {"minProperties": 2}), self._update_memory),
-            "forget": Tool(ToolSpec("forget", "Delete a memory by id.",
-                _schema(("id",), id={"type": "string"})), self._forget),
             "create_intention": Tool(ToolSpec("create_intention", "Persist a small pending intention for a future wake.",
                 _schema(("content",), content={"type": "string"})), self._create_intention),
             "update_intention": Tool(ToolSpec("update_intention", "Change an intention's content or status.",
@@ -95,9 +64,6 @@ class ToolRegistry:
                         offset={"type": "integer", "minimum": 0, "maximum": 1000})),
                 self._list_wake_history),
         }
-        if not memory_enabled:
-            for name in ("remember", "recall", "update_memory", "forget"):
-                self.tools.pop(name)
         if not owner_communication_enabled:
             self.tools.pop("send_owner_message")
         for capability in capabilities:
@@ -153,28 +119,6 @@ class ToolRegistry:
             if "enum" in properties[key] and value not in properties[key]["enum"]:
                 return f"Argument {key!r} is not an allowed value"
         return None
-
-    def _remember(self, a: dict[str, Any]) -> dict[str, Any]:
-        item_id = self.store.remember(
-            a["content"], "resident", kind=a["kind"], importance=a["importance"],
-            confidence=a["confidence"], provenance=a["provenance"], standing=a["standing"])
-        self.emit("memory.created", {"memory_id": item_id})
-        return {"memory_id": item_id, "memory": self.store.memory(item_id)}
-
-    def _recall(self, a: dict[str, Any]) -> dict[str, Any]:
-        return {"memories": self.store.recall(a["query"], a.get("limit", 10))}
-
-    def _update_memory(self, a: dict[str, Any]) -> dict[str, Any]:
-        fields = {name: a[name] for name in (
-            "content", "kind", "importance", "confidence", "provenance", "standing") if name in a}
-        updated = self.store.update_memory(a["id"], **fields)
-        if updated: self.emit("memory.updated", {"memory_id": a["id"]})
-        return {"updated": updated, "memory": self.store.memory(a["id"]) if updated else None}
-
-    def _forget(self, a: dict[str, Any]) -> dict[str, Any]:
-        forgotten = self.store.forget(a["id"])
-        if forgotten: self.emit("memory.forgotten", {"memory_id": a["id"]})
-        return {"forgotten": forgotten}
 
     def _create_intention(self, a: dict[str, Any]) -> dict[str, Any]:
         item_id = self.store.create_intention(a["content"])

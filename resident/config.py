@@ -140,7 +140,6 @@ class Config:
     owner_name: str = "Owner"
     personality: str = DEFAULT_PERSONALITY
     role: str = ""
-    memory_enabled: bool = True
     owner_communication_enabled: bool = True
     provider: str = "openai-agents"
     model: str = "gpt-5.6-luna"
@@ -148,7 +147,6 @@ class Config:
     openai_base_url: str = "https://api.openai.com/v1"
     openai_agent_id: str | None = None
     max_tool_rounds: int = 8
-    context_memories: int = 8
     context_messages: int = 8
     spontaneous_message_limit: int = 3
     spontaneous_message_window_seconds: int = 180

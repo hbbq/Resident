@@ -33,8 +33,6 @@ id: oracle
 name: Oracle
 personality_prompt: oracle.md
 role: Answer narrow questions.
-memory:
-  enabled: false
 capabilities: [messaging]
 subscriptions: [homeops]
 """, encoding="utf-8")
@@ -42,7 +40,6 @@ subscriptions: [homeops]
             oracle = catalog.residents[0]
             self.assertEqual("Be precise.", oracle.personality)
             self.assertEqual("Answer narrow questions.", oracle.role)
-            self.assertFalse(oracle.memory["enabled"])
             self.assertEqual(("messaging",), oracle.capabilities)
             self.assertEqual(("homeops",), oracle.subscriptions)
 
@@ -60,6 +57,19 @@ subscriptions: [homeops]
                 encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "prompt root"):
                 load_resident_catalog(root / "residents")
+
+    def test_rejects_removed_memory_and_curator_policy_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            definitions = Path(temporary) / "residents"
+            definitions.mkdir()
+            definition = definitions / "resident.yaml"
+            for removed_field in ("memory", "curator"):
+                with self.subTest(field=removed_field):
+                    definition.write_text(
+                        "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                        f"{removed_field}: {{}}\n", encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "Unknown fields"):
+                        load_resident_catalog(definitions)
 
     def test_rejects_unknown_and_malformed_subscriptions(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -184,8 +194,8 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(output[2].startswith("Runtime host started"))
 
     async def test_instance_state_and_identity_are_isolated_and_stable(self):
-        self.a.store.remember("only a", "resident")
-        self.assertEqual([], self.b.store.recall("only a"))
+        self.a.store.create_intention("only a")
+        self.assertEqual([], self.b.store.pending_intentions())
         identity = self.a.resident.id
         self.a.close()
         reopened = ResidentRuntime(

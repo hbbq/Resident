@@ -28,7 +28,7 @@ Resident instance
 │   ├── Identity
 │   └── Address name
 ├── Runtime
-├── Persistent memory
+├── Managed conversational session
 ├── Pending intentions
 ├── Journal
 ├── Model provider(s)
@@ -59,7 +59,7 @@ A wake event should remain deliberately small and general, conceptually containi
 
 Runtime compares a durable, public capability snapshot at startup and whenever capabilities are explicitly replaced, registered, or removed. A newly provisioned Resident records its first baseline silently. Later additions, removals, and public descriptor changes produce a normal `capabilities_changed` wake; executable handlers and connector secrets are outside the snapshot. Each wake uses one capability snapshot for both context and tool registration. There is no capability polling loop, and detection never exercises a capability.
 
-During a wakeup Resident receives an appropriate working context, reasons and possibly acts, persists anything it wants its future self to retain, and may then sleep again.
+During a wakeup Resident receives an appropriate working context, reasons and possibly acts, and may then sleep again. Conversational continuity currently comes from its durable managed-agent session; pending intentions remain explicit local state.
 
 Scheduling is a mechanism, not a collection of hard-coded behaviors. Resident should be able to request a future wakeup with a reason/context rather than requiring dedicated classes such as `TemperatureMonitor` or `RobotExplorationBehavior`.
 
@@ -67,13 +67,13 @@ Scheduling is a mechanism, not a collection of hard-coded behaviors. Resident sh
 
 Runtime is responsible for deterministic mechanisms such as wake/sleep, event routing, persistence, attention limits, permissions and hard safety boundaries, model invocation, tool execution, scheduling, and logging.
 
-Resident decides what observations mean, what is interesting, what it wants to do, which available capabilities to use, what it wants to remember, whether to ask its owner, and whether it wants to revisit something later.
+Resident decides what observations mean, what is interesting, what it wants to do, which available capabilities to use, whether to ask its owner, and whether it wants to revisit something later.
 
 > Runtime enables Resident's life; it should not live it on Resident's behalf.
 
 ### Managed agent boundary
 
-The initial managed-agent integration uses one long-lived OpenAI Agents session per Resident instance. The binding is local, durable, and replaceable; losing or deliberately rolling over that remote session must not change Resident identity or erase Resident-owned memory, schedules, connector checkpoints, communication records, or the local journal.
+The initial managed-agent integration uses one long-lived OpenAI Agents session per Resident instance. The binding is local and durable. Losing or deliberately rolling over that remote session must not change Resident identity or erase schedules, pending intentions, connector checkpoints, communication records, or the local journal, but conversational context in that session is not recoverable from those local records.
 
 OpenAI owns conversational session history and the managed turn loop. Resident remains an outbound-only environment bridge: it selects and coalesces wakes, submits factual wake envelopes, executes requested function actions locally, validates every argument, applies deterministic policy, records observable outcomes, and returns results. Function calls are durably claimed before execution; completed results can be replayed without repeating local effects, while an action interrupted before its outcome is recorded is not automatically repeated. HomeOps and other integrated systems remain unaware of OpenAI. Ordinary connector events are processed by the local queue and cannot directly interrupt active work; Owner ingress retains local priority semantics as the runtime evolves.
 
@@ -91,23 +91,23 @@ It should always contain enough information for Resident to understand the curre
 - the complete relevant `WakeEvent`, including its reason/source and associated payload or attachments;
 - capabilities currently available to Resident.
 
-The context builder may additionally include relevant pending intentions, retrieved memories, a small bounded set of standing Owner guidance, recent/relevant communication, and a small amount of recent runtime/journal context when useful.
+The context builder may additionally include relevant pending intentions, recent/relevant communication, and a small amount of recent runtime/journal context when useful.
 
-It must not automatically include the entire memory store, communication history, or journal. Memory retrieval should initially be simple and driven by the wake event/context; the retrieval strategy can evolve after observing real behavior. Resident must also be able to explicitly retrieve additional memories during a wakeup when the initial context is insufficient.
+It must not automatically include the entire communication history or journal.
 
-Similarly, the journal and communication history may later be exposed through search/read capabilities so Resident can investigate its own history without automatically receiving that history in every model context.
+The journal and communication history are exposed through bounded read-only search capabilities so Resident can investigate its own history without automatically receiving that history in every model context.
 
 Pending intentions can initially be included generously while their number is small. More selective retrieval should only be introduced when there is evidence that it is needed.
 
-A separate persistent `working_state` concept is not required initially; memories and pending intentions should be allowed to demonstrate whether another form of continuity is actually necessary.
+A separate persistent `working_state` concept is not required initially; the managed session and pending intentions should be allowed to demonstrate whether another form of continuity is actually necessary.
 
 > ContextBuilder provides enough context to begin thinking, not everything Resident might possibly need.
 
 ## Pending intentions
 
-Pending intentions are persistent first-class state separate from ordinary memory.
+Pending intentions are persistent first-class state separate from conversational context and any future long-term memory store.
 
-A memory describes something Resident wants its future self to know. An intention describes something Resident may want its future self to continue, revisit, or do when circumstances permit.
+An intention describes something Resident may want its future self to continue, revisit, or do when circumstances permit.
 
 For example:
 
@@ -117,7 +117,7 @@ When the robot becomes available, inspect behind the sofa.
 
 The initial representation should be deliberately small, conceptually containing an id, free-form content, creation time, and status. It must not grow into a conventional planner/task-management system unless actual Resident behavior demonstrates a need for one.
 
-Communication does not introduce a separate `PendingQuestion` system concept. If Resident wants to remember that it is waiting for information from its owner, it may use an ordinary pending intention or memory. Runtime does not need to decide which messages are questions or which later messages are answers.
+Communication does not introduce a separate `PendingQuestion` system concept. If Resident wants to record that it is waiting for information from its owner, it may use a pending intention. Runtime does not need to decide which messages are questions or which later messages are answers.
 
 ## Observability
 
@@ -166,7 +166,7 @@ Runtime event
     └── future observers (web UI, metrics, etc.)
 ```
 
-When Resident is run interactively in a terminal, the console observer should make its activity visible as it happens. Useful output includes wake reason, context assembly, observable Resident decisions/rationale, capability/tool calls and results, memory/intention changes, communication, sleep, and run metrics.
+When Resident is run interactively in a terminal, the console observer should make its activity visible as it happens. Useful output includes wake reason, context assembly, observable Resident decisions/rationale, capability/tool calls and results, intention changes, communication, sleep, and run metrics.
 
 Messages that Resident intentionally sends to its owner are communication, not merely diagnostic output. The terminal transport must therefore render them in a clearly distinguishable format so they cannot easily be confused with runtime logs, model diagnostics, or tool output. The exact visual style is an implementation detail, but the distinction should be obvious at a glance.
 
@@ -251,46 +251,19 @@ A future generic connector may allow Resident to use sufficiently self-describin
 
 Physical co-location does not require logical integration. For example, a camera and microphone mounted on a robot may remain separate connector/device identities. Relationships such as `mounted_on`, `powered_by`, or correlated availability may later be declared or inferred by Resident.
 
-## Memory
+## Long-term memory
 
-Persistent memory belongs to Resident rather than to the LLM context.
+Long-term memory is intentionally not implemented by the current runtime. Conversational and working continuity comes from the durable OpenAI Agents session. A future dedicated Memory Store and curator will own selected durable knowledge independently of that session, with explicit retrieval and lifecycle semantics designed as one coherent subsystem.
 
-> LLM context is not memory.
+The former SQLite `memories` table, automatic recall and standing-guidance context lanes, and `remember`/`recall`/`update_memory`/`forget` tools were removed rather than retained as a competing compatibility system. Session rollover therefore currently loses conversational knowledge that has not been represented elsewhere, such as in communication history or a pending intention.
 
-The context supplied during a wakeup is temporary working memory. Information that should survive must be stored persistently.
-
-The initial storage implementation can be deliberately simple, with SQLite as a strong v0 candidate.
-
-Resident should have a small general memory interface conceptually similar to:
-
-```text
-remember(content, kind, importance, confidence, provenance, standing)
-recall(query)
-update_memory(id, content?, kind?, importance?, confidence?, provenance?, standing?)
-forget(id)
-```
-
-Memory uses a small Resident-chosen semantic vocabulary: kind, coarse importance and confidence, provenance of the underlying information, and whether an Owner-derived preference or rule is standing guidance. Provenance is distinct from the persisted write origin. These fields are descriptive rather than policy or authorization, and Resident can revise them as its understanding changes.
-
-Recall first gates and ranks by textual relevance, then uses semantic metadata and recency to order relevant results. Empty-query recall lists the most durable memories. Explicit recall and automatic context retrieval remain bounded; high importance alone never causes unrelated memories to be injected into every wake. A separate, smaller context lane supplies memories that Resident explicitly classified as standing Owner preferences or rules without requiring wake-text overlap. This is durable guidance for Resident to interpret, not a runtime action rule or authorization mechanism. When the Owner changes such guidance, Resident should refine the existing memory rather than retain conflicting versions.
-
-### Journal versus memory
-
-Runtime maintains an append-only journal of what actually happened. Resident separately chooses what to retain as its own memory.
-
-This distinction is intentional:
-
-> Journal = what happened.
->
-> Memory = what Resident chose to remember.
-
-The journal supports debugging, auditability, and later analysis. It should not automatically become the entire reasoning context for every wakeup.
+Runtime still maintains an append-only journal of what happened. The journal supports debugging, auditability, and later analysis; it is not long-term memory and must not automatically become the reasoning context for every wakeup.
 
 ### World model
 
 A dedicated structured world-model representation is not required initially.
 
-Resident may begin by storing ordinary memories such as relationships, observations, hypotheses, and regularities. If experience shows that free-form memory is insufficient, structured entities/relationships or another representation can be introduced later.
+A future Memory Store may represent relationships, observations, hypotheses, regularities, or structured entities, but that representation should be chosen with the curator architecture rather than inferred from the removed legacy schema.
 
 ## Communication
 
@@ -300,11 +273,11 @@ The runtime treats communication as messages between a Resident instance and its
 
 Conceptually, a persisted message needs only general communication metadata such as an identity, timestamp, direction/sender, content, and optional attachments. The exact schema should remain small until experience demonstrates additional requirements.
 
-Incoming owner messages wake Resident and are delivered as part of the corresponding `WakeEvent`. Relevant/recent communication may also be selected by the context builder. Communication history should be persisted independently of whether Resident chooses to store a message's content in its autobiographical memory.
+Incoming owner messages wake Resident and are delivered as part of the corresponding `WakeEvent`. Relevant/recent communication may also be selected by the context builder. Communication history is persisted independently of conversational context and any future long-term memory system.
 
 All intentional outgoing Resident communication, including replies during Owner-initiated wakes, uses the communication capability. That path persists the message and delivers it through the currently configured transport. Model-returned result text is not a fallback transport: if communication is rejected by attention policy or fails in transport, the failure is journaled and the result text is not delivered in its place. Resident may send a question and go back to sleep without waiting for an answer. A later owner message is simply another message and wake event; Resident is responsible for understanding whether it answers something earlier.
 
-If Resident considers an unresolved exchange important enough to revisit, it can create a normal memory or pending intention. Runtime should not manufacture a pending-question record on Resident's behalf.
+If Resident considers an unresolved exchange important enough to revisit, it can create a pending intention. Runtime should not manufacture a pending-question record on Resident's behalf.
 
 Communication transports are replaceable. v0 may use the interactive terminal for both incoming and outgoing messages; later transports may include a web UI, messaging service, another Resident instance, or another mechanism without changing Resident's conceptual communication model.
 

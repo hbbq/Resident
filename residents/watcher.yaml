@@ -15,10 +15,6 @@ agent:
   model: gpt-5.6-luna
   api_key_env: OPENAI_API_KEY
 
-memory:
-  enabled: true
-  context_limit: 8
-
 capabilities:
   - diagnostics
   - homeops

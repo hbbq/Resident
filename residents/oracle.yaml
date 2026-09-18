@@ -15,9 +15,6 @@ agent:
   model: gpt-5.6-luna
   api_key_env: OPENAI_API_KEY
 
-memory:
-  enabled: false
-
 capabilities:
   - diagnostics
   - messaging

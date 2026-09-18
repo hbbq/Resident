@@ -46,7 +46,7 @@ A related development principle is:
 
 A continuous "I" is a requirement.
 
-Different wakeups should be experienced as the same Resident. Continuity must not depend on retaining an LLM chat session or replaying an ever-growing conversation history. Resident owns its identity and persistent memory independently of whichever model happens to reason for it at a particular moment.
+Different wakeups should be experienced as the same Resident. The current runtime uses a durable managed-agent session for conversational continuity while retaining Resident identity locally. Long-term continuity that must survive session replacement will belong to a future dedicated Memory Store and curator, independently of whichever model happens to reason for Resident at a particular moment.
 
 ## Asynchronous life
 
@@ -64,7 +64,7 @@ Communication is asynchronous, not session-oriented, and is modeled as general m
 
 Resident may contact its owner with text, images, audio, or other supported attachments. A later owner message may be an answer, instruction, correction, new topic, or something else; Resident is responsible for understanding its meaning and relationship to earlier communication.
 
-The owner may initiate communication at any time. An incoming owner message is a wake event. Communication history persists independently of Resident's chosen autobiographical memory, while only relevant/recent communication should normally be placed in a wake context.
+The owner may initiate communication at any time. An incoming owner message is a wake event. Communication history persists independently of managed session context and any future curated long-term memory, while only relevant/recent communication should normally be placed in a wake context.
 
 Human attention is a limited resource. Resident may internally want to communicate more often than is appropriate, but runtime-enforced configurable attention budgets must prevent it from peppering the owner with messages. Runtime need not understand which messages are questions in order to enforce that limit.
 

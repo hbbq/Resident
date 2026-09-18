@@ -25,7 +25,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
                            {"*"})
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
-    "role", "role_prompt", "agent", "memory", "curator", "capabilities",
+    "role", "role_prompt", "agent", "capabilities",
     "subscriptions", "owner_transport", "body",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
@@ -56,8 +56,6 @@ class ResidentDefinition:
     role: str = ""
     enabled: bool = True
     agent: AgentDefinition = field(default_factory=AgentDefinition)
-    memory: dict[str, Any] = field(default_factory=dict)
-    curator: dict[str, Any] = field(default_factory=dict)
     capabilities: tuple[str, ...] = ()
     subscriptions: tuple[str, ...] = ()
     owner_transport: OwnerTransportDefinition | None = None
@@ -201,20 +199,11 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
     enabled = data.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{path.name}.enabled must be boolean")
-    memory = _mapping(data.get("memory", {}), "memory")
-    if set(memory) - {"enabled", "context_limit"}:
-        raise ValueError(f"Unknown memory policy fields in {path.name}")
-    if "enabled" in memory and not isinstance(memory["enabled"], bool):
-        raise ValueError("memory.enabled must be boolean")
-    if ("context_limit" in memory and
-            (not isinstance(memory["context_limit"], int) or memory["context_limit"] < 0)):
-        raise ValueError("memory.context_limit must be a nonnegative integer")
-    curator = _mapping(data.get("curator", {}), "curator")
     body = data.get("body")
     if body is not None:
         body = _mapping(body, "body")
     return ResidentDefinition(
-        resident_id, name, personality, role, enabled, agent, memory, curator,
+        resident_id, name, personality, role, enabled, agent,
         _string_list(data.get("capabilities"), "capabilities"),
         _subscriptions(data.get("subscriptions"), "subscriptions"), transport, body,
     )
