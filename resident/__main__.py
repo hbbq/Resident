@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from dataclasses import replace
 
-from .config import Config
-from .capabilities import diagnostic_capabilities
 from .agentcontroller import AgentControllerConnector
 from .camera import CameraConnector
+from .capabilities import Capability, diagnostic_capabilities
+from .config import Config
 from .display import DisplayConnector
 from .homeops import HomeOpsConnector
+from .host import InstancePolicy, RuntimeHost, messaging_capability
+from .instances import (ResidentDefinition, load_resident_catalog, migrate_legacy_state,
+                        resolve_environment)
+from .mailbox import Mailbox
 from .provider import OpenAIAgentsProvider, OpenAIResponsesProvider
 from .runtime import ResidentRuntime
 from .telegram import TelegramTransport
@@ -18,9 +23,12 @@ class TerminalDiagnostics:
     def __init__(self, verbose: bool):
         self.verbose = verbose
 
-    @staticmethod
-    def runtime(message: str) -> None:
+    def runtime(self, message: str) -> None:
         print(f"[runtime] {message}")
+
+    def connector(self, message: str) -> None:
+        if self.verbose:
+            print(f"[connector] {message}")
 
     def homeops(self, message: str) -> None:
         if self.verbose:
@@ -39,48 +47,40 @@ class TerminalDiagnostics:
             print(f"[telegram] {message}")
 
 
-def main() -> int:
-    config = Config.from_env_and_args()
-    if not config.openai_api_key:
-        print("OPENAI_API_KEY must be set for the OpenAI provider.", file=sys.stderr)
-        return 2
-    if config.provider == "openai-agents":
-        provider = OpenAIAgentsProvider(
-            config.openai_api_key, config.model, config.openai_base_url,
-            agent_id=config.openai_agent_id,
-        )
-    else:
-        provider = OpenAIResponsesProvider(
-            config.openai_api_key, config.model, config.openai_base_url)
-    connectors = []
-    capabilities = diagnostic_capabilities()
-    terminal_diagnostics = TerminalDiagnostics(config.verbose)
+def _provider(definition: ResidentDefinition):
+    api_key = resolve_environment(definition.agent.api_key_env)
+    base_url = (resolve_environment(definition.agent.base_url_env, required=False)
+                or "https://api.openai.com/v1").rstrip("/")
+    agent_id = (resolve_environment(definition.agent.agent_id_env, required=False)
+                if definition.agent.agent_id_env else None)
+    if definition.agent.provider == "openai-agents":
+        return OpenAIAgentsProvider(api_key, definition.agent.model, base_url, agent_id=agent_id)
+    return OpenAIResponsesProvider(api_key, definition.agent.model, base_url)
+
+
+def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
+    producers = []
+    capabilities: list[Capability] = diagnostic_capabilities()
     if config.homeops_url:
-        homeops = HomeOpsConnector(
+        connector = HomeOpsConnector(
             config.homeops_url, poll_seconds=config.homeops_poll_seconds,
             request_timeout_seconds=config.homeops_request_timeout_seconds,
-            diagnostic_output=terminal_diagnostics.homeops,
-        )
-        connectors.append(homeops)
-        capabilities.extend(homeops.capabilities)
+            diagnostic_output=diagnostics.homeops)
+        producers.append(connector)
+        capabilities.extend(connector.capabilities)
     if config.displays:
-        assert config.homeops_url is not None
-        displays = DisplayConnector(
+        capabilities.extend(DisplayConnector(
             config.homeops_url, config.displays,
-            request_timeout_seconds=config.homeops_request_timeout_seconds,
-        )
-        capabilities.extend(displays.capabilities)
-    agentcontroller = None
+            request_timeout_seconds=config.homeops_request_timeout_seconds).capabilities)
     if config.agentcontroller_snapshot_path is not None:
-        agentcontroller = AgentControllerConnector(
+        connector = AgentControllerConnector(
             config.agentcontroller_snapshot_path,
             poll_seconds=config.agentcontroller_poll_seconds,
-            diagnostic_output=terminal_diagnostics.agentcontroller,
-        )
-        connectors.append(agentcontroller)
-        capabilities.extend(agentcontroller.capabilities)
+            diagnostic_output=diagnostics.agentcontroller)
+        producers.append(connector)
+        capabilities.extend(connector.capabilities)
     if config.cameras:
-        cameras = CameraConnector(
+        connector = CameraConnector(
             config.cameras, timeout_seconds=config.camera_capture_timeout_seconds,
             max_width=config.camera_max_width, max_height=config.camera_max_height,
             max_bytes=config.camera_max_bytes, rtsp_transport=config.camera_rtsp_transport,
@@ -88,44 +88,160 @@ def main() -> int:
             onvif_request_timeout_seconds=config.camera_onvif_request_timeout_seconds,
             onvif_pull_timeout_seconds=config.camera_onvif_pull_timeout_seconds,
             onvif_retry_seconds=config.camera_onvif_retry_seconds,
-            diagnostic_output=terminal_diagnostics.camera,
-        )
-        connectors.append(cameras)
-        capabilities.extend(cameras.capabilities)
+            diagnostic_output=diagnostics.camera)
+        producers.append(connector)
+        capabilities.extend(connector.capabilities)
+    return producers, capabilities
+
+
+def _select_capabilities(grants: tuple[str, ...], available: list[Capability]) -> list[Capability]:
+    selected = [capability for capability in available
+                if capability.name in grants or capability.connector_id in grants]
+    known = ({capability.name for capability in available} |
+             {capability.connector_id for capability in available} | {"messaging"})
+    unknown = sorted(set(grants) - known)
+    if unknown:
+        raise ValueError(f"Unknown capability grants: {', '.join(unknown)}")
+    return selected
+
+
+def build_host(config: Config) -> RuntimeHost:
+    if config.residents_dir is None:
+        raise ValueError("A Resident definitions directory is required")
+    catalog = load_resident_catalog(
+        config.residents_dir, prompt_root=config.prompt_root, default_id=config.default_resident)
+    diagnostics = TerminalDiagnostics(config.verbose)
+    producers, available = _shared_resources(config, diagnostics)
+    mailbox = Mailbox(config.data_dir / "runtime" / "mailbox.sqlite3")
+    for producer in producers:
+        bind = getattr(producer, "bind_checkpoint", None)
+        if bind is not None:
+            scope = producer.checkpoint_scope
+            bind(lambda scope=scope: mailbox.observed_snapshot(scope),
+                 lambda snapshot, scope=scope: mailbox.save_observed_snapshot(scope, snapshot))
+    runtimes: dict[str, ResidentRuntime] = {}
+    policies = {}
+    private_producers = {}
+    resolved_tokens: dict[str, str] = {}
+    recipients = lambda: frozenset((*runtimes, "owner"))
+    try:
+        for definition in catalog.residents:
+            instance_config = replace(
+                config, data_dir=config.data_dir / "instances" / definition.id,
+                instance_id=definition.id, resident_name=definition.name,
+                personality=definition.personality, role=definition.role,
+                memory_enabled=definition.memory.get("enabled", True),
+                context_memories=definition.memory.get("context_limit", config.context_memories),
+                owner_communication_enabled=(
+                    definition.owner_transport is not None or definition.id == catalog.default_id),
+                provider=definition.agent.provider, model=definition.agent.model,
+                openai_api_key=None, openai_agent_id=None, residents_dir=None)
+            transport = None
+            if definition.owner_transport:
+                item = definition.owner_transport
+                token = resolve_environment(item.token_env)
+                if token in resolved_tokens:
+                    raise ValueError(
+                        f"One Telegram bot cannot serve both {resolved_tokens[token]} and {definition.id}")
+                resolved_tokens[token] = definition.id
+                try:
+                    user_id = int(resolve_environment(item.owner_user_id_env))
+                    chat_id = int(resolve_environment(item.owner_chat_id_env))
+                except ValueError as exc:
+                    raise ValueError(f"Telegram IDs for {definition.id} must be integers") from exc
+                transport = TelegramTransport(
+                    token, user_id, chat_id, poll_seconds=config.telegram_poll_seconds,
+                    request_timeout_seconds=config.telegram_request_timeout_seconds,
+                    diagnostic_output=diagnostics.telegram)
+                private_producers[definition.id] = [transport]
+            grants = _select_capabilities(definition.capabilities, available)
+            if "messaging" in definition.capabilities:
+                grants.append(messaging_capability(mailbox, definition.id, recipients))
+            runtime = ResidentRuntime(
+                instance_config, _provider(definition), capabilities=grants,
+                owner_transport=transport,
+                diagnostic_output=lambda message, item=definition.id:
+                    diagnostics.runtime(f"{item}: {message}"))
+            runtimes[definition.id] = runtime
+            policies[definition.id] = InstancePolicy(frozenset(definition.subscriptions))
+            if transport:
+                transport.bind_owner_message(runtime.telegram_owner_message_event)
+                scope = transport.offset_checkpoint_scope
+                transport.bind_offset_checkpoint(
+                    lambda runtime=runtime, scope=scope: runtime.store.observed_snapshot(scope),
+                    lambda offset, runtime=runtime, scope=scope:
+                        runtime.store.save_observed_snapshot(scope, offset))
+        return RuntimeHost(
+            runtimes, policies, mailbox, event_producers=producers,
+            instance_producers=private_producers, default_id=catalog.default_id,
+            diagnostic_output=diagnostics.runtime)
+    except Exception:
+        for runtime in runtimes.values():
+            runtime.close()
+        mailbox.close()
+        raise
+
+
+def _legacy_runtime(config: Config) -> ResidentRuntime:
+    if not config.openai_api_key:
+        raise ValueError("OPENAI_API_KEY must be set for the OpenAI provider")
+    provider = (OpenAIAgentsProvider(config.openai_api_key, config.model, config.openai_base_url,
+                                     agent_id=config.openai_agent_id)
+                if config.provider == "openai-agents" else
+                OpenAIResponsesProvider(config.openai_api_key, config.model, config.openai_base_url))
+    diagnostics = TerminalDiagnostics(config.verbose)
+    producers, capabilities = _shared_resources(config, diagnostics)
     telegram = None
     if config.telegram_bot_token is not None:
         telegram = TelegramTransport(
-            config.telegram_bot_token, config.telegram_owner_user_id, config.telegram_owner_chat_id,
-            poll_seconds=config.telegram_poll_seconds,
+            config.telegram_bot_token, config.telegram_owner_user_id,
+            config.telegram_owner_chat_id, poll_seconds=config.telegram_poll_seconds,
             request_timeout_seconds=config.telegram_request_timeout_seconds,
-            diagnostic_output=terminal_diagnostics.telegram,
-        )
-        connectors.append(telegram)
+            diagnostic_output=diagnostics.telegram)
+        producers.append(telegram)
     runtime = ResidentRuntime(
-        config, provider, capabilities=capabilities, event_producers=connectors,
-        owner_transport=telegram,
-        diagnostic_output=terminal_diagnostics.runtime,
-    )
-    if agentcontroller is not None:
-        checkpoint_scope = agentcontroller.checkpoint_scope
-        agentcontroller.bind_checkpoint(
-            lambda: runtime.store.observed_snapshot(checkpoint_scope),
-            lambda snapshot: runtime.store.save_observed_snapshot(checkpoint_scope, snapshot),
-        )
+        config, provider, capabilities=capabilities, event_producers=producers,
+        owner_transport=telegram, diagnostic_output=diagnostics.runtime)
+    for producer in producers:
+        bind = getattr(producer, "bind_checkpoint", None)
+        if bind is not None:
+            scope = producer.checkpoint_scope
+            bind(lambda scope=scope: runtime.store.observed_snapshot(scope),
+                 lambda snapshot, scope=scope:
+                     runtime.store.save_observed_snapshot(scope, snapshot))
     if telegram is not None:
         telegram.bind_owner_message(runtime.telegram_owner_message_event)
-        offset_scope = telegram.offset_checkpoint_scope
+        scope = telegram.offset_checkpoint_scope
         telegram.bind_offset_checkpoint(
-            lambda: runtime.store.observed_snapshot(offset_scope),
-            lambda offset: runtime.store.save_observed_snapshot(offset_scope, offset),
-        )
+            lambda: runtime.store.observed_snapshot(scope),
+            lambda offset: runtime.store.save_observed_snapshot(scope, offset))
+    return runtime
+
+
+def main() -> int:
     try:
-        asyncio.run(runtime.run_interactive())
-    finally:
-        runtime.close()
-    return 0
+        config = Config.from_env_and_args()
+        if config.migrate_legacy:
+            target = migrate_legacy_state(config.data_dir)
+            print(f"Migrated legacy Resident state to {target}")
+            return 0
+        if config.residents_dir is not None:
+            host = build_host(config)
+            try:
+                asyncio.run(host.run())
+            finally:
+                host.close()
+        else:
+            runtime = _legacy_runtime(config)
+            try:
+                asyncio.run(runtime.run_interactive())
+            finally:
+                runtime.close()
+        return 0
+    except (ValueError, FileNotFoundError, FileExistsError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

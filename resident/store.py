@@ -269,6 +269,14 @@ class Store:
                 "INSERT OR IGNORE INTO identities VALUES('owner',?,?,?,?)",
                 (str(uuid.uuid4()), owner_name, "", now),
             )
+            # Configuration changes describe the same durable individual. Keep
+            # the UUID while refreshing the configured display/prompt metadata.
+            self.connection.execute(
+                "UPDATE identities SET address_name=?,personality=? WHERE role='resident'",
+                (resident_name, personality),
+            )
+            self.connection.execute(
+                "UPDATE identities SET address_name=? WHERE role='owner'", (owner_name,))
         return self.identities()
 
     def identities(self) -> tuple[Identity, Identity]:
