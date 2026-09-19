@@ -61,6 +61,21 @@ class FailingProvider:
         raise RuntimeError("provider unavailable")
 
 
+class ManagedRecordingProvider:
+    uses_managed_session = True
+
+    def __init__(self, session_id="session-existing"):
+        self.session_id = session_id
+        self.contexts = []
+
+    async def respond(self, context, tools, results, previous_response_id=None):
+        if previous_response_id is None:
+            self.contexts.append(json.loads(context))
+            if self.session_id is None:
+                self.session_id = "session-created"
+        return ModelTurn(f"turn-{len(self.contexts)}", message="done")
+
+
 class ThreadRecordingStore(Store):
     def __init__(self, path):
         self.owner_thread_id = threading.get_ident()
@@ -543,6 +558,96 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(context["recent_communication"]), 2)
             runtime.close()
 
+    async def test_managed_session_wakes_do_not_replay_local_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = ManagedRecordingProvider()
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime.store.add_message("inbound", runtime.owner.id, "historical message")
+            runtime.store.create_intention("historical intention")
+
+            await runtime.process(runtime.owner_message_event("first new message"))
+            await runtime.process(runtime.owner_message_event("second new message"))
+
+            first, second = provider.contexts
+            self.assertEqual("replace", first["authoritative_state_update"]["mode"])
+            self.assertEqual({"wake_event"}, set(second))
+            self.assertEqual("second new message", second["wake_event"]["payload"]["content"])
+            encoded = json.dumps(second)
+            self.assertNotIn("historical message", encoded)
+            self.assertNotIn("first new message", encoded)
+            self.assertNotIn("historical intention", encoded)
+            runtime.close()
+
+    async def test_managed_session_bootstrap_contains_trigger_once_without_communication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = ManagedRecordingProvider(session_id=None)
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime.store.add_message("inbound", runtime.owner.id, "older conversation")
+            runtime.store.create_intention("continue the durable task")
+
+            await runtime.process(runtime.owner_message_event("new bootstrap trigger"))
+
+            context = provider.contexts[0]
+            bootstrap = context["new_session_bootstrap"]
+            self.assertEqual("new bootstrap trigger", context["wake_event"]["payload"]["content"])
+            self.assertEqual(1, json.dumps(context).count("new bootstrap trigger"))
+            self.assertNotIn("recent_communication", bootstrap)
+            self.assertNotIn("older conversation", json.dumps(context))
+            self.assertEqual("continue the durable task",
+                             bootstrap["pending_intentions"][0]["content"])
+            runtime.close()
+
+    async def test_managed_session_restart_reuses_sync_checkpoint_without_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Config(Path(temporary))
+            first_provider = ManagedRecordingProvider()
+            first = ResidentRuntime(
+                config, first_provider, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            await first.process(first.owner_message_event("before restart"))
+            first.close()
+
+            second_provider = ManagedRecordingProvider()
+            second = ResidentRuntime(
+                config, second_provider, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            await second.process(second.owner_message_event("after restart"))
+
+            context = second_provider.contexts[0]
+            self.assertEqual({"wake_event"}, set(context))
+            self.assertEqual("after restart", context["wake_event"]["payload"]["content"])
+            self.assertNotIn("before restart", json.dumps(context))
+            second.close()
+
+    async def test_managed_session_guidance_changes_are_versioned_deltas(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = ManagedRecordingProvider()
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            await runtime.process(WakeEvent("baseline", "runtime", "baseline", utc_now(), {}))
+
+            guidance_id = runtime.store.set_owner_guidance("Keep the greenhouse warm")
+            await runtime.process(WakeEvent("set", "runtime", "sync", utc_now(), {}))
+            guidance_delta = provider.contexts[-1]["authoritative_state_update"]
+            self.assertEqual("delta", guidance_delta["mode"])
+            self.assertEqual(guidance_id,
+                             guidance_delta["standing_owner_guidance"]["set"][0]["id"])
+
+            runtime.store.remove_owner_guidance(guidance_id)
+            await runtime.process(WakeEvent("remove", "runtime", "sync", utc_now(), {}))
+            removal = provider.contexts[-1]["authoritative_state_update"][
+                "standing_owner_guidance"]["removed"][0]
+            self.assertEqual({"id": guidance_id, "revision": 2}, removal)
+
+            await runtime.process(WakeEvent("quiet", "runtime", "sync", utc_now(), {}))
+            self.assertNotIn("authoritative_state_update", provider.contexts[-1])
+            runtime.close()
+
 
 class AttentionBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_spontaneous_limit_counts_delivered_messages_and_rejects_next(self):
@@ -675,7 +780,7 @@ class StoreTests(unittest.TestCase):
             store = Store(path)
             action = store.begin_agent_tool_action(
                 "openai_agents", "session", "turn", "call", "clock", {})
-            self.assertEqual(16, store.connection.execute(
+            self.assertEqual(17, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertFalse(action["attachments_ephemeral"])
             self.assertEqual({"ok": True}, action["output"])
@@ -701,7 +806,7 @@ class StoreTests(unittest.TestCase):
             connection.close()
 
             store = Store(path)
-            self.assertEqual(16, store.connection.execute(
+            self.assertEqual(17, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertEqual(1, len(store.claim_due_wakeups(utc_now())))
             event = WakeEvent("event", "scheduler", "migrate", utc_now(), {})
@@ -2545,13 +2650,13 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             bootstrap = created_context["new_session_bootstrap"]
             self.assertEqual("place", bootstrap["durable_memory_awareness"][0]["kind"])
             self.assertIn("previous remote session was unavailable", bootstrap["handover"])
-            self.assertEqual(resident_id, created_context["resident"]["stable_id"])
+            self.assertEqual(resident_id, bootstrap["resident"]["stable_id"])
             self.assertEqual(
                 "Always preserve the garden schedule.",
-                created_context["standing_owner_guidance"][0]["content"])
+                bootstrap["standing_owner_guidance"][0]["content"])
             self.assertEqual(
                 "Finish checking the greenhouse",
-                created_context["pending_intentions"][0]["content"])
+                bootstrap["pending_intentions"][0]["content"])
             rollover = store.connection.execute(
                 "SELECT old_session_id,new_session_id,reason,finalization_status,status "
                 "FROM session_rollovers").fetchone()
@@ -3544,7 +3649,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             store = Store(path)
 
-            self.assertEqual(16, store.connection.execute(
+            self.assertEqual(17, store.connection.execute(
                 "SELECT version FROM schema_version").fetchone()[0])
             self.assertIsNone(store.connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone())

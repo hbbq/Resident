@@ -172,6 +172,9 @@ class Store:
         CREATE TABLE IF NOT EXISTS session_mutable_settings(
           provider TEXT NOT NULL, session_id TEXT NOT NULL, settings_json TEXT NOT NULL,
           updated_at TEXT NOT NULL, PRIMARY KEY(provider,session_id));
+        CREATE TABLE IF NOT EXISTS session_authoritative_state(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, state_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL, PRIMARY KEY(provider,session_id));
         CREATE TABLE IF NOT EXISTS session_rollovers(
           id TEXT PRIMARY KEY, provider TEXT NOT NULL, old_session_id TEXT,
           new_session_id TEXT, reason TEXT NOT NULL, requested_by TEXT NOT NULL,
@@ -313,7 +316,7 @@ class Store:
                     json.dumps(mutable, sort_keys=True, separators=(",", ":")),
                     row["id"],
                 ))
-        self.connection.execute("UPDATE schema_version SET version=16")
+        self.connection.execute("UPDATE schema_version SET version=17")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -330,6 +333,32 @@ class Store:
                 ON CONFLICT(scope) DO UPDATE SET data_json=excluded.data_json,
                     updated_at=excluded.updated_at
             """, (scope, encoded, utc_now()))
+
+    def session_authoritative_state(self, provider: str,
+                                    session_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT state_json FROM session_authoritative_state
+            WHERE provider=? AND session_id=?
+        """, (provider, session_id)).fetchone()
+        return None if row is None else json.loads(row["state_json"])
+
+    def save_session_authoritative_state(self, provider: str, session_id: str,
+                                         state: dict[str, Any]) -> None:
+        encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO session_authoritative_state(
+                  provider,session_id,state_json,updated_at) VALUES(?,?,?,?)
+                ON CONFLICT(provider,session_id) DO UPDATE SET
+                  state_json=excluded.state_json,updated_at=excluded.updated_at
+            """, (provider, session_id, encoded, utc_now()))
+
+    def owner_guidance_revision(self, guidance_id: str) -> int | None:
+        row = self.connection.execute("""
+            SELECT MAX(revision) AS revision FROM owner_guidance_revisions
+            WHERE guidance_id=?
+        """, (guidance_id,)).fetchone()
+        return None if row is None or row["revision"] is None else int(row["revision"])
 
     def agent_session_binding(self, provider: str) -> dict[str, Any] | None:
         row = self.connection.execute("""
