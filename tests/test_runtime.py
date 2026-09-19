@@ -2560,6 +2560,65 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                  "unavailable", "completed"), tuple(rollover))
             runtime.close()
 
+    async def test_remote_410_replacement_is_degraded_audited_and_reused_after_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "resident.sqlite3"
+            store = Store(database)
+            provider = OpenAIAgentsProvider("test-key", "model", poll_seconds=0)
+            store.save_agent_session_binding(
+                "openai_agents", "session-expired", None, "turn-old")
+            store.save_session_protocol(
+                "openai_agents", "session-expired",
+                provider._agent_protocol(provider._agent_config([])))
+            creates = []
+
+            def fake_request(method, path, body=None, **_):
+                if method == "GET" and path == "/agents/sessions/session-expired":
+                    raise RuntimeError("OpenAI Agents API returned HTTP 410: expired")
+                if method == "POST" and path == "/agents/sessions":
+                    creates.append(body)
+                    return {"id": "session-replacement", "status": "idle"}
+                if method == "GET" and path == "/agents/sessions/session-replacement":
+                    return {"id": "session-replacement", "status": "idle",
+                            "agent": provider._agent_config([])}
+                raise AssertionError((method, path, body))
+
+            provider._request = fake_request
+            provider._wait_for_submitted_wake = lambda *_: ModelTurn(
+                "turn-new", "replacement ready")
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            await runtime.process(WakeEvent(
+                "wake-410", "scheduler", "due", utc_now(), {}))
+
+            self.assertEqual(1, len(creates))
+            bootstrap = json.loads(creates[0]["input"])["new_session_bootstrap"]
+            self.assertIn("previous remote session was unavailable", bootstrap["handover"])
+            rollover = store.connection.execute(
+                "SELECT old_session_id,new_session_id,reason,finalization_status,status "
+                "FROM session_rollovers").fetchone()
+            self.assertEqual(
+                ("session-expired", "session-replacement", "remote_session_missing",
+                 "unavailable", "completed"), tuple(rollover))
+            runtime.close()
+
+            reopened = Store(database)
+            restarted = OpenAIAgentsProvider("test-key", "model", poll_seconds=0)
+            restarted._request = fake_request
+            restarted_runtime = ResidentRuntime(
+                Config(Path(temporary)), restarted, store=reopened, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            self.assertIsNone(await restarted.preflight_session())
+            session, created = restarted._ensure_session(
+                [], initial_input="ordinary wake after restart")
+            self.assertFalse(created)
+            self.assertEqual("session-replacement", session["id"])
+            self.assertEqual(1, len(creates))
+            restarted_runtime.close()
+
     async def test_restored_session_statuses_are_classified_explicitly(self):
         for status, expected in (("idle", None), ("in_progress", None),
                                  ("requires_action", None)):
@@ -2579,6 +2638,45 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "unsupported status 'future_state'"):
             await provider.preflight_session()
         self.assertIsNone(provider._requested_rollover_reason)
+
+    async def test_restored_session_404_and_410_are_definitively_unavailable(self):
+        for status in (404, 410):
+            with self.subTest(status=status):
+                provider = OpenAIAgentsProvider("test-key", "model")
+                provider._session_id = "session-old"
+
+                def unavailable(*_args, **_kwargs):
+                    raise RuntimeError(
+                        f"OpenAI Agents API returned HTTP {status}: unavailable")
+
+                provider._request = unavailable
+                self.assertEqual(
+                    "remote_session_missing", await provider.preflight_session())
+                self.assertTrue(provider.rollover_ready)
+                self.assertEqual(
+                    "remote_session_missing", provider.unavailable_session_reason)
+
+                provider._unavailable_session_id = None
+                provider._unavailable_session_reason = None
+                provider._requested_rollover_reason = None
+                self.assertTrue(await provider.confirm_rollover_ready())
+                self.assertEqual(
+                    "remote_session_missing", provider.unavailable_session_reason)
+
+    async def test_transient_session_get_error_is_not_classified_unavailable(self):
+        provider = OpenAIAgentsProvider("test-key", "model")
+        provider._session_id = "session-old"
+        provider._request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("OpenAI Agents API returned HTTP 503: retry later"))
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            await provider.preflight_session()
+        self.assertIsNone(provider.unavailable_session_reason)
+        self.assertFalse(provider.rollover_ready)
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            provider._ensure_session([], initial_input="ordinary wake")
+        self.assertIsNone(provider.unavailable_session_reason)
 
     async def test_terminal_restored_session_rolls_over_with_final_handover(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2717,6 +2815,39 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             "agent_id": None,
             "last_turn_id": None,
         }, binding)
+
+    def test_agents_ensure_session_recovers_404_and_410_once(self):
+        for status in (404, 410):
+            with self.subTest(status=status):
+                provider = OpenAIAgentsProvider("test-key", "model")
+                provider._session_id = "session-old"
+                creates = []
+
+                def fake_request(method, path, body=None, **_):
+                    if method == "GET" and path == "/agents/sessions/session-old":
+                        raise RuntimeError(
+                            f"OpenAI Agents API returned HTTP {status}: unavailable")
+                    if method == "POST" and path == "/agents/sessions":
+                        creates.append(body)
+                        return {"id": "session-new", "status": "idle"}
+                    if method == "GET" and path == "/agents/sessions/session-new":
+                        return {"id": "session-new", "status": "idle",
+                                "agent": provider._agent_config([])}
+                    raise AssertionError((method, path, body))
+
+                provider._request = fake_request
+                with self.assertRaises(RemoteSessionUnavailable):
+                    provider._ensure_session([], initial_input="ordinary wake")
+                replacement, created = provider._ensure_session(
+                    [], initial_input="degraded replacement bootstrap")
+                self.assertTrue(created)
+                self.assertEqual("session-new", replacement["id"])
+
+                reused, created = provider._ensure_session(
+                    [], initial_input="ordinary later wake")
+                self.assertFalse(created)
+                self.assertEqual("session-new", reused["id"])
+                self.assertEqual(1, len(creates))
 
     def test_agents_explicit_agent_override_rolls_over_conflicting_binding(self):
         provider = OpenAIAgentsProvider(

@@ -276,6 +276,12 @@ class OpenAIAgentsProvider:
         raise RuntimeError(
             f"OpenAI Agents session returned unsupported status {status!r}")
 
+    @staticmethod
+    def _definitive_session_unavailable(exc: Exception) -> bool:
+        """Recognize only provider responses that definitively retire a session."""
+        message = str(exc)
+        return any(f"HTTP {status}:" in message for status in (404, 410))
+
     def _mark_session_unavailable(self, session_id: str, reason: str) -> None:
         self._unavailable_session_id = session_id
         self._unavailable_session_reason = reason
@@ -294,7 +300,7 @@ class OpenAIAgentsProvider:
             session = await asyncio.to_thread(
                 self._request, "GET", f"/agents/sessions/{session_id}")
         except RuntimeError as exc:
-            if "HTTP 404" not in str(exc):
+            if not self._definitive_session_unavailable(exc):
                 raise
             self._mark_session_unavailable(session_id, "remote_session_missing")
             return "remote_session_missing"
@@ -328,7 +334,7 @@ class OpenAIAgentsProvider:
             session = await asyncio.to_thread(
                 self._request, "GET", f"/agents/sessions/{session_id}")
         except RuntimeError as exc:
-            if "HTTP 404" not in str(exc):
+            if not self._definitive_session_unavailable(exc):
                 raise
             self._mark_session_unavailable(session_id, "remote_session_missing")
             return True
@@ -354,7 +360,7 @@ class OpenAIAgentsProvider:
         try:
             page = self._request("GET", path)
         except RuntimeError as exc:
-            if "HTTP 404" in str(exc) or "HTTP 410" in str(exc):
+            if self._definitive_session_unavailable(exc):
                 raise SessionHistoryUnavailable(
                     f"Session item history for {session_id} is unavailable") from exc
             raise
@@ -555,7 +561,7 @@ class OpenAIAgentsProvider:
                            and confirmed.get("id") == self._session_id else
                            self._request("GET", f"/agents/sessions/{self._session_id}"))
             except RuntimeError as exc:
-                if "HTTP 404" not in str(exc):
+                if not self._definitive_session_unavailable(exc):
                     raise
                 self._mark_session_unavailable(
                     self._session_id, "remote_session_missing")

@@ -14,6 +14,8 @@ DEFAULT_PERSONALITY = (
     "preserve useful continuity, respect your owner's instructions, and communicate thoughtfully."
 )
 
+SUPPORTED_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+
 
 def _environment_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -200,7 +202,7 @@ class Config:
         parser.add_argument("--provider", choices=("openai-agents", "openai-responses", "openai"),
                             default=os.getenv("RESIDENT_PROVIDER", "openai-agents"))
         parser.add_argument("--model", default=os.getenv("RESIDENT_MODEL", "gpt-5.6-luna"))
-        parser.add_argument("--reasoning-effort", choices=("none", "minimal", "low", "medium", "high", "xhigh"),
+        parser.add_argument("--reasoning-effort", choices=SUPPORTED_REASONING_EFFORTS,
                             default=os.getenv("RESIDENT_REASONING_EFFORT"))
         parser.add_argument("--service-tier", default=os.getenv("RESIDENT_SERVICE_TIER"))
         parser.add_argument("--curator-model", default=os.getenv("RESIDENT_CURATOR_MODEL"),
