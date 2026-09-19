@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -27,10 +28,52 @@ _SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "wakeup.scheduled": ("schedule_id", "due_at"),
 }
 _SAFE_JOURNAL_EVENT_LIMIT = 50
+MAX_OWNER_GUIDANCE_ENTRY_BYTES = 4096
+MAX_ACTIVE_OWNER_GUIDANCE_COUNT = 16
+MAX_ACTIVE_OWNER_GUIDANCE_BYTES = 32768
+
+
+def _create_request_configuration(request: dict[str, Any]) -> tuple[dict, dict]:
+    """Reconstruct the applied descriptors solely from a durable create request."""
+    agent = request.get("agent") if isinstance(request.get("agent"), dict) else {}
+    protocol = {
+        "version": 1,
+        "instructions": agent.get("instructions"),
+        "tools": [{key: tool.get(key) for key in
+                   ("type", "name", "description", "parameters")}
+                  for tool in agent.get("tools", []) if isinstance(tool, dict)],
+        "saved_agent_id": request.get("agent_id"),
+        "environment": request.get("environment"),
+        "security_policy_revision": 1,
+    }
+    mutable = {
+        "model": agent.get("model"),
+        "reasoning": agent.get("reasoning"),
+        "service_tier": agent.get("service_tier"),
+    }
+    return protocol, mutable
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _validate_owner_guidance_projection(entries: list[dict[str, Any]]) -> None:
+    if len(entries) > MAX_ACTIVE_OWNER_GUIDANCE_COUNT:
+        raise ValueError(
+            f"Active Owner guidance exceeds {MAX_ACTIVE_OWNER_GUIDANCE_COUNT} entries; "
+            "replace or remove an existing entry")
+    if any(len(entry["content"].encode("utf-8")) > MAX_OWNER_GUIDANCE_ENTRY_BYTES
+           for entry in entries):
+        raise ValueError(
+            f"Owner guidance exceeds {MAX_OWNER_GUIDANCE_ENTRY_BYTES} UTF-8 bytes")
+    encoded = json.dumps(
+        entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if len(encoded) > MAX_ACTIVE_OWNER_GUIDANCE_BYTES:
+        raise ValueError(
+            f"Active Owner guidance exceeds {MAX_ACTIVE_OWNER_GUIDANCE_BYTES} "
+            "serialized UTF-8 bytes; replace or remove an existing entry")
 
 
 class Store:
@@ -48,7 +91,7 @@ class Store:
     def _migrate(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 12 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+        INSERT INTO schema_version(version) SELECT 14 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -82,6 +125,64 @@ class Store:
         CREATE TABLE IF NOT EXISTS agent_session_bindings(
           provider TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT,
           last_turn_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS memory_records(
+          id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL
+            CHECK(status IN ('active','superseded','invalidated')),
+          current_revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS memory_revisions(
+          memory_id TEXT NOT NULL REFERENCES memory_records(id), revision INTEGER NOT NULL,
+          operation TEXT NOT NULL CHECK(operation IN ('create','update','supersede','invalidate')),
+          content TEXT NOT NULL, rationale TEXT NOT NULL DEFAULT '', confidence REAL,
+          operation_key TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(memory_id,revision), UNIQUE(operation_key));
+        CREATE TABLE IF NOT EXISTS memory_provenance(
+          memory_id TEXT NOT NULL, revision INTEGER NOT NULL, source_session_id TEXT,
+          source_item_id TEXT, source_type TEXT NOT NULL, source_timestamp TEXT,
+          excerpt TEXT, content_hash TEXT,
+          FOREIGN KEY(memory_id,revision) REFERENCES memory_revisions(memory_id,revision));
+        CREATE TABLE IF NOT EXISTS owner_guidance(
+          id TEXT PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL
+            CHECK(status IN ('active','superseded','removed')),
+          revision INTEGER NOT NULL, source_session_id TEXT, source_item_id TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS owner_guidance_revisions(
+          guidance_id TEXT NOT NULL REFERENCES owner_guidance(id), revision INTEGER NOT NULL,
+          operation TEXT NOT NULL CHECK(operation IN ('set','remove')), content TEXT NOT NULL,
+          source_session_id TEXT, source_item_id TEXT, created_at TEXT NOT NULL,
+          PRIMARY KEY(guidance_id,revision));
+        CREATE TABLE IF NOT EXISTS curator_checkpoints(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, cursor TEXT,
+          last_item_id TEXT, handover_draft TEXT, updated_at TEXT NOT NULL,
+          PRIMARY KEY(provider,session_id));
+        CREATE TABLE IF NOT EXISTS curator_operations(
+          operation_key TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+          cursor TEXT, applied_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS curator_jobs(
+          id TEXT PRIMARY KEY, session_id TEXT NOT NULL, source_cursor TEXT,
+          status TEXT NOT NULL CHECK(status IN ('claimed','completed','failed')),
+          attempts INTEGER NOT NULL, last_error_type TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS session_handovers(
+          id TEXT PRIMARY KEY, old_session_id TEXT NOT NULL, new_session_id TEXT,
+          content TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+          consumed_at TEXT);
+        CREATE TABLE IF NOT EXISTS session_protocol_descriptors(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, descriptor_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY(provider,session_id));
+        CREATE TABLE IF NOT EXISTS session_mutable_settings(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, settings_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL, PRIMARY KEY(provider,session_id));
+        CREATE TABLE IF NOT EXISTS session_rollovers(
+          id TEXT PRIMARY KEY, provider TEXT NOT NULL, old_session_id TEXT,
+          new_session_id TEXT, reason TEXT NOT NULL, requested_by TEXT NOT NULL,
+          finalization_status TEXT NOT NULL, status TEXT NOT NULL,
+          creation_state TEXT NOT NULL DEFAULT 'not_attempted', create_token TEXT,
+          create_request_json TEXT, create_request_hash TEXT, handover_id TEXT,
+          protocol_descriptor_json TEXT, mutable_settings_json TEXT,
+          created_at TEXT NOT NULL, create_started_at TEXT, bound_at TEXT, completed_at TEXT);
+        CREATE TABLE IF NOT EXISTS session_rollover_requests(
+          provider TEXT PRIMARY KEY, old_session_id TEXT NOT NULL, reason TEXT NOT NULL,
+          requested_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_tool_actions(
           provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
           call_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL,
@@ -93,6 +194,9 @@ class Store:
         CREATE INDEX IF NOT EXISTS idx_wake_runs_started ON wake_runs(started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_journal_run_sequence ON journal(run_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory_records(status,updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_provenance_source
+          ON memory_provenance(source_session_id,source_item_id);
         """)
         # An already-provisioned Resident predates capability snapshots. Seed an
         # empty baseline so its first run with this feature sees the currently
@@ -158,7 +262,58 @@ class Store:
                     "ALTER TABLE agent_tool_actions ADD COLUMN "
                     "attachments_ephemeral INTEGER NOT NULL DEFAULT 0 "
                     "CHECK(attachments_ephemeral IN (0,1))")
-        self.connection.execute("UPDATE schema_version SET version=12")
+        checkpoint_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(curator_checkpoints)")
+        }
+        if "handover_draft" not in checkpoint_columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE curator_checkpoints ADD COLUMN handover_draft TEXT")
+        rollover_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(session_rollovers)")
+        }
+        rollover_additions = {
+            "creation_state": "TEXT NOT NULL DEFAULT 'not_attempted'",
+            "create_token": "TEXT",
+            "create_request_json": "TEXT",
+            "create_request_hash": "TEXT",
+            "handover_id": "TEXT",
+            "protocol_descriptor_json": "TEXT",
+            "mutable_settings_json": "TEXT",
+            "create_started_at": "TEXT",
+            "bound_at": "TEXT",
+        }
+        with self.connection:
+            for name, declaration in rollover_additions.items():
+                if name not in rollover_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE session_rollovers ADD COLUMN {name} {declaration}")
+            # A pending row written by the old implementation may already have
+            # crossed the remote POST. Treat it as uncertain, never as an
+            # unattempted create merely because the old schema lacked this state.
+            self.connection.execute("""
+                UPDATE session_rollovers SET creation_state='create_uncertain'
+                WHERE status='pending' AND create_request_json IS NULL
+                  AND creation_state='not_attempted'
+            """)
+            legacy_snapshots = self.connection.execute("""
+                SELECT id,create_request_json FROM session_rollovers
+                WHERE status='pending' AND creation_state='not_attempted'
+                  AND create_request_json IS NOT NULL
+                  AND (protocol_descriptor_json IS NULL OR mutable_settings_json IS NULL)
+            """).fetchall()
+            for row in legacy_snapshots:
+                request = json.loads(row["create_request_json"])
+                protocol, mutable = _create_request_configuration(request)
+                self.connection.execute("""
+                    UPDATE session_rollovers
+                    SET protocol_descriptor_json=?,mutable_settings_json=? WHERE id=?
+                """, (
+                    json.dumps(protocol, sort_keys=True, separators=(",", ":")),
+                    json.dumps(mutable, sort_keys=True, separators=(",", ":")),
+                    row["id"],
+                ))
+        self.connection.execute("UPDATE schema_version SET version=16")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -195,6 +350,567 @@ class Store:
                   session_id=excluded.session_id, agent_id=excluded.agent_id,
                   last_turn_id=excluded.last_turn_id, updated_at=excluded.updated_at
             """, (provider, session_id, agent_id, last_turn_id, now, now))
+
+    def bind_initial_agent_session(self, provider: str, session_id: str,
+                                   agent_id: str | None,
+                                   create_request: dict[str, Any],
+                                   protocol_descriptor: dict[str, Any],
+                                   mutable_settings: dict[str, Any]) -> None:
+        """Atomically bind a created session and its exact applied configuration."""
+        request_protocol, request_mutable = _create_request_configuration(create_request)
+        if protocol_descriptor != request_protocol or mutable_settings != request_mutable:
+            raise ValueError(
+                "Initial create request and configuration descriptors must match")
+        descriptor_json = json.dumps(
+            protocol_descriptor, sort_keys=True, separators=(",", ":"))
+        settings_json = json.dumps(
+            mutable_settings, sort_keys=True, separators=(",", ":"))
+        now = utc_now()
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO agent_session_bindings(
+                  provider,session_id,agent_id,last_turn_id,created_at,updated_at)
+                VALUES(?,?,?,NULL,?,?) ON CONFLICT(provider) DO UPDATE SET
+                  session_id=excluded.session_id,agent_id=excluded.agent_id,last_turn_id=NULL,
+                  updated_at=excluded.updated_at
+            """, (provider, session_id, agent_id, now, now))
+            self.connection.execute("""
+                INSERT INTO session_protocol_descriptors(provider,session_id,descriptor_json,created_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  descriptor_json=excluded.descriptor_json
+            """, (provider, session_id, descriptor_json, now))
+            self.connection.execute("""
+                INSERT INTO session_mutable_settings(provider,session_id,settings_json,updated_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  settings_json=excluded.settings_json,updated_at=excluded.updated_at
+            """, (provider, session_id, settings_json, now))
+
+    def save_session_protocol(self, provider: str, session_id: str,
+                              descriptor: dict[str, Any]) -> None:
+        encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO session_protocol_descriptors(provider,session_id,descriptor_json,created_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  descriptor_json=excluded.descriptor_json
+            """, (provider, session_id, encoded, utc_now()))
+
+    def session_protocol(self, provider: str, session_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT descriptor_json FROM session_protocol_descriptors
+            WHERE provider=? AND session_id=?
+        """, (provider, session_id)).fetchone()
+        return None if row is None else json.loads(row["descriptor_json"])
+
+    def save_session_mutable_settings(self, provider: str, session_id: str,
+                                      settings: dict[str, Any]) -> None:
+        encoded = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO session_mutable_settings(provider,session_id,settings_json,updated_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  settings_json=excluded.settings_json,updated_at=excluded.updated_at
+            """, (provider, session_id, encoded, utc_now()))
+
+    def session_mutable_settings(self, provider: str,
+                                 session_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT settings_json FROM session_mutable_settings
+            WHERE provider=? AND session_id=?
+        """, (provider, session_id)).fetchone()
+        return None if row is None else json.loads(row["settings_json"])
+
+    def begin_session_rollover(self, provider: str, old_session_id: str | None,
+                               reason: str, requested_by: str,
+                               create_request: dict[str, Any],
+                               protocol_descriptor: dict[str, Any],
+                               mutable_settings: dict[str, Any]) -> dict[str, Any]:
+        # Once a create may have crossed the remote boundary, its recorded
+        # transition excludes every competing create for this provider/session.
+        # Its historical reason and snapshots remain authoritative.
+        pending = self.connection.execute("""
+            SELECT * FROM session_rollovers
+            WHERE provider=? AND old_session_id IS ? AND status='pending'
+              AND creation_state IN ('create_uncertain','not_attempted')
+            ORDER BY CASE creation_state WHEN 'create_uncertain' THEN 0 ELSE 1 END,
+              created_at ASC LIMIT 1
+        """, (provider, old_session_id)).fetchone()
+        if pending is not None:
+            result = dict(pending)
+            if result.get("create_request_json"):
+                result["create_request"] = json.loads(result["create_request_json"])
+            if result.get("protocol_descriptor_json"):
+                result["protocol_descriptor"] = json.loads(
+                    result["protocol_descriptor_json"])
+            if result.get("mutable_settings_json"):
+                result["mutable_settings"] = json.loads(result["mutable_settings_json"])
+            return result
+        rollover_id = str(uuid.uuid4())
+        create_token = str(uuid.uuid4())
+        request = json.loads(json.dumps(create_request))
+        request.setdefault("metadata", {})["rollover_token"] = create_token
+        encoded = json.dumps(request, sort_keys=True, separators=(",", ":"))
+        request_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        request_protocol, request_mutable = _create_request_configuration(request)
+        if protocol_descriptor != request_protocol or mutable_settings != request_mutable:
+            raise ValueError(
+                "Rollover create request and configuration descriptors must match")
+        descriptor_json = json.dumps(
+            protocol_descriptor, sort_keys=True, separators=(",", ":"))
+        settings_json = json.dumps(mutable_settings, sort_keys=True, separators=(",", ":"))
+        handover = self.pending_handover(old_session_id) if old_session_id else None
+        if handover is not None:
+            try:
+                bootstrap = json.loads(request.get("input", ""))["new_session_bootstrap"]
+            except (KeyError, TypeError, json.JSONDecodeError):
+                handover = None
+            else:
+                if bootstrap.get("handover") != handover["content"]:
+                    handover = None
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO session_rollovers(
+                  id,provider,old_session_id,reason,requested_by,finalization_status,status,
+                  creation_state,create_token,create_request_json,create_request_hash,
+                  handover_id,protocol_descriptor_json,mutable_settings_json,created_at)
+                VALUES(?,?,?,?,?,'pending','pending','not_attempted',?,?,?,?,?,?,?)
+            """, (rollover_id, provider, old_session_id, reason, requested_by,
+                  create_token, encoded, request_hash,
+                  handover["id"] if handover else None, descriptor_json, settings_json,
+                  utc_now()))
+        return {
+            "id": rollover_id, "provider": provider, "old_session_id": old_session_id,
+            "reason": reason, "status": "pending", "creation_state": "not_attempted",
+            "create_token": create_token, "create_request": request,
+            "create_request_hash": request_hash,
+            "handover_id": handover["id"] if handover else None,
+            "protocol_descriptor": json.loads(descriptor_json),
+            "mutable_settings": json.loads(settings_json),
+        }
+
+    def request_session_rollover(self, provider: str, old_session_id: str,
+                                 reason: str, requested_by: str = "runtime") -> None:
+        """Durably retain a pre-create request while final consolidation runs."""
+        now = utc_now()
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO session_rollover_requests(
+                  provider,old_session_id,reason,requested_by,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(provider) DO UPDATE SET
+                  old_session_id=excluded.old_session_id,reason=excluded.reason,
+                  requested_by=excluded.requested_by,updated_at=excluded.updated_at
+            """, (provider, old_session_id, reason, requested_by, now, now))
+
+    def pending_session_rollover_request(self, provider: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM session_rollover_requests WHERE provider=?", (provider,)).fetchone()
+        return None if row is None else dict(row)
+
+    def clear_session_rollover_request(self, provider: str,
+                                       old_session_id: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                DELETE FROM session_rollover_requests
+                WHERE provider=? AND old_session_id=?
+            """, (provider, old_session_id))
+
+    def pending_session_rollover(self, provider: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT * FROM session_rollovers WHERE provider=? AND status='pending'
+            ORDER BY CASE WHEN creation_state='create_uncertain' AND old_session_id IS (
+                SELECT session_id FROM agent_session_bindings WHERE provider=?
+              ) THEN 0 WHEN old_session_id IS (
+                SELECT session_id FROM agent_session_bindings WHERE provider=?
+              ) THEN 1 ELSE 2 END,
+              CASE WHEN creation_state='create_uncertain' THEN created_at END ASC,
+              created_at DESC LIMIT 1
+        """, (provider, provider, provider)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        if result.get("create_request_json"):
+            result["create_request"] = json.loads(result["create_request_json"])
+        if result.get("protocol_descriptor_json"):
+            result["protocol_descriptor"] = json.loads(result["protocol_descriptor_json"])
+        if result.get("mutable_settings_json"):
+            result["mutable_settings"] = json.loads(result["mutable_settings_json"])
+        return result
+
+    def mark_session_rollover_create_started(self, rollover_id: str) -> None:
+        with self.connection:
+            result = self.connection.execute("""
+                UPDATE session_rollovers SET creation_state='create_uncertain',create_started_at=?
+                WHERE id=? AND status='pending' AND creation_state='not_attempted'
+            """, (utc_now(), rollover_id))
+        if result.rowcount != 1:
+            raise RuntimeError("Rollover remote creation is not safe to start again")
+
+    def bind_session_rollover(self, rollover_id: str, new_session_id: str,
+                              agent_id: str | None,
+                              finalization_status: str) -> None:
+        now = utc_now()
+        row = self.connection.execute(
+            "SELECT provider,protocol_descriptor_json,mutable_settings_json "
+            "FROM session_rollovers WHERE id=? AND status='pending' "
+            "AND creation_state='create_uncertain'", (rollover_id,)).fetchone()
+        if row is None:
+            raise RuntimeError("Rollover is not awaiting a remote create result")
+        provider = row["provider"]
+        descriptor_json = row["protocol_descriptor_json"]
+        settings_json = row["mutable_settings_json"]
+        if descriptor_json is None or settings_json is None:
+            raise RuntimeError("Rollover has no durable configuration snapshot")
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO agent_session_bindings(
+                  provider,session_id,agent_id,last_turn_id,created_at,updated_at)
+                VALUES(?,?,?,NULL,?,?) ON CONFLICT(provider) DO UPDATE SET
+                  session_id=excluded.session_id,agent_id=excluded.agent_id,last_turn_id=NULL,
+                  updated_at=excluded.updated_at
+            """, (provider, new_session_id, agent_id, now, now))
+            self.connection.execute("""
+                INSERT INTO session_protocol_descriptors(provider,session_id,descriptor_json,created_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  descriptor_json=excluded.descriptor_json
+            """, (provider, new_session_id, descriptor_json, now))
+            self.connection.execute("""
+                INSERT INTO session_mutable_settings(provider,session_id,settings_json,updated_at)
+                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  settings_json=excluded.settings_json,updated_at=excluded.updated_at
+            """, (provider, new_session_id, settings_json, now))
+            self.connection.execute("""
+                UPDATE session_rollovers SET new_session_id=?,creation_state='bound',
+                  finalization_status=?,bound_at=? WHERE id=?
+            """, (new_session_id, finalization_status, now, rollover_id))
+
+    def recover_session_rollovers(self, provider: str) -> int:
+        """Finish only replacements whose binding was durably committed."""
+        now = utc_now()
+        binding = self.agent_session_binding(provider)
+        with self.connection:
+            if binding is not None:
+                # Legacy rows did not record the explicit bound state. A binding
+                # away from the recorded old session is nevertheless durable
+                # proof that the replacement ID reached SQLite.
+                self.connection.execute("""
+                    UPDATE session_rollovers SET new_session_id=?,creation_state='bound',
+                      bound_at=?,finalization_status=CASE
+                        WHEN finalization_status='pending' THEN 'unknown_after_restart'
+                        ELSE finalization_status END
+                    WHERE provider=? AND status='pending'
+                      AND create_request_json IS NULL AND creation_state='create_uncertain'
+                      AND (old_session_id IS NULL OR old_session_id<>?)
+                """, (binding["session_id"], now, provider, binding["session_id"]))
+            result = self.connection.execute("""
+                UPDATE session_rollovers SET status='completed',completed_at=?
+                WHERE provider=? AND status='pending' AND creation_state='bound'
+            """, (now, provider))
+            self.connection.execute("""
+                UPDATE session_handovers SET new_session_id=(
+                    SELECT new_session_id FROM session_rollovers
+                    WHERE session_rollovers.handover_id=session_handovers.id
+                      AND provider=? AND creation_state='bound'
+                    ORDER BY bound_at DESC LIMIT 1),consumed_at=?
+                WHERE consumed_at IS NULL AND id IN (
+                    SELECT handover_id FROM session_rollovers
+                    WHERE provider=? AND creation_state='bound' AND handover_id IS NOT NULL)
+            """, (provider, now, provider))
+        return result.rowcount
+
+    def complete_session_rollover(self, rollover_id: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE session_rollovers SET status='completed',completed_at=?
+                WHERE id=? AND status='pending' AND creation_state='bound'
+            """, (utc_now(), rollover_id))
+
+    def fail_session_rollover(self, rollover_id: str,
+                              finalization_status: str = "failed") -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE session_rollovers SET finalization_status=?,status='failed',
+                  creation_state='rejected',completed_at=?
+                WHERE id=? AND status='pending'
+            """, (finalization_status, utc_now(), rollover_id))
+
+    def curator_checkpoint(self, provider: str, session_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT cursor,last_item_id,handover_draft,updated_at FROM curator_checkpoints
+            WHERE provider=? AND session_id=?
+        """, (provider, session_id)).fetchone()
+        return None if row is None else dict(row)
+
+    def apply_curator_batch(self, provider: str, session_id: str, cursor: str | None,
+                            last_item_id: str | None, operation_key: str,
+                            mutations: list[dict[str, Any]],
+                            handover_operation: str = "keep",
+                            handover_draft: str | None = None) -> bool:
+        """Atomically apply validated curator decisions and advance its source checkpoint."""
+        if any(not mutation.get("provenance") for mutation in mutations):
+            raise ValueError("Durable Curator memory requires verified provenance")
+        if handover_operation not in {"keep", "replace", "clear"}:
+            raise ValueError("Unsupported Curator handover operation")
+        if handover_operation == "replace" and not handover_draft:
+            raise ValueError("Replacement Curator handover must be nonempty")
+        if handover_operation != "replace" and handover_draft is not None:
+            raise ValueError("Only handover replacement may provide draft content")
+        now = utc_now()
+        with self.connection:
+            claimed = self.connection.execute("""
+                INSERT INTO curator_operations(operation_key,session_id,cursor,applied_at)
+                VALUES(?,?,?,?) ON CONFLICT DO NOTHING
+            """, (operation_key, session_id, cursor, now))
+            if claimed.rowcount == 0:
+                return False
+            for index, mutation in enumerate(mutations):
+                memory_id = str(mutation.get("memory_id") or uuid.uuid4())
+                operation = mutation["operation"]
+                existing = self.connection.execute(
+                    "SELECT current_revision FROM memory_records WHERE id=?", (memory_id,)
+                ).fetchone()
+                if operation == "create" and existing is not None:
+                    raise ValueError(f"Memory create targets an existing record: {memory_id}")
+                revision = (existing["current_revision"] + 1) if existing else 1
+                if operation != "create" and existing is None:
+                    raise ValueError(f"Memory mutation targets an unknown record: {memory_id}")
+                status = {"create": "active", "update": "active",
+                          "supersede": "superseded", "invalidate": "invalidated"}[operation]
+                if existing is None:
+                    self.connection.execute("""
+                        INSERT INTO memory_records(id,kind,status,current_revision,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?)
+                    """, (memory_id, mutation.get("kind", "experience"), status, revision, now, now))
+                else:
+                    self.connection.execute("""
+                        UPDATE memory_records SET status=?,current_revision=?,updated_at=? WHERE id=?
+                    """, (status, revision, now, memory_id))
+                mutation_key = f"{operation_key}:{index}"
+                self.connection.execute("""
+                    INSERT INTO memory_revisions(
+                      memory_id,revision,operation,content,rationale,confidence,operation_key,created_at)
+                    VALUES(?,?,?,?,?,?,?,?)
+                """, (memory_id, revision, operation, mutation.get("content", ""),
+                      mutation.get("rationale", ""), mutation.get("confidence"), mutation_key, now))
+                for evidence in mutation.get("provenance", []):
+                    self.connection.execute("""
+                        INSERT INTO memory_provenance(
+                          memory_id,revision,source_session_id,source_item_id,source_type,
+                          source_timestamp,excerpt,content_hash) VALUES(?,?,?,?,?,?,?,?)
+                    """, (memory_id, revision, session_id,
+                          evidence.get("item_id"), evidence.get("source_type", "session_item"),
+                          evidence.get("timestamp"), evidence.get("excerpt"),
+                          evidence.get("content_hash")))
+            self.connection.execute("""
+                INSERT INTO curator_checkpoints(
+                  provider,session_id,cursor,last_item_id,handover_draft,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  cursor=excluded.cursor,last_item_id=excluded.last_item_id,
+                  handover_draft=CASE ?
+                    WHEN 'keep' THEN curator_checkpoints.handover_draft
+                    WHEN 'replace' THEN excluded.handover_draft
+                    WHEN 'clear' THEN NULL END,
+                  updated_at=excluded.updated_at
+            """, (provider, session_id, cursor, last_item_id, handover_draft, now,
+                  handover_operation))
+        return True
+
+    def claim_curator_job(self, job_id: str, session_id: str,
+                          source_cursor: str | None) -> bool:
+        now = utc_now()
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT status FROM curator_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is not None and row["status"] == "completed":
+                return False
+            self.connection.execute("""
+                INSERT INTO curator_jobs(
+                  id,session_id,source_cursor,status,attempts,created_at,updated_at)
+                VALUES(?,?,?,'claimed',1,?,?)
+                ON CONFLICT(id) DO UPDATE SET status='claimed',attempts=attempts+1,
+                  last_error_type=NULL,updated_at=excluded.updated_at
+            """, (job_id, session_id, source_cursor, now, now))
+        return True
+
+    def finish_curator_job(self, job_id: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE curator_jobs SET status='completed',updated_at=? WHERE id=?
+            """, (utc_now(), job_id))
+
+    def fail_curator_job(self, job_id: str, error_type: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE curator_jobs SET status='failed',last_error_type=?,updated_at=? WHERE id=?
+            """, (error_type[:100], utc_now(), job_id))
+
+    def search_memories(self, query: str = "", *, limit: int = 10,
+                        offset: int = 0) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 20))
+        offset = max(0, min(offset, 1000))
+        parameters: list[Any] = []
+        where = "WHERE records.status='active'"
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where += " AND lower(revisions.content) LIKE lower(?) ESCAPE '\\'"
+            parameters.append(f"%{escaped}%")
+        parameters.extend((limit, offset))
+        rows = self.connection.execute(f"""
+            SELECT records.id,records.kind,revisions.content,revisions.confidence,
+                   records.updated_at FROM memory_records records
+            JOIN memory_revisions revisions ON revisions.memory_id=records.id
+              AND revisions.revision=records.current_revision
+            {where} ORDER BY records.updated_at DESC,records.id LIMIT ? OFFSET ?
+        """, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def memory_awareness(self, *, limit: int = 8) -> list[dict[str, Any]]:
+        """Compact type-level index for replacement-session bootstrap."""
+        rows = self.connection.execute("""
+            SELECT kind,count(*) AS active_count,max(updated_at) AS most_recent_at
+            FROM memory_records WHERE status='active' GROUP BY kind
+            ORDER BY most_recent_at DESC,kind LIMIT ?
+        """, (max(1, min(limit, 20)),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def memory(self, memory_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT records.id,records.kind,records.status,records.current_revision,
+                   revisions.content,revisions.rationale,revisions.confidence,records.updated_at
+            FROM memory_records records JOIN memory_revisions revisions
+              ON revisions.memory_id=records.id AND revisions.revision=records.current_revision
+            WHERE records.id=?
+        """, (memory_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["provenance"] = [dict(item) for item in self.connection.execute("""
+            SELECT source_session_id,source_item_id,source_type,source_timestamp,excerpt,content_hash
+            FROM memory_provenance WHERE memory_id=? AND revision=?
+        """, (memory_id, row["current_revision"]))]
+        return result
+
+    def active_owner_guidance(self) -> list[dict[str, Any]]:
+        entries = [dict(row) for row in self.connection.execute("""
+            SELECT id,content,revision,updated_at FROM owner_guidance
+            WHERE status='active' ORDER BY updated_at,id
+        """)]
+        _validate_owner_guidance_projection(entries)
+        return entries
+
+    def set_owner_guidance(self, content: str, *, guidance_id: str | None = None,
+                           source_session_id: str | None = None,
+                           source_item_id: str | None = None) -> str:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Owner guidance must be nonempty text")
+        if len(content.encode("utf-8")) > MAX_OWNER_GUIDANCE_ENTRY_BYTES:
+            raise ValueError(
+                f"Owner guidance exceeds {MAX_OWNER_GUIDANCE_ENTRY_BYTES} UTF-8 bytes")
+        guidance_id = guidance_id or str(uuid.uuid4())
+        now = utc_now()
+        with self.connection:
+            current = self.connection.execute(
+                "SELECT revision FROM owner_guidance WHERE id=?", (guidance_id,)).fetchone()
+            revision = (current["revision"] + 1) if current else 1
+            prospective = [dict(row) for row in self.connection.execute("""
+                SELECT id,content,revision,updated_at FROM owner_guidance
+                WHERE status='active' AND id<>? ORDER BY updated_at,id
+            """, (guidance_id,))]
+            prospective.append({"id": guidance_id, "content": content,
+                                "revision": revision, "updated_at": now})
+            prospective.sort(key=lambda entry: (entry["updated_at"], entry["id"]))
+            _validate_owner_guidance_projection(prospective)
+            self.connection.execute("""
+                INSERT INTO owner_guidance(id,content,status,revision,source_session_id,
+                  source_item_id,created_at,updated_at) VALUES(?,?,'active',?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET content=excluded.content,status='active',
+                  revision=excluded.revision,source_session_id=excluded.source_session_id,
+                  source_item_id=excluded.source_item_id,updated_at=excluded.updated_at
+            """, (guidance_id, content, revision,
+                  source_session_id, source_item_id, now, now))
+            self.connection.execute("""
+                INSERT INTO owner_guidance_revisions(
+                  guidance_id,revision,operation,content,source_session_id,source_item_id,created_at)
+                VALUES(?,?,'set',?,?,?,?)
+            """, (guidance_id, revision, content, source_session_id, source_item_id, now))
+        return guidance_id
+
+    def remove_owner_guidance(self, guidance_id: str, *,
+                              source_session_id: str | None = None,
+                              source_item_id: str | None = None) -> bool:
+        with self.connection:
+            current = self.connection.execute("""
+                SELECT content,revision,source_session_id,source_item_id FROM owner_guidance
+                WHERE id=? AND status='active'
+            """, (guidance_id,)).fetchone()
+            if current is None:
+                return False
+            result = self.connection.execute("""
+                UPDATE owner_guidance SET status='removed',revision=revision+1,updated_at=?
+                WHERE id=? AND status='active'
+            """, (utc_now(), guidance_id))
+            self.connection.execute("""
+                INSERT INTO owner_guidance_revisions(
+                  guidance_id,revision,operation,content,source_session_id,source_item_id,created_at)
+                VALUES(?,?,'remove',?,?,?,?)
+            """, (guidance_id, current["revision"] + 1, current["content"],
+                  source_session_id, source_item_id, utc_now()))
+        return result.rowcount == 1
+
+    def is_pending_owner_message(self, message_id: str, owner_id: str) -> bool:
+        """Verify the durable message created by the authenticated Owner transport."""
+        if not isinstance(message_id, str) or not message_id:
+            return False
+        return self.connection.execute("""
+            SELECT 1
+            FROM owner_message_processing
+            JOIN messages ON messages.id=owner_message_processing.message_id
+            WHERE messages.id=? AND messages.direction='inbound'
+              AND messages.sender_id=? AND owner_message_processing.status='pending'
+        """, (message_id, owner_id)).fetchone() is not None
+
+    def create_handover(self, old_session_id: str, content: str, expires_at: str) -> str:
+        pending = self.pending_handover(old_session_id)
+        if pending is not None:
+            bound = self.connection.execute(
+                "SELECT 1 FROM session_rollovers WHERE handover_id=? AND status='pending'",
+                (pending["id"],)).fetchone()
+            if bound is None:
+                with self.connection:
+                    self.connection.execute(
+                        "UPDATE session_handovers SET content=?,created_at=?,expires_at=? "
+                        "WHERE id=? AND consumed_at IS NULL",
+                        (content, utc_now(), expires_at, pending["id"]))
+            return pending["id"]
+        handover_id = str(uuid.uuid4())
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO session_handovers(id,old_session_id,content,created_at,expires_at)
+                VALUES(?,?,?,?,?)
+            """, (handover_id, old_session_id, content, utc_now(), expires_at))
+        return handover_id
+
+    def pending_handover(self, old_session_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT id,old_session_id,new_session_id,content,created_at,expires_at,consumed_at
+            FROM session_handovers WHERE old_session_id=? AND consumed_at IS NULL
+              AND expires_at>? ORDER BY created_at DESC LIMIT 1
+        """, (old_session_id, utc_now())).fetchone()
+        return None if row is None else dict(row)
+
+    def consume_handover(self, handover_id: str, new_session_id: str) -> str | None:
+        now = utc_now()
+        with self.connection:
+            row = self.connection.execute("""
+                SELECT content FROM session_handovers WHERE id=? AND consumed_at IS NULL
+                  AND expires_at>?
+            """, (handover_id, now)).fetchone()
+            if row is None:
+                return None
+            self.connection.execute("""
+                UPDATE session_handovers SET new_session_id=?,consumed_at=? WHERE id=?
+            """, (new_session_id, now, handover_id))
+        return row["content"]
 
     def begin_agent_tool_action(self, provider: str, session_id: str, turn_id: str,
                                 call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:

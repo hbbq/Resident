@@ -14,6 +14,8 @@ DEFAULT_PERSONALITY = (
     "preserve useful continuity, respect your owner's instructions, and communicate thoughtfully."
 )
 
+SUPPORTED_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+
 
 def _environment_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -143,9 +145,17 @@ class Config:
     owner_communication_enabled: bool = True
     provider: str = "openai-agents"
     model: str = "gpt-5.6-luna"
+    reasoning_effort: str | None = None
+    service_tier: str | None = None
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_agent_id: str | None = None
+    new_chapter: bool = False
+    curator_model: str | None = None
+    curator_api_key: str | None = field(default=None, repr=False)
+    curator_base_url: str = "https://api.openai.com/v1"
+    curator_batch_size: int = 50
+    curator_max_batches: int = 4
     max_tool_rounds: int = 8
     context_messages: int = 8
     spontaneous_message_limit: int = 3
@@ -192,6 +202,18 @@ class Config:
         parser.add_argument("--provider", choices=("openai-agents", "openai-responses", "openai"),
                             default=os.getenv("RESIDENT_PROVIDER", "openai-agents"))
         parser.add_argument("--model", default=os.getenv("RESIDENT_MODEL", "gpt-5.6-luna"))
+        parser.add_argument("--reasoning-effort", choices=SUPPORTED_REASONING_EFFORTS,
+                            default=os.getenv("RESIDENT_REASONING_EFFORT"))
+        parser.add_argument("--service-tier", default=os.getenv("RESIDENT_SERVICE_TIER"))
+        parser.add_argument("--curator-model", default=os.getenv("RESIDENT_CURATOR_MODEL"),
+                            help="separate model for durable memory consolidation; disabled when omitted")
+        parser.add_argument("--new-chapter", action="store_true",
+                            default=_environment_flag("RESIDENT_NEW_CHAPTER"),
+                            help="intentionally roll over the current Agents session at the next wake")
+        parser.add_argument("--curator-batch-size", type=int,
+                            default=int(os.getenv("RESIDENT_CURATOR_BATCH_SIZE", "50")))
+        parser.add_argument("--curator-max-batches", type=int,
+                            default=int(os.getenv("RESIDENT_CURATOR_MAX_BATCHES", "4")))
         parser.add_argument("--spontaneous-message-limit", type=int,
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_LIMIT", "3")))
         parser.add_argument("--spontaneous-message-window-seconds", type=int,
@@ -253,8 +275,16 @@ class Config:
             resident_name=args.resident_name,
             owner_name=args.owner_name, personality=args.personality, provider=args.provider,
             model=args.model, openai_api_key=os.getenv("OPENAI_API_KEY"),
+            reasoning_effort=args.reasoning_effort, service_tier=args.service_tier,
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
             openai_agent_id=os.getenv("RESIDENT_OPENAI_AGENT_ID", "").strip() or None,
+            new_chapter=args.new_chapter,
+            curator_model=args.curator_model,
+            curator_api_key=os.getenv("RESIDENT_CURATOR_API_KEY") or os.getenv("OPENAI_API_KEY"),
+            curator_base_url=os.getenv("RESIDENT_CURATOR_BASE_URL",
+                                       os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/"),
+            curator_batch_size=max(1, min(args.curator_batch_size, 100)),
+            curator_max_batches=max(1, args.curator_max_batches),
             spontaneous_message_limit=max(0, args.spontaneous_message_limit),
             spontaneous_message_window_seconds=max(1, args.spontaneous_message_window_seconds),
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,

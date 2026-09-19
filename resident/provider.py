@@ -7,9 +7,10 @@ import urllib.error
 import urllib.request
 from concurrent.futures import Future
 from contextvars import ContextVar
-from typing import Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
+from .memory import SessionHistoryUnavailable, SessionItemPage
 
 
 class ModelProvider(Protocol):
@@ -17,6 +18,14 @@ class ModelProvider(Protocol):
                       previous_response_id: str | None = None) -> ModelTurn: ...
 
     def discard_continuation(self, continuation_id: str) -> None: ...
+
+
+class RemoteSessionUnavailable(RuntimeError):
+    """A restored session vanished before a replacement bootstrap was prepared."""
+
+
+class RolloverRecoveryRequired(RuntimeError):
+    """Remote creation may have succeeded and cannot be reconciled by this API."""
 
 
 RESIDENT_AGENT_INSTRUCTIONS = (
@@ -119,7 +128,8 @@ class OpenAIAgentsProvider:
 
     def __init__(self, api_key: str, model: str, base_url: str = "https://api.openai.com/v1", *,
                  agent_id: str | None = None, poll_seconds: float = 0.25,
-                 timeout_seconds: float = 120.0):
+                 timeout_seconds: float = 120.0, reasoning_effort: str | None = None,
+                 service_tier: str | None = None):
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required for the OpenAI provider")
         self.api_key, self.model, self.base_url = api_key, model, base_url.rstrip("/")
@@ -127,11 +137,14 @@ class OpenAIAgentsProvider:
         # The ID nested in an inline-created session describes that session's
         # resolved agent, but is not valid as agent_id on a later session create.
         self.agent_id = agent_id
+        self.reasoning_effort, self.service_tier = reasoning_effort, service_tier
         self.poll_seconds = poll_seconds
         self.timeout_seconds = timeout_seconds
         self._session_id: str | None = None
         self._last_turn_id: str | None = None
         self._tool_fingerprint: str | None = None
+        self._protocol_descriptor: dict[str, Any] | None = None
+        self._mutable_settings_descriptor: dict[str, Any] | None = None
         self._active_turn_id: str | None = None
         self._submitted_call_ids: dict[str, set[str]] = {}
         self._pending_wakes: dict[str, tuple[str, str, str]] = {}
@@ -140,9 +153,33 @@ class OpenAIAgentsProvider:
         self._binding_writer: ContextVar[
             Callable[[str, str | None, str | None], None] | None
         ] = ContextVar("agents_binding_writer", default=None)
+        self._lifecycle_writer: ContextVar[Callable[[Callable, tuple], Any] | None] = (
+            ContextVar("agents_lifecycle_writer", default=None))
         self._pending_binding: tuple[str, str | None, str | None] | None = None
         self._begin_action: Callable[..., dict] | None = None
         self._complete_action: Callable[..., None] | None = None
+        self._load_protocol: Callable[[str], dict | None] = lambda _session_id: None
+        self._save_protocol: Callable[[str, dict], None] = lambda *_: None
+        self._load_mutable: Callable[[str], dict | None] = lambda _session_id: None
+        self._save_mutable: Callable[[str, dict], None] = lambda *_: None
+        self._bind_initial_session: Callable[..., None] = lambda *_: None
+        self._load_pending_rollover: Callable[[], dict | None] = lambda: None
+        self._begin_rollover: Callable[..., dict] = (
+            lambda old, reason, requested_by, request, protocol, mutable: {
+                "id": "", "old_session_id": old, "reason": reason,
+                "creation_state": "not_attempted", "create_request": request,
+                "protocol_descriptor": protocol, "mutable_settings": mutable})
+        self._mark_rollover_create_started: Callable[[str], None] = lambda *_: None
+        self._bind_rollover: Callable[..., None] = lambda *_: None
+        self._complete_rollover: Callable[[str], None] = lambda *_: None
+        self._fail_rollover: Callable[[str, str], None] = lambda *_: None
+        self._requested_rollover_reason: str | None = None
+        self._unavailable_session_id: str | None = None
+        self._unavailable_session_reason: str | None = None
+        self._preflight_session_status: str | None = None
+        self._confirmed_rollover_session: dict[str, Any] | None = None
+        self._rollover_deferred_while_busy = False
+        self._lifecycle_bound = False
 
     def bind_session_store(self, load: Callable[[], dict | None],
                            save: Callable[[str, str | None, str | None], None]) -> None:
@@ -150,17 +187,186 @@ class OpenAIAgentsProvider:
         binding = load()
         if binding is not None:
             persisted_agent_id = binding.get("agent_id")
-            if self.agent_id is None or self.agent_id == persisted_agent_id:
-                self._session_id = binding["session_id"]
-                self._last_turn_id = binding.get("last_turn_id")
-                if self.agent_id is None and persisted_agent_id is not None:
-                    # Older versions persisted session-local agent IDs. Keep the
-                    # recoverable session and turn, but migrate away from ever
-                    # presenting that ID as a saved Agent resource.
-                    save(self._session_id, None, self._last_turn_id)
+            # Configuration drift does not make the old session disappear.  Keep
+            # it bound so the common idle/final-curation/handover lifecycle owns
+            # the saved-Agent transition just like every other immutable change.
+            self._session_id = binding["session_id"]
+            self._last_turn_id = binding.get("last_turn_id")
+            if self.agent_id is None and persisted_agent_id is not None:
+                # Older versions persisted session-local agent IDs. Keep the
+                # recoverable session and turn, but migrate away from ever
+                # presenting that ID as a saved Agent resource.
+                save(self._session_id, None, self._last_turn_id)
 
     def bind_action_store(self, begin: Callable[..., dict], complete: Callable[..., None]) -> None:
         self._begin_action, self._complete_action = begin, complete
+
+    def bind_lifecycle_store(self, load_protocol: Callable[[str], dict | None],
+                             save_protocol: Callable[[str, dict], None],
+                             load_mutable: Callable[[str], dict | None],
+                             save_mutable: Callable[[str, dict], None],
+                             load_pending_rollover: Callable[[], dict | None],
+                             begin_rollover: Callable[[str | None, str, str, dict], dict],
+                             mark_rollover_create_started: Callable[[str], None],
+                             bind_rollover: Callable[..., None],
+                             complete_rollover: Callable[[str], None],
+                             fail_rollover: Callable[[str, str], None],
+                             bind_initial_session: Callable[..., None]) -> None:
+        self._lifecycle_bound = True
+        self._load_protocol, self._save_protocol = load_protocol, save_protocol
+        self._load_mutable, self._save_mutable = load_mutable, save_mutable
+        self._load_pending_rollover = load_pending_rollover
+        self._begin_rollover = begin_rollover
+        self._mark_rollover_create_started = mark_rollover_create_started
+        self._bind_rollover = bind_rollover
+        self._complete_rollover, self._fail_rollover = complete_rollover, fail_rollover
+        self._bind_initial_session = bind_initial_session
+        if self._session_id is not None:
+            self._protocol_descriptor = load_protocol(self._session_id)
+            self._mutable_settings_descriptor = load_mutable(self._session_id)
+        pending = load_pending_rollover()
+        if (pending is not None and (self._session_id is None
+                                    or pending.get("old_session_id") == self._session_id)):
+            if self._session_id is None and pending.get("old_session_id") is not None:
+                # A durable create attempt takes precedence over a newly desired
+                # saved Agent ID until its recorded configuration is replayed.
+                self._session_id = pending["old_session_id"]
+                self._last_turn_id = None
+                self._protocol_descriptor = load_protocol(self._session_id)
+                self._mutable_settings_descriptor = load_mutable(self._session_id)
+            self._requested_rollover_reason = pending["reason"]
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    @property
+    def session_protocol_known(self) -> bool:
+        return self._session_id is None or self._protocol_descriptor is not None
+
+    @property
+    def unavailable_session_reason(self) -> str | None:
+        return self._unavailable_session_reason
+
+    def request_rollover(self, reason: str = "explicit_new_chapter") -> None:
+        if not reason.strip():
+            raise ValueError("Session rollover reason must be nonempty")
+        self._requested_rollover_reason = reason.strip()
+
+    @property
+    def rollover_ready(self) -> bool:
+        """Whether the most recent preflight found the old session idle."""
+        return (self._session_id is None or self._unavailable_session_id == self._session_id
+                or self._preflight_session_status == "idle")
+
+    @property
+    def requested_rollover_reason(self) -> str | None:
+        return self._requested_rollover_reason
+
+    @staticmethod
+    def _session_usability(session: dict[str, Any]) -> str:
+        """Classify only session states represented by the Agents adapter contract."""
+        status = session.get("status")
+        if status == "idle":
+            return "usable"
+        if status in {"in_progress", "requires_action"}:
+            return "busy"
+        if status == "failed":
+            return "terminal"
+        raise RuntimeError(
+            f"OpenAI Agents session returned unsupported status {status!r}")
+
+    @staticmethod
+    def _definitive_session_unavailable(exc: Exception) -> bool:
+        """Recognize only provider responses that definitively retire a session."""
+        message = str(exc)
+        return any(f"HTTP {status}:" in message for status in (404, 410))
+
+    def _mark_session_unavailable(self, session_id: str, reason: str) -> None:
+        self._unavailable_session_id = session_id
+        self._unavailable_session_reason = reason
+        self._preflight_session_status = None
+        self._confirmed_rollover_session = None
+        if self._requested_rollover_reason is None:
+            self._requested_rollover_reason = reason
+
+    async def preflight_session(self) -> str | None:
+        """Detect an unavailable restored session before wake context is built."""
+        session_id = self._session_id
+        if session_id is None:
+            self._preflight_session_status = None
+            return None
+        try:
+            session = await asyncio.to_thread(
+                self._request, "GET", f"/agents/sessions/{session_id}")
+        except RuntimeError as exc:
+            if not self._definitive_session_unavailable(exc):
+                raise
+            self._mark_session_unavailable(session_id, "remote_session_missing")
+            return "remote_session_missing"
+        self._preflight_session_status = session.get("status")
+        usability = self._session_usability(session)
+        if usability == "terminal":
+            self._mark_session_unavailable(session_id, "remote_session_failed")
+            return "remote_session_failed"
+        if usability == "usable":
+            # A fresh idle preflight gives Runtime the opportunity to prepare
+            # final curation and bootstrap input for this wake.
+            self._rollover_deferred_while_busy = False
+        remote_agent = session.get("agent")
+        remote_agent_id = (remote_agent.get("id")
+                           if isinstance(remote_agent, dict) else None)
+        if (self.agent_id is not None and remote_agent_id is not None
+                and remote_agent_id != self.agent_id
+                and self._requested_rollover_reason is None):
+            # Make the immutable mismatch visible before Runtime decides whether
+            # final curation and a handover can safely be prepared.  A busy
+            # session remains bound and the request is merely carried forward.
+            self._requested_rollover_reason = "saved_agent_id_changed"
+        return None
+
+    async def confirm_rollover_ready(self) -> bool:
+        """Recheck idleness and preserve that exact observation for creation."""
+        session_id = self._session_id
+        if session_id is None or self._unavailable_session_id == session_id:
+            return True
+        try:
+            session = await asyncio.to_thread(
+                self._request, "GET", f"/agents/sessions/{session_id}")
+        except RuntimeError as exc:
+            if not self._definitive_session_unavailable(exc):
+                raise
+            self._mark_session_unavailable(session_id, "remote_session_missing")
+            return True
+        self._preflight_session_status = session.get("status")
+        usability = self._session_usability(session)
+        if usability == "terminal":
+            self._mark_session_unavailable(session_id, "remote_session_failed")
+            return True
+        self._confirmed_rollover_session = session if usability == "usable" else None
+        return self._confirmed_rollover_session is not None
+
+    async def session_items(self, cursor: str | None, limit: int = 50) -> SessionItemPage:
+        if self._session_id is None:
+            return SessionItemPage((), cursor, False)
+        return await asyncio.to_thread(self._session_items_sync, self._session_id, cursor, limit)
+
+    def _session_items_sync(self, session_id: str, cursor: str | None,
+                            limit: int) -> SessionItemPage:
+        from urllib.parse import quote
+        path = f"/agents/sessions/{session_id}/items?order=asc&limit={max(1, min(limit, 100))}"
+        if cursor:
+            path += f"&after={quote(cursor, safe='')}"
+        try:
+            page = self._request("GET", path)
+        except RuntimeError as exc:
+            if self._definitive_session_unavailable(exc):
+                raise SessionHistoryUnavailable(
+                    f"Session item history for {session_id} is unavailable") from exc
+            raise
+        data = tuple(item for item in (page.get("data") or []) if isinstance(item, dict))
+        next_cursor = page.get("last_id") or (data[-1].get("id") if data else cursor)
+        return SessionItemPage(data, next_cursor, bool(page.get("has_more")))
 
     def prepare_tool_call(self, call: ToolCall) -> dict | None:
         if self._begin_action is None or self._session_id is None or self._active_turn_id is None:
@@ -205,10 +411,24 @@ class OpenAIAgentsProvider:
         # asyncio.to_thread propagates this context into only this response's
         # worker, avoiding a process-wide or connection-wide thread escape.
         token = self._binding_writer.set(save_on_event_loop)
+        def lifecycle_on_event_loop(function: Callable, arguments: tuple) -> Any:
+            completed: Future[Any] = Future()
+
+            def invoke() -> None:
+                try:
+                    completed.set_result(function(*arguments))
+                except BaseException as exc:
+                    completed.set_exception(exc)
+
+            loop.call_soon_threadsafe(invoke)
+            return completed.result()
+
+        lifecycle_token = self._lifecycle_writer.set(lifecycle_on_event_loop)
         try:
             return await asyncio.to_thread(
                 self._respond_sync, context, tools, results, previous_response_id)
         finally:
+            self._lifecycle_writer.reset(lifecycle_token)
             self._binding_writer.reset(token)
 
     def discard_continuation(self, continuation_id: str) -> None:
@@ -295,10 +515,11 @@ class OpenAIAgentsProvider:
     def _reconcile_before_wake(self, session_id: str, session: dict) -> ModelTurn | None:
         """Finish remote work without attributing it to the next ordinary wake."""
         status = session.get("status")
-        if status == "failed":
+        usability = self._session_usability(session)
+        if usability == "terminal":
             raise RuntimeError(
                 f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
-        if status == "idle":
+        if usability == "usable":
             latest = self._latest_turn(session_id)
             if latest is not None and latest.get("id") != self._last_turn_id:
                 self._completed_turn(session_id, session, latest)
@@ -318,45 +539,133 @@ class OpenAIAgentsProvider:
                         allow_create: bool = True) -> tuple[dict, bool]:
         self._flush_pending_binding()
         agent = self._agent_config(tools)
+        desired_protocol = self._agent_protocol(agent)
         fingerprint = json.dumps(agent, sort_keys=True, separators=(",", ":"))
         if self._session_id is not None:
+            if self._unavailable_session_id == self._session_id:
+                pending = self._pending_rollover_for_bound_session()
+                requested_reason = self._requested_rollover_reason
+                reason = (pending["reason"] if pending is not None else
+                          self._unavailable_session_reason or "remote_session_missing")
+                result = self._intentional_rollover(
+                    reason, agent, desired_protocol, initial_input, allow_create,
+                    finalization_status="unavailable")
+                if (pending is not None and requested_reason is not None
+                        and requested_reason != reason):
+                    self._requested_rollover_reason = requested_reason
+                return result
             try:
-                session = self._request("GET", f"/agents/sessions/{self._session_id}")
+                confirmed = self._confirmed_rollover_session
+                self._confirmed_rollover_session = None
+                session = (confirmed if confirmed is not None
+                           and confirmed.get("id") == self._session_id else
+                           self._request("GET", f"/agents/sessions/{self._session_id}"))
             except RuntimeError as exc:
-                if "HTTP 404" not in str(exc):
+                if not self._definitive_session_unavailable(exc):
                     raise
-                self._session_id = None
-                self._last_turn_id = None
+                self._mark_session_unavailable(
+                    self._session_id, "remote_session_missing")
+                raise RemoteSessionUnavailable(str(exc)) from exc
             else:
-                remote_agent_id = (session.get("agent") or {}).get("id")
+                if self._session_usability(session) == "terminal":
+                    self._mark_session_unavailable(
+                        self._session_id, "remote_session_failed")
+                    raise RemoteSessionUnavailable(
+                        "OpenAI Agents session is terminal and cannot accept another wake")
+                remote_agent = session.get("agent")
+                applied_protocol = self._protocol_descriptor
+                if (applied_protocol is None and isinstance(remote_agent, dict)
+                        and {"model", "instructions", "tools"} <= remote_agent.keys()):
+                    applied_protocol = self._agent_protocol(remote_agent)
+                if applied_protocol is None and self._tool_fingerprint is not None:
+                    try:
+                        applied_protocol = self._agent_protocol(
+                            json.loads(self._tool_fingerprint))
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+                compatibility = self._protocol_compatibility(applied_protocol, desired_protocol)
+                if applied_protocol is None and self._lifecycle_bound:
+                    # A legacy binding without an applied descriptor cannot prove
+                    # that today's immutable protocol was used.
+                    compatibility = "rollover"
+
+                # Transition precedence is deliberate: an unresolved durable
+                # attempt owns this old session before any newly inferred reason.
+                # Newer desired state is retained and reconciled after that exact
+                # historical create request has completed.
+                pending = self._pending_rollover_for_bound_session()
+                remote_agent_id = (remote_agent.get("id")
+                                   if isinstance(remote_agent, dict) else None)
+                inferred_reason = None
                 if (self.agent_id is not None and remote_agent_id is not None
                         and remote_agent_id != self.agent_id):
-                    # A current operator override must not inherit a session
-                    # attached to a different saved Agent resource.
-                    self._session_id = None
-                    self._last_turn_id = None
+                    inferred_reason = "saved_agent_id_changed"
+                elif compatibility == "rollover":
+                    inferred_reason = "function_or_immutable_protocol_changed"
+
+                requested_reason = self._requested_rollover_reason
+                if pending is not None:
+                    rollover_reason = pending["reason"]
+                    future_reason = (
+                        requested_reason if requested_reason != rollover_reason else None)
+                    if (future_reason is None and inferred_reason is not None
+                            and pending.get("protocol_descriptor") != desired_protocol):
+                        future_reason = inferred_reason
                 else:
-                    remote_agent = session.get("agent")
-                    if self._tool_fingerprint is None:
-                        if (not isinstance(remote_agent, dict)
-                                or not {"model", "instructions", "tools"} <= remote_agent.keys()
-                                or self._agent_config_matches(remote_agent, agent)):
-                            # A restored provider has no in-memory fingerprint.
-                            # Recognize a matching persisted session from its
-                            # returned config. A partial legacy response cannot
-                            # prove a mismatch, so avoid replacing it eagerly.
-                            self._tool_fingerprint = fingerprint
-                    if self._tool_fingerprint != fingerprint and session.get("status") == "idle":
-                        # Session updates only accept model, reasoning, and
-                        # service-tier overrides. Instructions and tools are part
-                        # of session creation, so replace an idle session when the
-                        # Resident configuration actually changes.
-                        self._session_id = None
-                        self._last_turn_id = None
-                    else:
-                        # If the session is active, leave the mismatch pending and
-                        # retry once it becomes idle.
+                    rollover_reason = requested_reason or inferred_reason
+                    future_reason = None
+
+                if rollover_reason is not None:
+                    self._requested_rollover_reason = rollover_reason
+                    if session.get("status") != "idle":
+                        # Detection records intent only.  Active and requires-action
+                        # sessions finish under their existing immutable contract.
+                        self._rollover_deferred_while_busy = self._lifecycle_bound
                         return session, False
+                    if self._lifecycle_bound and self._rollover_deferred_while_busy:
+                        # This input was assembled before the active turn became
+                        # idle, so it has no final catch-up/handover bootstrap.
+                        # Let it use the old session and leave the request pending
+                        # for the next preflight-prepared wake boundary.
+                        self._rollover_deferred_while_busy = False
+                        return session, False
+                    result = self._intentional_rollover(
+                        rollover_reason, agent, desired_protocol,
+                        initial_input, allow_create)
+                    if pending is not None:
+                        self._requested_rollover_reason = future_reason
+                    return result
+
+                if self._tool_fingerprint is None:
+                    if (not isinstance(remote_agent, dict)
+                            or not {"model", "instructions", "tools"} <= remote_agent.keys()
+                            or self._agent_config_matches(remote_agent, agent)):
+                        # A restored provider has no in-memory fingerprint.
+                        # Recognize a matching persisted session from its returned
+                        # config. A partial legacy response cannot prove a mismatch.
+                        self._tool_fingerprint = fingerprint
+
+                # Mutable settings are an independent reconciliation dimension.
+                # A compatible local revocation retains the old immutable remote
+                # descriptor, but must not suppress a safe mutable PATCH.
+                mutable_patch = self._mutable_patch(remote_agent)
+                if mutable_patch:
+                    if session.get("status") != "idle":
+                        return session, False
+                    patched = self._request(
+                        "PATCH", f"/agents/sessions/{self._session_id}",
+                        {"agent": mutable_patch})
+                    session = {**session, **patched}
+                    desired_mutable = self._desired_mutable_settings()
+                    self._lifecycle_call(
+                        self._save_mutable, self._session_id, desired_mutable)
+                    self._mutable_settings_descriptor = desired_mutable
+                if compatibility != "compatible_revocation":
+                    self._protocol_descriptor = desired_protocol
+                    self._lifecycle_call(
+                        self._save_protocol, self._session_id, desired_protocol)
+                    self._tool_fingerprint = fingerprint
+                return session, False
         if not allow_create:
             raise RuntimeError(
                 "OpenAI Agents session disappeared while continuing a turn")
@@ -371,12 +680,158 @@ class OpenAIAgentsProvider:
         }
         if self.agent_id:
             body["agent_id"] = self.agent_id
-        session = self._request("POST", "/agents/sessions", body)
-        self._session_id = session["id"]
+        mutable_settings = self._desired_mutable_settings()
+        if self._lifecycle_bound:
+            reason = self._requested_rollover_reason or "initial_session"
+            return self._create_initial_session(
+                reason, body, desired_protocol, mutable_settings, fingerprint)
+        else:
+            session = self._request("POST", "/agents/sessions", body)
+            session_id = session["id"]
+            # Keep the standalone adapter's retry checkpoint behavior: if its
+            # binding callback fails, the known remote ID is retried before use.
+            self._session_id = session_id
+            self._persist_binding(session_id, self.agent_id, None)
+            self._save_protocol(session_id, desired_protocol)
+            self._save_mutable(session_id, mutable_settings)
+        self._session_id = session_id
         self._last_turn_id = None
         self._tool_fingerprint = fingerprint
-        self._persist_binding(self._session_id, self.agent_id, None)
+        self._protocol_descriptor = desired_protocol
+        self._mutable_settings_descriptor = mutable_settings
         return session, True
+
+    def _create_initial_session(self, reason: str, body: dict[str, Any],
+                                descriptor: dict[str, Any],
+                                mutable_settings: dict[str, Any],
+                                fingerprint: str) -> tuple[dict, bool]:
+        """Create the first session only after its exact request is durable."""
+        attempt = self._lifecycle_call(
+            self._begin_rollover, None, reason, "runtime", body,
+            descriptor, mutable_settings)
+        attempt_id = attempt["id"]
+        if attempt.get("creation_state") == "create_uncertain":
+            raise RolloverRecoveryRequired(
+                "Initial session creation may have succeeded before Resident could "
+                "record its ID. The Agents API exposes no supported create-idempotency "
+                "or reconciliation contract, so automatic re-creation is blocked; "
+                f"create attempt {attempt_id} requires operator reconciliation.")
+        if attempt.get("creation_state") != "not_attempted":
+            raise RuntimeError(
+                f"Initial create attempt {attempt_id} is not in a creatable state: "
+                f"{attempt.get('creation_state')}")
+        persisted_body = attempt.get("create_request")
+        persisted_descriptor = attempt.get("protocol_descriptor")
+        persisted_mutable = attempt.get("mutable_settings")
+        if not isinstance(persisted_body, dict):
+            raise RuntimeError(
+                f"Initial create attempt {attempt_id} has no durable create request")
+        if (not isinstance(persisted_descriptor, dict)
+                or not isinstance(persisted_mutable, dict)):
+            raise RuntimeError(
+                f"Initial create attempt {attempt_id} has no durable configuration snapshot")
+        self._lifecycle_call(self._mark_rollover_create_started, attempt_id)
+        try:
+            session = self._request("POST", "/agents/sessions", persisted_body)
+            session_id = session["id"]
+            self._lifecycle_call(
+                self._bind_rollover, attempt_id, session_id,
+                persisted_descriptor.get("saved_agent_id"), "not_applicable")
+            # The binding and exact create-time descriptors are now one durable
+            # transaction. That is the point at which a new-chapter request for
+            # a previously sessionless Resident has been satisfied.
+            self._requested_rollover_reason = None
+            self._session_id, self._last_turn_id = session_id, None
+            self._pending_binding = None
+            self._protocol_descriptor = persisted_descriptor
+            self._mutable_settings_descriptor = persisted_mutable
+            self._tool_fingerprint = json.dumps(
+                persisted_body.get("agent", {}), sort_keys=True, separators=(",", ":"))
+            self._lifecycle_call(self._complete_rollover, attempt_id)
+            return session, True
+        except Exception as exc:
+            if self._definitive_create_rejection(exc):
+                self._lifecycle_call(
+                    self._fail_rollover, attempt_id, "create_rejected")
+            raise
+
+    def _pending_rollover_for_bound_session(self) -> dict[str, Any] | None:
+        """Return only unresolved durable work owned by the current binding."""
+        pending = self._lifecycle_call(self._load_pending_rollover)
+        if (pending is None or pending.get("old_session_id") != self._session_id
+                or pending.get("creation_state") not in {
+                    "not_attempted", "create_uncertain"}):
+            return None
+        return pending
+
+    def _intentional_rollover(self, reason: str, agent: dict,
+                              descriptor: dict[str, Any], initial_input: str | None,
+                              allow_create: bool, *,
+                              finalization_status: str = "completed") -> tuple[dict, bool]:
+        if not allow_create:
+            raise RuntimeError("OpenAI Agents session requires rollover while continuing a turn")
+        if initial_input is None:
+            raise RuntimeError("Intentional session rollover requires bootstrap input")
+        old_session_id = self._session_id
+        body: dict = {
+            "environment": {"type": "none"}, "agent": agent, "input": initial_input,
+            "metadata": {"managed_by": "resident", "rollover_reason": reason},
+        }
+        if self.agent_id:
+            body["agent_id"] = self.agent_id
+        mutable_settings = self._desired_mutable_settings()
+        rollover = self._lifecycle_call(
+            self._begin_rollover, old_session_id, reason, "runtime", body,
+            descriptor, mutable_settings)
+        rollover_id = rollover["id"]
+        if rollover.get("creation_state") == "create_uncertain":
+            raise RolloverRecoveryRequired(
+                "Replacement session creation may have succeeded before Resident could "
+                "record its ID. The Agents API exposes no supported create-idempotency or "
+                "lookup-by-rollover-token contract, so automatic re-creation is blocked; "
+                f"rollover {rollover_id} requires operator reconciliation.")
+        if rollover.get("creation_state") != "not_attempted":
+            raise RuntimeError(
+                f"Rollover {rollover_id} is not in a creatable state: "
+                f"{rollover.get('creation_state')}")
+        persisted_body = rollover.get("create_request")
+        if not isinstance(persisted_body, dict):
+            raise RuntimeError(f"Rollover {rollover_id} has no durable create request")
+        persisted_descriptor = rollover.get("protocol_descriptor")
+        persisted_mutable = rollover.get("mutable_settings")
+        if not isinstance(persisted_descriptor, dict) or not isinstance(persisted_mutable, dict):
+            raise RuntimeError(f"Rollover {rollover_id} has no durable configuration snapshot")
+        self._lifecycle_call(self._mark_rollover_create_started, rollover_id)
+        try:
+            session = self._request("POST", "/agents/sessions", persisted_body)
+            new_session_id = session["id"]
+            if self._lifecycle_bound:
+                self._lifecycle_call(
+                    self._bind_rollover, rollover_id, new_session_id,
+                    persisted_descriptor.get("saved_agent_id"),
+                    finalization_status)
+            self._session_id, self._last_turn_id = new_session_id, None
+            self._unavailable_session_id = None
+            self._unavailable_session_reason = None
+            self._requested_rollover_reason = (
+                reason if rollover.get("reason") != reason else None)
+            self._protocol_descriptor = persisted_descriptor
+            self._mutable_settings_descriptor = persisted_mutable
+            self._tool_fingerprint = json.dumps(
+                persisted_body.get("agent", {}), sort_keys=True, separators=(",", ":"))
+            if self._lifecycle_bound:
+                self._pending_binding = None
+                self._lifecycle_call(self._complete_rollover, rollover_id)
+            else:
+                self._persist_binding(
+                    new_session_id, persisted_descriptor.get("saved_agent_id"), None)
+                self._save_protocol(new_session_id, persisted_descriptor)
+                self._save_mutable(new_session_id, persisted_mutable)
+            return session, True
+        except Exception as exc:
+            if self._definitive_create_rejection(exc):
+                self._lifecycle_call(self._fail_rollover, rollover_id, "create_rejected")
+            raise
 
     def _persist_binding(self, session_id: str, agent_id: str | None,
                          last_turn_id: str | None) -> None:
@@ -392,7 +847,7 @@ class OpenAIAgentsProvider:
             self._persist_binding(*self._pending_binding)
 
     def _agent_config(self, tools: Sequence[ToolSpec]) -> dict:
-        return {
+        agent = {
             "model": self.model,
             "instructions": RESIDENT_AGENT_INSTRUCTIONS,
             "tools": [{
@@ -400,6 +855,86 @@ class OpenAIAgentsProvider:
                 "description": tool.description, "parameters": tool.input_schema,
             } for tool in tools],
         }
+        if self.reasoning_effort:
+            agent["reasoning"] = {"effort": self.reasoning_effort}
+        if self.service_tier:
+            agent["service_tier"] = self.service_tier
+        return agent
+
+    def _desired_mutable_settings(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "reasoning": ({"effort": self.reasoning_effort}
+                          if self.reasoning_effort is not None else None),
+            "service_tier": self.service_tier,
+        }
+
+    def _mutable_patch(self, remote_agent: object) -> dict[str, Any]:
+        remote = remote_agent if isinstance(remote_agent, dict) else {}
+        desired = self._desired_mutable_settings()
+        applied = self._mutable_settings_descriptor or {}
+        patch: dict[str, Any] = {}
+        for key in ("model", "reasoning", "service_tier"):
+            if key in remote:
+                known, current = True, remote.get(key)
+            elif key in applied:
+                known, current = True, applied.get(key)
+            else:
+                known, current = False, None
+            if (known and current != desired[key]) or (
+                    not known and desired[key] is not None
+                    and (key != "model" or self._lifecycle_bound)):
+                patch[key] = desired[key]
+        return patch
+
+    @staticmethod
+    def _definitive_create_rejection(exc: Exception) -> bool:
+        message = str(exc)
+        return any(f"HTTP {status}" in message for status in (
+            400, 401, 403, 404, 405, 406, 410, 411, 413, 414, 415, 422))
+
+    def protocol_change_requires_rollover(self, tools: Sequence[ToolSpec]) -> bool:
+        if self._session_id is None:
+            return False
+        if self._requested_rollover_reason:
+            return True
+        applied = self._protocol_descriptor
+        desired = self._agent_protocol(self._agent_config(tools))
+        return self._protocol_compatibility(applied, desired) == "rollover"
+
+    def _lifecycle_call(self, function: Callable, *arguments: Any) -> Any:
+        writer = self._lifecycle_writer.get()
+        return function(*arguments) if writer is None else writer(function, arguments)
+
+    def _agent_protocol(self, agent: dict) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "instructions": agent.get("instructions"),
+            "tools": [{key: tool.get(key) for key in
+                       ("type", "name", "description", "parameters")}
+                      for tool in agent.get("tools", []) if isinstance(tool, dict)],
+            "saved_agent_id": self.agent_id,
+            "environment": {"type": "none"},
+            "security_policy_revision": 1,
+        }
+
+    @staticmethod
+    def _protocol_compatibility(applied: dict[str, Any] | None,
+                                desired: dict[str, Any]) -> str:
+        if applied is None:
+            return "unchanged"
+        if any(applied.get(key) != desired.get(key) for key in (
+                "version", "instructions", "saved_agent_id", "environment",
+                "security_policy_revision")):
+            return "rollover"
+        old_tools = {tool.get("name"): tool for tool in applied.get("tools", [])}
+        new_tools = {tool.get("name"): tool for tool in desired.get("tools", [])}
+        # A local revocation can safely preserve the old advertised contract:
+        # ToolRegistry returns a deterministic unavailable response if it is called.
+        if set(new_tools) < set(old_tools) and all(
+                old_tools[name] == tool for name, tool in new_tools.items()):
+            return "compatible_revocation"
+        return "unchanged" if old_tools == new_tools else "rollover"
 
     @staticmethod
     def _agent_config_matches(remote: object, expected: dict) -> bool:
@@ -408,11 +943,12 @@ class OpenAIAgentsProvider:
         remote_tools = [{key: tool.get(key) for key in (
             "type", "name", "description", "parameters")}
             for tool in remote.get("tools", []) if isinstance(tool, dict)]
-        return {
+        comparable = {
             "model": remote.get("model"),
             "instructions": remote.get("instructions"),
             "tools": remote_tools,
-        } == expected
+        }
+        return comparable == {key: expected.get(key) for key in comparable}
 
     def _wait_for_turn(self, session_id: str, expected_turn_id: str | None) -> ModelTurn:
         if not expected_turn_id:
@@ -423,7 +959,7 @@ class OpenAIAgentsProvider:
         while time.monotonic() < expires:
             session = self._request("GET", f"/agents/sessions/{session_id}")
             status = session.get("status")
-            if status == "failed":
+            if self._session_usability(session) == "terminal":
                 raise RuntimeError(f"OpenAI Agents session failed: {session.get('error') or 'no details'}")
             if status == "requires_action":
                 turn = self._required_actions_turn(session)

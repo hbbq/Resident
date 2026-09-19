@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from .config import SUPPORTED_REASONING_EFFORTS
+
 
 _ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _ENV = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
@@ -38,6 +40,8 @@ class AgentDefinition:
     api_key_env: str = "OPENAI_API_KEY"
     base_url_env: str = "OPENAI_BASE_URL"
     agent_id_env: str | None = None
+    reasoning_effort: str | None = None
+    service_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,14 @@ def _string_list(value: Any, label: str) -> tuple[str, ...]:
     if len(value) != len(set(value)):
         raise ValueError(f"{label} contains duplicates")
     return tuple(value)
+
+
+def _reasoning_effort(value: Any, label: str) -> str:
+    effort = _string(value, label)
+    if effort not in SUPPORTED_REASONING_EFFORTS:
+        allowed = ", ".join(SUPPORTED_REASONING_EFFORTS)
+        raise ValueError(f"{label} must be one of: {allowed}")
+    return effort
 
 
 def _subscriptions(value: Any, label: str) -> tuple[str, ...]:
@@ -172,7 +184,8 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
             if "role_prompt" in data else _string(data["role"], "role"))
 
     agent_data = _mapping(data.get("agent", {}), f"{path.name}.agent")
-    agent_allowed = {"provider", "model", "api_key_env", "base_url_env", "agent_id_env"}
+    agent_allowed = {"provider", "model", "api_key_env", "base_url_env", "agent_id_env",
+                     "reasoning_effort", "service_tier"}
     if set(agent_data) - agent_allowed:
         raise ValueError(f"Unknown agent fields in {path.name}: {', '.join(sorted(set(agent_data) - agent_allowed))}")
     provider = _string(agent_data.get("provider", "openai-agents"), "agent.provider")
@@ -184,6 +197,12 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
         api_key_env=_env_name(agent_data.get("api_key_env", "OPENAI_API_KEY"), "agent.api_key_env"),
         base_url_env=_env_name(agent_data.get("base_url_env", "OPENAI_BASE_URL"), "agent.base_url_env"),
         agent_id_env=_env_name(agent_data.get("agent_id_env"), "agent.agent_id_env", required=False),
+        reasoning_effort=(
+            _reasoning_effort(agent_data["reasoning_effort"], "agent.reasoning_effort")
+            if agent_data.get("reasoning_effort") is not None else None),
+        service_tier=(
+            _string(agent_data["service_tier"], "agent.service_tier")
+            if agent_data.get("service_tier") is not None else None),
     )
     transport = None
     if data.get("owner_transport") is not None:

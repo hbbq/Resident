@@ -30,5 +30,6 @@ class ContextBuilder:
             } for c in capabilities],
             "pending_intentions": self.store.pending_intentions(),
             "recent_communication": self.store.recent_messages(self.message_limit),
+            "standing_owner_guidance": self.store.active_owner_guidance(),
         }
         return json.dumps(document, ensure_ascii=False, indent=2)

@@ -59,7 +59,7 @@ A wake event should remain deliberately small and general, conceptually containi
 
 Runtime compares a durable, public capability snapshot at startup and whenever capabilities are explicitly replaced, registered, or removed. A newly provisioned Resident records its first baseline silently. Later additions, removals, and public descriptor changes produce a normal `capabilities_changed` wake; executable handlers and connector secrets are outside the snapshot. Each wake uses one capability snapshot for both context and tool registration. There is no capability polling loop, and detection never exercises a capability.
 
-During a wakeup Resident receives an appropriate working context, reasons and possibly acts, and may then sleep again. Conversational continuity currently comes from its durable managed-agent session; pending intentions remain explicit local state.
+During a wakeup Resident receives an appropriate working context, reasons and possibly acts, and may then sleep again. The durable managed-agent session supplies episodic continuity; pending intentions, standing Owner guidance, and curated long-term memory remain explicit local state.
 
 Scheduling is a mechanism, not a collection of hard-coded behaviors. Resident should be able to request a future wakeup with a reason/context rather than requiring dedicated classes such as `TemperatureMonitor` or `RobotExplorationBehavior`.
 
@@ -102,6 +102,10 @@ Pending intentions can initially be included generously while their number is sm
 A separate persistent `working_state` concept is not required initially; the managed session and pending intentions should be allowed to demonstrate whether another form of continuity is actually necessary.
 
 > ContextBuilder provides enough context to begin thinking, not everything Resident might possibly need.
+
+Long-term memory is an append-only revision graph in the per-Resident store. Active records are retrieved selectively through bounded read-only tools. No durable Curator memory revision is accepted without at least one verified reference to an item in the fetched source page; mixed valid/invalid evidence rejects that mutation, and provenance excerpts and hashes are derived only from the Resident's credential-scrubbed source projection. A separately configured Curator reads that explicit allowlisted projection after a durable cursor and commits accepted decisions plus checkpoint in one transaction. Tool arguments/results and unknown structured fields never enter the projection. Recognizable credential-bearing text structures are deterministically removed both before Curator inference and before its memories or handovers are persisted; arbitrary natural-language secret classification is intentionally not claimed. Curator catch-up runs at startup and after completed activity, so correctness does not depend on graceful shutdown. Standing Owner guidance has its own complete revision history and is always present in wake context, subject to deterministic per-entry, active-count, and total serialized-size bounds enforced on each set or replacement.
+
+Session compatibility is field-based. Mutable model settings are patched between turns and their last successfully applied values are persisted independently of the immutable protocol descriptor, so a partial remote representation cannot erase a configured change after restart. Local configuration and capability grants that do not alter the advertised function protocol continue unchanged; revocation can retain an unavailable compatibility handler. Function additions/renames, descriptions or schemas, immutable instructions, saved-Agent ID adoption, explicit new chapters, unrecoverable remote sessions, and security contract revisions use an explicit rollover record. Before a reachable intentional rollover the Curator performs final catch-up; the replacement bootstrap contains bounded memory awareness and a short-lived handover, never the complete store. Rollover persists its exact create request and token before crossing the remote boundary, records the attempt before POST, and atomically binds the returned replacement ID with its protocol and mutable settings. Because the current Agents API has no supported create-idempotency or lookup-by-token contract, an attempted create whose returned ID was not durably bound remains explicitly uncertain and blocks automatic re-creation; a durably bound replacement is completed on restart without another POST.
 
 ## Pending intentions
 
@@ -253,7 +257,7 @@ Physical co-location does not require logical integration. For example, a camera
 
 ## Long-term memory
 
-Long-term memory is intentionally not implemented by the current runtime. Conversational and working continuity comes from the durable OpenAI Agents session. A future dedicated Memory Store and curator will own selected durable knowledge independently of that session, with explicit retrieval and lifecycle semantics designed as one coherent subsystem.
+Long-term memory is deliberately separate from the OpenAI Agents session. The session is working context; curated memory, Owner guidance, provenance, curator checkpoints, handovers, and rollover lineage are local durable subsystems with distinct retention and retrieval semantics.
 
 The former SQLite `memories` table, automatic recall and standing-guidance context lanes, and `remember`/`recall`/`update_memory`/`forget` tools were removed rather than retained as a competing compatibility system. Session rollover therefore currently loses conversational knowledge that has not been represented elsewhere, such as in communication history or a pending intention.
 
