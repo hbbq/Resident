@@ -59,7 +59,7 @@ A wake event should remain deliberately small and general, conceptually containi
 
 Runtime compares a durable, public capability snapshot at startup and whenever capabilities are explicitly replaced, registered, or removed. A newly provisioned Resident records its first baseline silently. Later additions, removals, and public descriptor changes produce a normal `capabilities_changed` wake; executable handlers and connector secrets are outside the snapshot. Each wake uses one capability snapshot for both context and tool registration. There is no capability polling loop, and detection never exercises a capability.
 
-During a wakeup Resident receives an appropriate working context, reasons and possibly acts, and may then sleep again. The durable managed-agent session supplies episodic continuity; pending intentions, standing Owner guidance, and curated long-term memory remain explicit local state.
+During a wakeup Resident receives an appropriate working context, reasons and possibly acts, and may then sleep again. The durable managed-agent session supplies episodic continuity, so ordinary wakes add the new trigger without replaying prior communication or working context. New sessions receive bounded bootstrap state and handover; changed locally authoritative identity, capability, and standing-guidance state is synchronized durably to existing sessions. Pending intentions, standing Owner guidance, and curated long-term memory remain explicit local state.
 
 Scheduling is a mechanism, not a collection of hard-coded behaviors. Resident should be able to request a future wakeup with a reason/context rather than requiring dedicated classes such as `TemperatureMonitor` or `RobotExplorationBehavior`.
 
@@ -277,7 +277,7 @@ The runtime treats communication as messages between a Resident instance and its
 
 Conceptually, a persisted message needs only general communication metadata such as an identity, timestamp, direction/sender, content, and optional attachments. The exact schema should remain small until experience demonstrates additional requirements.
 
-Incoming owner messages wake Resident and are delivered as part of the corresponding `WakeEvent`. Relevant/recent communication may also be selected by the context builder. Communication history is persisted independently of conversational context and any future long-term memory system.
+Incoming owner messages wake Resident and are delivered once as part of the corresponding `WakeEvent`. Communication history is persisted independently of conversational context and long-term memory, and is retrieved on demand rather than replayed into a surviving managed session or normal bootstrap.
 
 All intentional outgoing Resident communication, including replies during Owner-initiated wakes, uses the communication capability. That path persists the message and delivers it through the currently configured transport. Model-returned result text is not a fallback transport: if communication is rejected by attention policy or fails in transport, the failure is journaled and the result text is not delivered in its place. Resident may send a question and go back to sleep without waiting for an answer. A later owner message is simply another message and wake event; Resident is responsible for understanding whether it answers something earlier.
 
