@@ -22,7 +22,8 @@ from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
 _DEGRADED_HANDOVER = (
     "The previous remote session was unavailable, so its final working context could not be "
     "curated. Continue from the durable Resident identity, standing Owner guidance, pending "
-    "intentions, recent communications, and long-term-memory index in this bootstrap."
+    "intentions, and long-term-memory index in this bootstrap. Older communication remains "
+    "available through bounded communication search."
 )
 
 
@@ -291,6 +292,37 @@ class ResidentRuntime:
         except Exception:
             pass
 
+    def _authoritative_state_update(self, session_id: str,
+                                    current: dict) -> dict | None:
+        """Describe only externally owned state not yet synchronized to this session."""
+        previous = self.store.session_authoritative_state("openai_agents", session_id)
+        if previous is None:
+            return {"mode": "replace", **current}
+
+        update: dict = {"mode": "delta"}
+        for key in ("resident", "owner", "available_connectors"):
+            if previous.get(key) != current.get(key):
+                update[key] = current[key]
+
+        old_guidance = {
+            entry["id"]: entry for entry in previous.get("standing_owner_guidance", [])
+        }
+        new_guidance = {
+            entry["id"]: entry for entry in current.get("standing_owner_guidance", [])
+        }
+        changed = [entry for guidance_id, entry in new_guidance.items()
+                   if old_guidance.get(guidance_id) != entry]
+        removed = [{
+            "id": guidance_id,
+            "revision": self.store.owner_guidance_revision(guidance_id),
+        } for guidance_id in old_guidance.keys() - new_guidance.keys()]
+        if changed or removed:
+            update["standing_owner_guidance"] = {
+                "set": changed,
+                "removed": removed,
+            }
+        return update if len(update) > 1 else None
+
     async def process(self, event: WakeEvent) -> str:
         started = time.monotonic()
         run_id = self.store.start_run(event)
@@ -308,12 +340,27 @@ class ResidentRuntime:
             preflight_session = getattr(self.provider, "preflight_session", None)
             unavailable_reason = (
                 await preflight_session() if preflight_session is not None else None)
-            context = self.context_builder.build(self.resident, self.owner, event, capabilities)
-            context_document = json.loads(context)
+            managed_session = bool(getattr(self.provider, "uses_managed_session", False))
+            authoritative_state = self.context_builder.authoritative_state(
+                self.resident, self.owner, capabilities)
+            existing_session_id = getattr(self.provider, "session_id", None)
+            if managed_session:
+                authoritative_update = (
+                    self._authoritative_state_update(existing_session_id, authoritative_state)
+                    if existing_session_id is not None else None)
+                context = self.context_builder.build_managed_wake(
+                    event, authoritative_update=authoritative_update)
+            else:
+                context = self.context_builder.build(
+                    self.resident, self.owner, event, capabilities)
             self._emit("context.assembled", {
                 "characters": len(context),
-                "pending_intentions": len(self.store.pending_intentions()),
-                "recent_messages": len(self.store.recent_messages(self.config.context_messages)),
+                "pending_intentions": (
+                    0 if managed_session and existing_session_id is not None
+                    else len(self.store.pending_intentions())),
+                "recent_messages": (
+                    0 if managed_session
+                    else len(self.store.recent_messages(self.config.context_messages))),
             })
             owner_guidance_authorization = None
             if event.source == "owner" and event.reason == "owner_message":
@@ -381,12 +428,17 @@ class ResidentRuntime:
                 else:
                     handover = None
             if new_session:
-                context_document["new_session_bootstrap"] = {
-                    "durable_memory_awareness": self.store.memory_awareness(limit=8),
-                    "handover": handover,
-                    "note": "Long-term memory is selectively available through memory tools.",
-                }
-                context = json.dumps(context_document, ensure_ascii=False, indent=2)
+                if managed_session:
+                    context = self.context_builder.build_managed_bootstrap(
+                        self.resident, self.owner, event, capabilities, handover=handover)
+                else:
+                    context_document = json.loads(context)
+                    context_document["new_session_bootstrap"] = {
+                        "durable_memory_awareness": self.store.memory_awareness(limit=8),
+                        "handover": handover,
+                        "note": "Long-term memory is selectively available through memory tools.",
+                    }
+                    context = json.dumps(context_document, ensure_ascii=False, indent=2)
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
@@ -424,12 +476,8 @@ class ResidentRuntime:
                         handover_id = self.store.create_handover(
                             old_session_id, handover,
                             (datetime.now(UTC) + timedelta(hours=24)).isoformat())
-                    context_document["new_session_bootstrap"] = {
-                        "durable_memory_awareness": self.store.memory_awareness(limit=8),
-                        "handover": handover,
-                        "note": "Long-term memory is selectively available through memory tools.",
-                    }
-                    context = json.dumps(context_document, ensure_ascii=False, indent=2)
+                    context = self.context_builder.build_managed_bootstrap(
+                        self.resident, self.owner, event, capabilities, handover=handover)
                     turn = await self.provider.respond(
                         context, registry.specs, results, continuation_id)
                 if handover_id is not None:
@@ -498,6 +546,15 @@ class ResidentRuntime:
             if capability_event_state is not None:
                 self.store.save_observed_snapshot("runtime.capabilities", capability_event_state[1])
                 self._capability_event_states.pop(event.id, None)
+            if managed_session:
+                synchronized_session_id = getattr(self.provider, "session_id", None)
+                if synchronized_session_id is not None:
+                    # Tool calls in this completed turn also made their durable
+                    # state changes visible through the managed session history.
+                    synchronized_state = self.context_builder.authoritative_state(
+                        self.resident, self.owner, capabilities)
+                    self.store.save_session_authoritative_state(
+                        "openai_agents", synchronized_session_id, synchronized_state)
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
             if self.curator is not None:

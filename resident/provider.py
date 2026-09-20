@@ -126,6 +126,8 @@ class OpenAIAgentsProvider:
     durable conversational session and agent turn loop.
     """
 
+    uses_managed_session = True
+
     def __init__(self, api_key: str, model: str, base_url: str = "https://api.openai.com/v1", *,
                  agent_id: str | None = None, poll_seconds: float = 0.25,
                  timeout_seconds: float = 120.0, reasoning_effort: str | None = None,
