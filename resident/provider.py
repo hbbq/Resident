@@ -1326,9 +1326,15 @@ class OpenAIAgentsProvider:
                 nonlocal event_count
                 data_lines: list[str] = []
                 expires = started + self.timeout_seconds
-                for raw_line in response:
-                    if time.monotonic() >= expires:
+                while True:
+                    remaining = expires - time.monotonic()
+                    if remaining <= 0:
                         raise TimeoutError("Timed out waiting for the OpenAI Agents stream")
+                    response.fp.raw._sock.settimeout(remaining)
+                    try:
+                        raw_line = next(response)
+                    except StopIteration:
+                        break
                     line = raw_line.decode("utf-8").rstrip("\r\n")
                     if line == "":
                         if not data_lines:

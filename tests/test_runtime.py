@@ -487,6 +487,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/agents/", serialized)
 
     async def test_agents_sse_parser_and_timeline_are_payload_safe(self):
+        class FakeSocket:
+            def settimeout(self, _timeout):
+                pass
+
         class FakeStreamResponse:
             def __init__(self):
                 self.lines = iter([
@@ -496,6 +500,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                     b"\n",
                 ])
                 self.closed = False
+                self.fp = type("File", (), {
+                    "raw": type("Raw", (), {"_sock": FakeSocket()})()
+                })()
 
             def __iter__(self):
                 return self
@@ -533,6 +540,58 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(stream_events))
         self.assertEqual(1, stream_events[0]["event_count"])
         self.assertNotIn("turn-secret", json.dumps(events))
+
+    def test_agents_sse_stall_near_deadline_uses_only_remaining_timeout(self):
+        clock = [100.0]
+
+        class FakeSocket:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, timeout):
+                self.timeouts.append(timeout)
+
+        class FakeStreamResponse:
+            def __init__(self):
+                self.socket = FakeSocket()
+                self.fp = type("File", (), {
+                    "raw": type("Raw", (), {"_sock": self.socket})()
+                })()
+                self.reads = 0
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.reads += 1
+                if self.reads == 1:
+                    clock[0] = 100.9
+                    return b": keepalive\n"
+                raise TimeoutError("simulated stalled read")
+
+            def close(self):
+                self.closed = True
+
+        provider = OpenAIAgentsProvider(
+            "test-key", "model", timeout_seconds=1.0)
+        response = FakeStreamResponse()
+
+        def open_near_deadline(*_args, **_kwargs):
+            clock[0] = 100.4
+            return response
+
+        with patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("resident.provider.urllib.request.urlopen",
+                      side_effect=open_near_deadline):
+            with self.assertRaisesRegex(TimeoutError, "simulated stalled read"):
+                with provider._open_event_stream("session-1") as stream:
+                    list(stream)
+
+        self.assertEqual(2, response.reads)
+        self.assertAlmostEqual(0.6, response.socket.timeouts[0])
+        self.assertAlmostEqual(0.1, response.socket.timeouts[1])
+        self.assertTrue(response.closed)
 
     async def test_default_diagnostics_show_actionable_runtime_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
