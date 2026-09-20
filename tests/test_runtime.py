@@ -1282,7 +1282,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             requests.append((method, path, body))
             if method == "GET":
                 return {"id": "session-1", "status": "idle", "agent": remote_agent}
-            if method == "PATCH":
+            if method == "POST" and path == "/agents/sessions/session-1":
                 return {"id": "session-1", "status": "idle"}
             raise AssertionError((method, path, body))
 
@@ -1331,7 +1331,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             requests.append((method, path, body))
             if method == "GET":
                 return {"id": "session-1", "status": "idle", "agent": remote_agent}
-            if method == "PATCH":
+            if method == "POST" and path == "/agents/sessions/session-1":
                 return {"id": "session-1", "status": "idle"}
             raise AssertionError((method, path, body))
 
@@ -1340,7 +1340,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(created)
         self.assertEqual("session-1", session["id"])
-        self.assertEqual(["GET", "PATCH"], [request[0] for request in requests])
+        self.assertEqual(["GET", "POST"], [request[0] for request in requests])
         self.assertEqual({"agent": {
             "reasoning": {"effort": "high"}, "service_tier": "priority",
         }}, requests[-1][2])
@@ -1383,7 +1383,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     if method == "GET":
                         return {"id": "session-old", "status": "idle",
                                 "agent": remote_agent}
-                    if method == "PATCH":
+                    if method == "POST" and path == "/agents/sessions/session-old":
                         remote_agent.update(body["agent"])
                         return {"id": "session-old", "status": "idle"}
                     raise AssertionError((method, path, body))
@@ -1399,10 +1399,12 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertFalse(created)
                 self.assertEqual("session-old", session["id"])
-                patches = [body for method, _, body in requests if method == "PATCH"]
+                patches = [body for method, path, body in requests
+                           if method == "POST" and path == "/agents/sessions/session-old"]
                 self.assertEqual(
                     [] if not expected_patch else [{"agent": expected_patch}], patches)
-                self.assertFalse(any(method == "POST" for method, _, _ in requests))
+                self.assertFalse(any(method == "POST" and path == "/agents/sessions"
+                                     for method, path, _ in requests))
                 self.assertEqual(old_protocol, store.session_protocol(
                     "openai_agents", "session-old"))
                 self.assertEqual(provider._desired_mutable_settings(),
@@ -1421,8 +1423,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     diagnostic_output=lambda _: None)
                 requests.clear()
                 restarted_provider._ensure_session([], initial_input="next wake")
-                self.assertFalse(any(method in {"PATCH", "POST"}
-                                     for method, _, _ in requests))
+                self.assertFalse(any(method == "POST" for method, _, _ in requests))
                 self.assertEqual(old_protocol, reopened.session_protocol(
                     "openai_agents", "session-old"))
                 restarted_runtime.close()
@@ -1477,7 +1478,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 requests.append((method, path, body))
                 if method == "GET":
                     return {"id": "session-1", "status": "idle", "agent": {}}
-                if method == "PATCH":
+                if method == "POST" and path == "/agents/sessions/session-1":
                     return {"id": "session-1", "status": "idle"}
                 raise AssertionError((method, path, body))
 
@@ -1507,7 +1508,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 clear_requests.append((method, path, body))
                 if method == "GET":
                     return {"id": "session-1", "status": "idle", "agent": {}}
-                if method == "PATCH":
+                if method == "POST" and path == "/agents/sessions/session-1":
                     return {"id": "session-1", "status": "idle"}
                 raise AssertionError((method, path, body))
 
@@ -1563,7 +1564,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 requests.append((method, request_path, body))
                 if method == "GET":
                     return {"id": "session-1", "status": "idle", "agent": {}}
-                if method == "PATCH":
+                if method == "POST" and request_path == "/agents/sessions/session-1":
                     return {"id": "session-1", "status": "idle"}
                 raise AssertionError((method, request_path, body))
 
@@ -1574,7 +1575,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(expected_protocol, changed._protocol_descriptor)
             self.assertEqual(expected_mutable, changed._mutable_settings_descriptor)
             changed._ensure_session([], initial_input="wake after restart")
-            self.assertEqual(["GET", "PATCH"], [method for method, _, _ in requests])
+            self.assertEqual(["GET", "POST"], [method for method, _, _ in requests])
             self.assertEqual({"agent": changed._desired_mutable_settings()}, requests[-1][2])
             self.assertEqual(expected_protocol, reopened.session_protocol(
                 "openai_agents", "session-1"))
@@ -1614,7 +1615,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             def fake_request(method, path, body=None, **_):
                 requests.append((method, path, body))
-                if method == "POST":
+                if method == "POST" and path == "/agents/sessions":
                     return {"id": "session-initial", "status": "idle"}
                 if method == "GET":
                     return {"id": "session-initial", "status": "idle",
@@ -1709,7 +1710,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     return {"id": "session-initial", "status": "idle"}
                 if method == "GET":
                     return {"id": "session-initial", "status": "idle", "agent": {}}
-                if method == "PATCH":
+                if method == "POST" and request_path == "/agents/sessions/session-initial":
                     return {"id": "session-initial", "status": "idle"}
                 raise AssertionError((method, request_path, body))
 
@@ -1727,7 +1728,9 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({"agent": {
                 "model": "model-b", "reasoning": {"effort": "high"},
             }}, requests[-1][2])
-            self.assertEqual(1, sum(method == "POST" for method, _, _ in requests))
+            self.assertEqual(1, sum(
+                method == "POST" and path == "/agents/sessions"
+                for method, path, _ in requests))
             resumed_runtime.close()
 
     def test_definitive_initial_create_rejection_is_retryable_and_keeps_new_chapter(self):
@@ -2110,9 +2113,9 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 requests.append((method, request_path, body))
                 if method == "GET":
                     return {"id": "session-recovered", "status": "idle", "agent": {}}
-                if method == "PATCH":
+                if method == "POST" and request_path == "/agents/sessions/session-recovered":
                     return {"id": "session-recovered", "status": "idle"}
-                if method == "POST":
+                if method == "POST" and request_path == "/agents/sessions":
                     return {"id": "session-chapter", "status": "idle"}
                 raise AssertionError((method, request_path, body))
 
@@ -2122,11 +2125,15 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 owner_output=lambda _: None, diagnostic_output=lambda _: None)
             provider._ensure_session([], initial_input="ordinary wake")
             self.assertEqual({"agent": {"model": "model-b"}},
-                             next(body for method, _, body in requests if method == "PATCH"))
+                             next(body for method, path, body in requests
+                                  if method == "POST"
+                                  and path == "/agents/sessions/session-recovered"))
 
             provider.request_rollover("explicit_new_chapter")
             provider._ensure_session([], initial_input="chapter bootstrap")
-            self.assertEqual(1, sum(method == "POST" for method, _, _ in requests))
+            self.assertEqual(1, sum(
+                method == "POST" and path == "/agents/sessions"
+                for method, path, _ in requests))
             self.assertEqual("session-chapter", provider.session_id)
             runtime.close()
 
@@ -2243,10 +2250,10 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 if method == "GET":
                     session_id = request_path.rsplit("/", 1)[-1]
                     return {"id": session_id, "status": "idle", "agent": {}}
-                if method == "POST":
+                if method == "POST" and request_path == "/agents/sessions":
                     creates.append(body)
                     return {"id": "session-new", "status": "idle"}
-                if method == "PATCH":
+                if method == "POST" and request_path == "/agents/sessions/session-new":
                     patches.append(body)
                     return {"id": "session-new", "status": "idle"}
                 raise AssertionError((method, request_path, body))
@@ -2370,7 +2377,9 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, sum(
                 method == "POST" and request_path == "/agents/sessions"
                 for method, request_path, _ in requests))
-            self.assertFalse(any(method == "PATCH" for method, _, _ in requests))
+            self.assertFalse(any(
+                method == "POST" and request_path != "/agents/sessions"
+                for method, request_path, _ in requests))
             self.assertFalse(provider.protocol_change_requires_rollover([]))
             runtime.close()
 

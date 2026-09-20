@@ -649,13 +649,13 @@ class OpenAIAgentsProvider:
 
                 # Mutable settings are an independent reconciliation dimension.
                 # A compatible local revocation retains the old immutable remote
-                # descriptor, but must not suppress a safe mutable PATCH.
+                # descriptor, but must not suppress a safe mutable update.
                 mutable_patch = self._mutable_patch(remote_agent)
                 if mutable_patch:
                     if session.get("status") != "idle":
                         return session, False
                     patched = self._request(
-                        "PATCH", f"/agents/sessions/{self._session_id}",
+                        "POST", f"/agents/sessions/{self._session_id}",
                         {"agent": mutable_patch})
                     session = {**session, **patched}
                     desired_mutable = self._desired_mutable_settings()
