@@ -3976,8 +3976,61 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("reconciled", turn.message)
         self.assertEqual(["submitted"], submissions)
         self.assertEqual(
-            [("session-1", None, correlation, "wake-1", "stream_eof")],
+            [("session-1", None, correlation, "wake-1", "stream_error")],
             fallbacks)
+
+    def test_agents_stream_matching_session_error_reconciles_submitted_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        _, correlation = provider._correlated_context("wake", "wake-1")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "error", "session_id": "session-1",
+                "error": "stream failed",
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, fallback_correlation,
+                          wake_key, reason):
+            fallbacks.append((session_id, expected_turn_id, fallback_correlation,
+                              wake_key, reason))
+            return ModelTurn("turn-exact", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", None, correlation, "wake-1", "stream_error")],
+            fallbacks)
+
+    def test_agents_stream_matching_turn_error_reconciles_continuation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "error", "turn_id": "turn-1", "error": "stream failed",
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, correlation, wake_key,
+                          reason):
+            fallbacks.append(
+                (session_id, expected_turn_id, correlation, wake_key, reason))
+            return ModelTurn("turn-1", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, expected_turn_id="turn-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", "turn-1", None, None, "stream_error")], fallbacks)
 
     def test_agents_stream_mismatched_error_cannot_terminate_wake(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
@@ -4011,7 +4064,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("reconciled", turn.message)
         self.assertEqual(
-            [("session-1", None, correlation, "wake-1", "stream_eof")],
+            [("session-1", None, correlation, "wake-1", "stream_error")],
             fallbacks)
 
     def test_agents_stream_mismatched_error_cannot_terminate_continuation(self):
@@ -4038,7 +4091,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("reconciled", turn.message)
         self.assertEqual(
-            [("session-1", "turn-1", None, None, "stream_eof")], fallbacks)
+            [("session-1", "turn-1", None, None, "stream_error")], fallbacks)
 
     def test_agents_stream_expected_continuation_terminal_event_is_definitive(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
