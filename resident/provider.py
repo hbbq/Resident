@@ -7,8 +7,9 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import Future
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Iterator, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
 from .memory import SessionHistoryUnavailable, SessionItemPage
@@ -17,6 +18,12 @@ from .observability import to_thread_timed
 
 _agents_http_trace: ContextVar[dict[str, Any] | None] = ContextVar(
     "agents_http_trace", default=None)
+
+_STREAM_MESSAGE_MISSING = object()
+
+
+class _AgentsStreamTerminalError(RuntimeError):
+    """A definitive terminal event, rather than an uncertain stream failure."""
 
 
 class ModelProvider(Protocol):
@@ -439,10 +446,13 @@ class OpenAIAgentsProvider:
         def flush_http_trace() -> None:
             from .observability import emit_timeline
             previous_finished = http_trace["lifecycle_started"]
-            for event in http_trace["events"]:
+            for event in sorted(
+                    http_trace["events"],
+                    key=lambda entry: entry["started_monotonic_seconds"]):
                 started = event["started_monotonic_seconds"]
+                operation = event.pop("timeline_operation", "openai.agents_http")
                 emit_timeline(
-                    "openai.agents_http", "finished",
+                    operation, "finished",
                     gap_since_previous_seconds=max(0.0, started - previous_finished),
                     lifecycle_offset_seconds=max(
                         0.0, started - http_trace["lifecycle_started"]),
@@ -476,10 +486,14 @@ class OpenAIAgentsProvider:
                 raise RuntimeError("Agents tool results require the requesting turn id")
             events = [self._tool_result_event(result, turn_id) for result in results]
             call_key = ":".join(sorted(result.call_id for result in results))
-            self._submit_events(session_id, events, f"resident-tool:{turn_id}:{call_key}"[:256])
-            self._submitted_call_ids.setdefault(turn_id, set()).update(
-                result.call_id for result in results)
-            turn = self._wait_for_turn(session_id, turn_id)
+            def submit_results() -> None:
+                self._submit_events(
+                    session_id, events, f"resident-tool:{turn_id}:{call_key}"[:256])
+                self._submitted_call_ids.setdefault(turn_id, set()).update(
+                    result.call_id for result in results)
+
+            turn = self._submit_and_stream(
+                session_id, submit_results, expected_turn_id=turn_id)
             if turn.tool_calls or turn_id not in self._pending_wakes:
                 return turn
             pending_context, wake_key, correlation = self._pending_wakes[turn_id]
@@ -534,13 +548,155 @@ class OpenAIAgentsProvider:
                 {"type": "input_text", "text": context}
             ]}],
         }
-        self._submit_events(session_id, [event], f"resident-wake:{wake_key}"[:256])
-        return self._wait_for_submitted_wake(session_id, correlation, wake_key)
+        return self._submit_and_stream(
+            session_id,
+            lambda: self._submit_events(
+                session_id, [event], f"resident-wake:{wake_key}"[:256]),
+            correlation=correlation, wake_key=wake_key)
 
     def _wait_for_submitted_wake(self, session_id: str, correlation: str,
                                  wake_key: str) -> ModelTurn:
+        # Session creation can accept its initial input before a stream can be
+        # opened. Reconcile exactly rather than assuming that a live stream can
+        # replay the already-created turn.
         turn_id = self._wait_for_correlated_turn(session_id, correlation, wake_key)
         return self._wait_for_turn(session_id, turn_id)
+
+    def _submit_and_stream(self, session_id: str, submit: Callable[[], None], *,
+                           expected_turn_id: str | None = None,
+                           correlation: str | None = None,
+                           wake_key: str | None = None) -> ModelTurn:
+        """Open a live stream before submission, falling back on uncertainty."""
+        if "_request" in self.__dict__ and "_open_event_stream" not in self.__dict__:
+            # Existing request-level test doubles model the reconciliation path.
+            submit()
+            return self._fallback_wait(
+                session_id, expected_turn_id, correlation, wake_key, "stream_unavailable")
+        submission_attempted = False
+        try:
+            with self._open_event_stream(session_id) as events:
+                submission_attempted = True
+                submit()
+                return self._consume_event_stream(
+                    session_id, events, expected_turn_id=expected_turn_id,
+                    correlation=correlation, wake_key=wake_key)
+        except _AgentsStreamTerminalError:
+            raise
+        except Exception as exc:
+            if submission_attempted:
+                return self._fallback_wait(
+                    session_id, expected_turn_id, correlation, wake_key,
+                    self._stream_fallback_reason(exc))
+            submit()
+            return self._fallback_wait(
+                session_id, expected_turn_id, correlation, wake_key,
+                "stream_connect_error")
+
+    def _fallback_wait(self, session_id: str, expected_turn_id: str | None,
+                       correlation: str | None, wake_key: str | None,
+                       reason: str) -> ModelTurn:
+        self._trace_instant("openai.agents_fallback", reason=reason)
+        if expected_turn_id:
+            return self._wait_for_turn(session_id, expected_turn_id)
+        if correlation is None or wake_key is None:
+            raise RuntimeError("Agents stream fallback lacks wake correlation")
+        return self._wait_for_submitted_wake(session_id, correlation, wake_key)
+
+    def _consume_event_stream(self, session_id: str, events: Iterator[dict], *,
+                              expected_turn_id: str | None,
+                              correlation: str | None,
+                              wake_key: str | None) -> ModelTurn:
+        turn_id = expected_turn_id
+        messages: dict[int, list[str]] = {}
+        saw_complete_message = False
+        for event in events:
+            if event.get("session_id", session_id) != session_id:
+                raise ValueError("Agents stream event belongs to another session")
+            event_type = event.get("type")
+            event_turn_id = event.get("turn_id")
+            if event_type == "agent.session.turn.item.added" and turn_id is None:
+                item = event.get("item")
+                if (isinstance(item, dict) and correlation is not None
+                        and wake_key is not None
+                        and self._item_matches_wake(item, correlation, wake_key)):
+                    candidate = event_turn_id or item.get("turn_id")
+                    if not candidate:
+                        raise ValueError("Correlated stream item has no turn id")
+                    turn_id = candidate
+                continue
+            if event_type == "agent.session.requires_action":
+                session = event.get("session")
+                if not isinstance(session, dict) or session.get("id") != session_id:
+                    raise ValueError("Malformed Agents required-action event")
+                action_turn_ids = {
+                    action.get("turn_id")
+                    for action in session.get("required_actions", [])
+                    if isinstance(action, dict) and action.get("type") == "function_call"
+                }
+                if action_turn_ids != {turn_id}:
+                    raise ValueError("Agents required actions belong to another turn")
+                turn = self._required_actions_turn(session)
+                if turn.tool_calls:
+                    return turn
+                continue
+            if event_type == "agent.session.turn.item.done" and event_turn_id == turn_id:
+                item = event.get("item")
+                output_index = event.get("output_index")
+                if (not isinstance(item, dict) or not isinstance(output_index, int)
+                        or item.get("turn_id", turn_id) != turn_id):
+                    raise ValueError("Malformed Agents completed-item event")
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    content = item.get("content")
+                    if not isinstance(content, list):
+                        raise ValueError("Malformed streamed assistant message")
+                    texts = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            raise ValueError("Malformed streamed assistant content")
+                        if part.get("type") == "output_text":
+                            text = part.get("text")
+                            if not isinstance(text, str):
+                                raise ValueError("Malformed streamed output text")
+                            if text:
+                                texts.append(text)
+                    messages[output_index] = texts
+                    saw_complete_message = True
+                continue
+            if event_type == "agent.session.turn.completed" and event_turn_id == turn_id:
+                turn = event.get("turn")
+                if not isinstance(turn, dict) or turn.get("id") != turn_id:
+                    raise ValueError("Malformed Agents completed-turn event")
+                if event.get("usage") is not None:
+                    turn = {**turn, "usage": event["usage"]}
+                message: object = _STREAM_MESSAGE_MISSING
+                if saw_complete_message:
+                    message = "\n".join(
+                        text for index in sorted(messages) for text in messages[index]) or None
+                return self._completed_turn(
+                    session_id, {}, turn, streamed_message=message)
+            if event_type in ("agent.session.turn.failed", "agent.session.turn.cancelled"):
+                if event_turn_id != turn_id:
+                    continue
+                turn = event.get("turn") if isinstance(event.get("turn"), dict) else {}
+                if event_type.endswith("failed"):
+                    raise _AgentsStreamTerminalError(
+                        f"OpenAI Agents turn failed: {turn.get('error') or 'no details'}")
+                raise _AgentsStreamTerminalError("OpenAI Agents turn was cancelled")
+            if event_type in ("agent.session.failed", "error"):
+                raise _AgentsStreamTerminalError(
+                    f"OpenAI Agents session failed: "
+                    f"{event.get('error') or event.get('session', {}).get('error') or 'no details'}")
+        raise EOFError("OpenAI Agents event stream ended before the turn settled")
+
+    @staticmethod
+    def _stream_fallback_reason(exc: Exception) -> str:
+        if isinstance(exc, (TimeoutError, urllib.error.URLError)):
+            return "stream_timeout_or_disconnect"
+        if isinstance(exc, (ValueError, json.JSONDecodeError)):
+            return "stream_malformed"
+        if isinstance(exc, EOFError):
+            return "stream_eof"
+        return "stream_error"
 
     def _reconcile_before_wake(self, session_id: str, session: dict) -> ModelTurn | None:
         """Finish remote work without attributing it to the next ordinary wake."""
@@ -1008,11 +1164,14 @@ class OpenAIAgentsProvider:
             time.sleep(self.poll_seconds)
         raise TimeoutError("Timed out waiting for the OpenAI Agents session")
 
-    def _completed_turn(self, session_id: str, session: dict, turn: dict) -> ModelTurn:
+    def _completed_turn(self, session_id: str, session: dict, turn: dict, *,
+                        streamed_message: object = _STREAM_MESSAGE_MISSING) -> ModelTurn:
         turn_id = turn.get("id")
         if not turn_id:
             raise RuntimeError("Completed Agents turn has no id")
-        message = self._turn_message(session_id, turn_id)
+        message = (self._turn_message(session_id, turn_id)
+                   if streamed_message is _STREAM_MESSAGE_MISSING
+                   else streamed_message)
         submitted = self._submitted_call_ids.pop(turn_id, set())
         for call_id in submitted:
             self._ephemeral_tool_results.pop(call_id, None)
@@ -1021,7 +1180,7 @@ class OpenAIAgentsProvider:
         self._last_turn_id = turn_id
         self._persist_binding(session_id, self.agent_id, turn_id)
         usage = turn.get("usage") or session.get("usage") or {}
-        return ModelTurn(turn_id, message=message,
+        return ModelTurn(turn_id, message=message if isinstance(message, str) else None,
                          input_tokens=usage.get("input_tokens"),
                          output_tokens=usage.get("output_tokens"))
 
@@ -1074,28 +1233,35 @@ class OpenAIAgentsProvider:
             page = self._request("GET", path)
             data = page.get("data") or []
             for item in data:
-                if item.get("type") != "message" or item.get("role") != "user":
-                    continue
-                for part in item.get("content") or []:
-                    if part.get("type") != "input_text" or not part.get("text"):
-                        continue
-                    text = part["text"]
-                    try:
-                        document = json.loads(text)
-                    except (TypeError, json.JSONDecodeError):
-                        document = None
-                    matches_marker = (
-                        isinstance(document, dict) and
-                        document.get("resident_wake_correlation") == correlation)
-                    if matches_marker or self._wake_idempotency_key(text) == wake_key:
-                        turn_id = item.get("turn_id")
-                        if turn_id:
-                            return turn_id
+                if self._item_matches_wake(item, correlation, wake_key):
+                    turn_id = item.get("turn_id")
+                    if turn_id:
+                        return turn_id
             if not page.get("has_more") or not data:
                 return None
             after = page.get("last_id") or data[-1].get("id")
             if not after:
                 raise RuntimeError("Agents item page has_more without a pagination cursor")
+
+    @classmethod
+    def _item_matches_wake(cls, item: dict, correlation: str, wake_key: str) -> bool:
+        if item.get("type") != "message" or item.get("role") != "user":
+            return False
+        for part in item.get("content") or []:
+            if not isinstance(part, dict) or part.get("type") != "input_text":
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            try:
+                document = json.loads(text)
+            except json.JSONDecodeError:
+                document = None
+            if ((isinstance(document, dict)
+                 and document.get("resident_wake_correlation") == correlation)
+                    or cls._wake_idempotency_key(text) == wake_key):
+                return True
+        return False
 
     def _turn_message(self, session_id: str, turn_id: str) -> str | None:
         # Session items are cursor-paginated. Read newest-first so a long-lived
@@ -1138,6 +1304,90 @@ class OpenAIAgentsProvider:
         self._request(
             "POST", f"/agents/sessions/{session_id}/events", {"events": events},
             allow_empty=True, extra_headers={"Idempotency-Key": idempotency_key})
+
+    @contextmanager
+    def _open_event_stream(self, session_id: str) -> Iterator[Iterator[dict]]:
+        """Open and parse the live session SSE stream without assuming replay."""
+        request = urllib.request.Request(
+            f"{self.base_url}/agents/sessions/{session_id}/events", method="GET",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Accept": "text/event-stream",
+                "OpenAI-Beta": "agents=v1",
+            })
+        started = time.monotonic()
+        outcome = "ok"
+        event_count = 0
+        response = None
+        try:
+            response = urllib.request.urlopen(request, timeout=self.timeout_seconds)
+
+            def events() -> Iterator[dict]:
+                nonlocal event_count
+                data_lines: list[str] = []
+                expires = started + self.timeout_seconds
+                for raw_line in response:
+                    if time.monotonic() >= expires:
+                        raise TimeoutError("Timed out waiting for the OpenAI Agents stream")
+                    line = raw_line.decode("utf-8").rstrip("\r\n")
+                    if line == "":
+                        if not data_lines:
+                            continue
+                        payload = "\n".join(data_lines)
+                        data_lines.clear()
+                        if payload == "[DONE]":
+                            return
+                        event = json.loads(payload)
+                        if not isinstance(event, dict):
+                            raise ValueError("Agents stream data is not an object")
+                        event_count += 1
+                        yield event
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip(" "))
+                    elif line.startswith(":") or line.startswith("event:") or line.startswith("id:"):
+                        continue
+                if data_lines:
+                    payload = "\n".join(data_lines)
+                    if payload != "[DONE]":
+                        event = json.loads(payload)
+                        if not isinstance(event, dict):
+                            raise ValueError("Agents stream data is not an object")
+                        event_count += 1
+                        yield event
+
+            yield events()
+        except urllib.error.HTTPError as exc:
+            outcome = "error"
+            detail = exc.read().decode(errors="replace")[:2000]
+            raise RuntimeError(
+                f"OpenAI Agents stream returned HTTP {exc.code}: {detail}") from exc
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            if response is not None:
+                response.close()
+            self._trace_span(
+                "openai.agents_stream", started, outcome,
+                event_count=event_count,
+                request_timeout_seconds=self.timeout_seconds)
+
+    def _trace_span(self, operation: str, started: float, outcome: str, **details: Any) -> None:
+        trace = _agents_http_trace.get()
+        if trace is not None:
+            finished = time.monotonic()
+            trace["events"].append({
+                "timeline_operation": operation,
+                "outcome": outcome,
+                "duration_seconds": finished - started,
+                "started_monotonic_seconds": started,
+                "finished_monotonic_seconds": finished,
+                **details,
+            })
+
+    def _trace_instant(self, operation: str, **details: Any) -> None:
+        now = time.monotonic()
+        self._trace_span(operation, now, "ok", **details)
 
     @staticmethod
     def _arguments(value: object) -> dict:

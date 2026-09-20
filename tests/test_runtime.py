@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -484,6 +485,54 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         serialized = json.dumps(events)
         self.assertNotIn("sensitive", serialized)
         self.assertNotIn("/agents/", serialized)
+
+    async def test_agents_sse_parser_and_timeline_are_payload_safe(self):
+        class FakeStreamResponse:
+            def __init__(self):
+                self.lines = iter([
+                    b"event: ignored-envelope-name\n",
+                    b'data: {"type":"agent.session.turn.in_progress",\n',
+                    b'data: "session_id":"session-1","turn_id":"turn-secret"}\n',
+                    b"\n",
+                ])
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self.lines)
+
+            def close(self):
+                self.closed = True
+
+        provider = OpenAIAgentsProvider("test-key", "model")
+        response = FakeStreamResponse()
+
+        def fake_lifecycle(*_):
+            with provider._open_event_stream("session-1") as stream:
+                observed = list(stream)
+            self.assertEqual("agent.session.turn.in_progress", observed[0]["type"])
+            return ModelTurn("turn", message="done")
+
+        provider._respond_sync = fake_lifecycle
+        events = []
+        token = timeline_reporter.set(events.append)
+        try:
+            with patch("resident.provider.urllib.request.urlopen",
+                       return_value=response) as urlopen:
+                await provider.respond("sensitive context", [], [])
+        finally:
+            timeline_reporter.reset(token)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual("text/event-stream", request.get_header("Accept"))
+        self.assertTrue(response.closed)
+        stream_events = [event for event in events
+                         if event["operation"] == "openai.agents_stream"]
+        self.assertEqual(1, len(stream_events))
+        self.assertEqual(1, stream_events[0]["event_count"])
+        self.assertNotIn("turn-secret", json.dumps(events))
 
     async def test_default_diagnostics_show_actionable_runtime_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3465,6 +3514,109 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             {"Idempotency-Key": "resident-tool:turn-1:call-1"},
             kwargs["extra_headers"])
         self.assertTrue(kwargs["allow_empty"])
+
+    def test_agents_stream_is_healthy_wait_path_and_persists_completion(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        saved = []
+        provider.bind_session_store(
+            lambda: None, lambda session_id, agent_id, turn_id:
+            saved.append((session_id, agent_id, turn_id)))
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        posts = []
+
+        def fake_request(method, path, body=None, **_):
+            self.assertEqual("POST", method)
+            posts.append((path, body))
+            return {}
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.turn.item.added", "session_id": "session-1",
+                "turn_id": "turn-1", "item": {
+                    "type": "message", "role": "user", "turn_id": "turn-1",
+                    "content": [{"type": "input_text", "text": context}],
+                },
+            }, {
+                "type": "agent.session.turn.item.done", "session_id": "session-1",
+                "turn_id": "turn-1", "output_index": 0, "item": {
+                    "type": "message", "role": "assistant", "turn_id": "turn-1",
+                    "content": [{"type": "output_text", "text": "streamed"}],
+                },
+            }, {
+                "type": "agent.session.turn.completed", "session_id": "session-1",
+                "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"},
+                "usage": {"input_tokens": 4, "output_tokens": 2},
+            }])
+
+        provider._request = fake_request
+        provider._open_event_stream = fake_stream
+        turn = provider._submit_wake("session-1", context, "wake-1", correlation)
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual("streamed", turn.message)
+        self.assertEqual(4, turn.input_tokens)
+        self.assertEqual([("session-1", None, "turn-1")], saved)
+        self.assertEqual(1, len(posts))
+
+    def test_agents_stream_returns_only_expected_turn_required_actions(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._request = lambda *_args, **_kwargs: {}
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.requires_action", "session": {
+                    "id": "session-1", "status": "requires_action",
+                    "required_actions": [{
+                        "type": "function_call", "turn_id": "turn-1",
+                        "call_id": "call-1", "name": "clock", "arguments": {},
+                    }],
+                },
+            }])
+
+        provider._open_event_stream = fake_stream
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, expected_turn_id="turn-1")
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual(("call-1",), tuple(call.id for call in turn.tool_calls))
+
+    def test_agents_stream_eof_falls_back_to_exact_reconciliation(self):
+        provider = OpenAIAgentsProvider(
+            "test-key", "gpt-5.6-luna", poll_seconds=0)
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        operations = []
+
+        def fake_request(method, path, body=None, **_):
+            operations.append((method, path))
+            if method == "POST":
+                return {}
+            if path == "/agents/sessions/session-1":
+                return {"id": "session-1", "status": "idle"}
+            if "/items?" in path:
+                return {"data": [{
+                    "type": "message", "role": "assistant", "turn_id": "turn-1",
+                    "content": [{"type": "output_text", "text": "reconciled"}],
+                }, {
+                    "type": "message", "role": "user", "turn_id": "turn-1",
+                    "content": [{"type": "input_text", "text": context}],
+                }]}
+            if path.endswith("/turns/turn-1"):
+                return {"id": "turn-1", "status": "completed"}
+            raise AssertionError((method, path, body))
+
+        @contextmanager
+        def empty_stream(_session_id):
+            yield iter(())
+
+        provider._request = fake_request
+        provider._open_event_stream = empty_stream
+        turn = provider._submit_wake("session-1", context, "wake-1", correlation)
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual("reconciled", turn.message)
+        self.assertIn(("GET", "/agents/sessions/session-1/turns/turn-1"), operations)
 
     async def test_recovered_requires_action_finishes_before_new_ordinary_wake(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
