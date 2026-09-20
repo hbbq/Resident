@@ -759,14 +759,54 @@ class OpenAIAgentsProvider:
                 if not event_turn_id or event_turn_id != turn_id:
                     continue
                 turn = event.get("turn") if isinstance(event.get("turn"), dict) else {}
+                if turn.get("id") not in (None, turn_id):
+                    continue
                 if event_type.endswith("failed"):
                     raise _AgentsStreamTerminalError(
                         f"OpenAI Agents turn failed: {turn.get('error') or 'no details'}")
                 raise _AgentsStreamTerminalError("OpenAI Agents turn was cancelled")
-            if event_type in ("agent.session.failed", "error"):
+            if event_type == "agent.session.failed":
+                session = (event.get("session")
+                           if isinstance(event.get("session"), dict) else {})
+                event_session_ids = [
+                    identity for identity in (event.get("session_id"), session.get("id"))
+                    if identity is not None
+                ]
+                if (not event_session_ids
+                        or any(identity != session_id for identity in event_session_ids)):
+                    continue
                 raise _AgentsStreamTerminalError(
                     f"OpenAI Agents session failed: "
-                    f"{event.get('error') or event.get('session', {}).get('error') or 'no details'}")
+                    f"{event.get('error') or session.get('error') or 'no details'}")
+            if event_type == "error":
+                session = (event.get("session")
+                           if isinstance(event.get("session"), dict) else {})
+                error_turn = (event.get("turn")
+                              if isinstance(event.get("turn"), dict) else {})
+                event_session_ids = [
+                    identity for identity in (event.get("session_id"), session.get("id"))
+                    if identity is not None
+                ]
+                event_turn_ids = [
+                    identity for identity in (event_turn_id, error_turn.get("id"))
+                    if identity is not None
+                ]
+                session_matches = (event_session_ids
+                                   and all(identity == session_id
+                                           for identity in event_session_ids))
+                turn_matches = (event_turn_ids and turn_id is not None
+                                and all(identity == turn_id
+                                        for identity in event_turn_ids))
+                if ((event_session_ids
+                     and not all(identity == session_id
+                                 for identity in event_session_ids))
+                        or (event_turn_ids and not turn_matches)
+                        or not (session_matches or turn_matches)):
+                    continue
+                error = (event.get("error") or session.get("error")
+                         or error_turn.get("error") or "no details")
+                raise _AgentsStreamTerminalError(
+                    f"OpenAI Agents stream failed: {error}")
         raise EOFError("OpenAI Agents event stream ended before the turn settled")
 
     @staticmethod
