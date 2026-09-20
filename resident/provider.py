@@ -607,6 +607,8 @@ class OpenAIAgentsProvider:
                               correlation: str | None,
                               wake_key: str | None) -> ModelTurn:
         turn_id = expected_turn_id
+        output_items: dict[int, tuple[object, object, object]] = {}
+        completed_output_indexes: set[int] = set()
         messages: dict[int, list[str]] = {}
         saw_complete_message = False
         for event in events:
@@ -614,15 +616,43 @@ class OpenAIAgentsProvider:
                 raise ValueError("Agents stream event belongs to another session")
             event_type = event.get("type")
             event_turn_id = event.get("turn_id")
-            if event_type == "agent.session.turn.item.added" and turn_id is None:
+            if event_type == "agent.session.turn.item.added":
                 item = event.get("item")
-                if (isinstance(item, dict) and correlation is not None
+                if not isinstance(item, dict):
+                    if turn_id is not None and event_turn_id == turn_id:
+                        raise ValueError("Malformed Agents added-item event")
+                    continue
+                item_turn_id = item.get("turn_id")
+                if (event_turn_id is not None and item_turn_id is not None
+                        and event_turn_id != item_turn_id):
+                    raise ValueError("Agents stream item has conflicting turn ids")
+                item_event_turn_id = (event_turn_id
+                                      if event_turn_id is not None else item_turn_id)
+                if (turn_id is None and correlation is not None
                         and wake_key is not None
                         and self._item_matches_wake(item, correlation, wake_key)):
-                    candidate = event_turn_id or item.get("turn_id")
-                    if not candidate:
+                    if not item_event_turn_id:
                         raise ValueError("Correlated stream item has no turn id")
-                    turn_id = candidate
+                    turn_id = item_event_turn_id
+                if item_event_turn_id != turn_id:
+                    continue
+                output_index = event.get("output_index")
+                if output_index is None:
+                    if item.get("role") == "assistant":
+                        raise ValueError("Streamed assistant item has no output index")
+                    continue
+                if (not isinstance(output_index, int) or isinstance(output_index, bool)
+                        or output_index < 0):
+                    raise ValueError("Malformed Agents added-item output index")
+                if output_index in output_items:
+                    raise ValueError("Duplicate Agents stream output index")
+                if output_index != len(output_items):
+                    raise ValueError("Agents stream output indexes are not contiguous")
+                item_id = item.get("id")
+                if not isinstance(item_id, str) or not item_id:
+                    raise ValueError("Streamed output item has no id")
+                output_items[output_index] = (
+                    item_id, item.get("type"), item.get("role"))
                 continue
             if event_type == "agent.session.requires_action":
                 session = event.get("session")
@@ -639,13 +669,33 @@ class OpenAIAgentsProvider:
                 if turn.tool_calls:
                     return turn
                 continue
-            if event_type == "agent.session.turn.item.done" and event_turn_id == turn_id:
+            if event_type == "agent.session.turn.item.done":
                 item = event.get("item")
+                if not isinstance(item, dict):
+                    if event_turn_id == turn_id:
+                        raise ValueError("Malformed Agents completed-item event")
+                    continue
+                item_turn_id = item.get("turn_id")
+                if (event_turn_id is not None and item_turn_id is not None
+                        and event_turn_id != item_turn_id):
+                    raise ValueError("Agents stream item has conflicting turn ids")
+                item_event_turn_id = (event_turn_id
+                                      if event_turn_id is not None else item_turn_id)
+                if item_event_turn_id != turn_id:
+                    continue
                 output_index = event.get("output_index")
-                if (not isinstance(item, dict) or not isinstance(output_index, int)
-                        or item.get("turn_id", turn_id) != turn_id):
+                if (not isinstance(output_index, int) or isinstance(output_index, bool)
+                        or output_index < 0):
                     raise ValueError("Malformed Agents completed-item event")
+                if output_index in completed_output_indexes:
+                    raise ValueError("Duplicate Agents stream output index")
+                metadata = (item.get("id"), item.get("type"), item.get("role"))
+                if output_items.get(output_index) != metadata:
+                    raise ValueError("Agents stream output item metadata changed")
+                completed_output_indexes.add(output_index)
                 if item.get("type") == "message" and item.get("role") == "assistant":
+                    if item.get("status") != "completed":
+                        raise ValueError("Streamed assistant message is incomplete")
                     content = item.get("content")
                     if not isinstance(content, list):
                         raise ValueError("Malformed streamed assistant message")
@@ -653,12 +703,13 @@ class OpenAIAgentsProvider:
                     for part in content:
                         if not isinstance(part, dict):
                             raise ValueError("Malformed streamed assistant content")
-                        if part.get("type") == "output_text":
-                            text = part.get("text")
-                            if not isinstance(text, str):
-                                raise ValueError("Malformed streamed output text")
-                            if text:
-                                texts.append(text)
+                        if part.get("type") != "output_text":
+                            raise ValueError("Malformed streamed assistant content")
+                        text = part.get("text")
+                        if not isinstance(text, str):
+                            raise ValueError("Malformed streamed output text")
+                        if text:
+                            texts.append(text)
                     messages[output_index] = texts
                     saw_complete_message = True
                 continue
@@ -669,7 +720,8 @@ class OpenAIAgentsProvider:
                 if event.get("usage") is not None:
                     turn = {**turn, "usage": event["usage"]}
                 message: object = _STREAM_MESSAGE_MISSING
-                if saw_complete_message:
+                if (saw_complete_message and output_items
+                        and completed_output_indexes == set(output_items)):
                     message = "\n".join(
                         text for index in sorted(messages) for text in messages[index]) or None
                 return self._completed_turn(

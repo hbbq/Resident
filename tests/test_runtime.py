@@ -3597,9 +3597,16 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "content": [{"type": "input_text", "text": context}],
                 },
             }, {
+                "type": "agent.session.turn.item.added", "session_id": "session-1",
+                "turn_id": "turn-1", "output_index": 0, "item": {
+                    "id": "output-1", "type": "message", "role": "assistant",
+                    "turn_id": "turn-1", "status": "in_progress", "content": [],
+                },
+            }, {
                 "type": "agent.session.turn.item.done", "session_id": "session-1",
                 "turn_id": "turn-1", "output_index": 0, "item": {
-                    "type": "message", "role": "assistant", "turn_id": "turn-1",
+                    "id": "output-1", "type": "message", "role": "assistant",
+                    "turn_id": "turn-1", "status": "completed",
                     "content": [{"type": "output_text", "text": "streamed"}],
                 },
             }, {
@@ -3617,6 +3624,177 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(4, turn.input_tokens)
         self.assertEqual([("session-1", None, "turn-1")], saved)
         self.assertEqual(1, len(posts))
+
+    def _agents_stream_completion(self, events):
+        provider = OpenAIAgentsProvider(
+            "test-key", "gpt-5.6-luna", poll_seconds=0)
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path))
+            if path == "/agents/sessions/session-1":
+                return {"id": "session-1", "status": "idle"}
+            if path.endswith("/turns/turn-1"):
+                return {"id": "turn-1", "status": "completed"}
+            if "/items?" in path:
+                return {"data": [{
+                    "id": "exact-output", "type": "message", "role": "assistant",
+                    "turn_id": "turn-1", "status": "completed",
+                    "content": [{"type": "output_text", "text": "reconciled"}],
+                }]}
+            raise AssertionError((method, path, body))
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(events)
+
+        provider._request = fake_request
+        provider._open_event_stream = fake_stream
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, expected_turn_id="turn-1")
+        return turn, requests
+
+    def test_agents_stream_missing_output_index_uses_exact_items(self):
+        events = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 1, "item": {
+                "id": "output-2", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        }]
+
+        turn, requests = self._agents_stream_completion(events)
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertIn(("GET", "/agents/sessions/session-1/items?order=desc&limit=100"),
+                      requests)
+
+    def test_agents_stream_duplicate_output_index_uses_exact_items(self):
+        events = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": item_id, "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        } for item_id in ("output-1", "output-conflict")]
+
+        turn, requests = self._agents_stream_completion(events)
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertIn(("GET", "/agents/sessions/session-1/items?order=desc&limit=100"),
+                      requests)
+
+    def test_agents_stream_incomplete_or_missing_assistant_uses_exact_items(self):
+        incomplete_assistant = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "incomplete",
+                "content": [{"type": "output_text", "text": "partial"}],
+            },
+        }]
+        missing_assistant = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "reasoning-1", "type": "reasoning", "turn_id": "turn-1",
+                "status": "in_progress", "summary": [],
+            },
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "reasoning-1", "type": "reasoning", "turn_id": "turn-1",
+                "status": "completed", "summary": [],
+            },
+        }]
+        completed = {
+            "type": "agent.session.turn.completed", "session_id": "session-1",
+            "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"},
+        }
+
+        for name, output_events in (
+                ("incomplete", incomplete_assistant),
+                ("missing", missing_assistant)):
+            with self.subTest(name=name):
+                turn, requests = self._agents_stream_completion(
+                    [*output_events, completed])
+                self.assertEqual("reconciled", turn.message)
+                self.assertIn(
+                    ("GET", "/agents/sessions/session-1/items?order=desc&limit=100"),
+                    requests)
+
+    def test_agents_wake_stream_accepts_one_absent_turn_id(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        events = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "item": {
+                "id": "input-1", "type": "message", "role": "user",
+                "turn_id": "turn-1", "status": "completed",
+                "content": [{"type": "input_text", "text": context}],
+            },
+        }, {
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "completed",
+                "content": [{"type": "output_text", "text": "streamed"}],
+            },
+        }, {
+            "type": "agent.session.turn.completed", "session_id": "session-1",
+            "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"},
+        }]
+
+        turn = provider._consume_event_stream(
+            "session-1", iter(events), expected_turn_id=None,
+            correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual("streamed", turn.message)
+
+    def test_agents_wake_stream_conflicting_turn_ids_uses_exact_reconciliation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.turn.item.added", "session_id": "session-1",
+                "turn_id": "turn-event", "item": {
+                    "id": "input-1", "type": "message", "role": "user",
+                    "turn_id": "turn-item", "status": "completed",
+                    "content": [{"type": "input_text", "text": context}],
+                },
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, fallback_correlation,
+                          wake_key, reason):
+            fallbacks.append((session_id, expected_turn_id, fallback_correlation,
+                              wake_key, reason))
+            return ModelTurn("turn-exact", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("turn-exact", turn.response_id)
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", None, correlation, "wake-1", "stream_malformed")],
+            fallbacks)
 
     def test_agents_stream_returns_only_expected_turn_required_actions(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
