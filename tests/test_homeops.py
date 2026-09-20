@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from resident.__main__ import TerminalDiagnostics
 from resident.config import Config
 from resident.homeops import HomeOpsConnector
+from resident.observability import timeline_reporter
 from resident.runtime import ResidentRuntime
 from resident.readiness import ReadinessItem, ReadinessResult
 
@@ -38,6 +39,23 @@ class FakeHomeOpsConnector(HomeOpsConnector):
 
 
 class HomeOpsConnectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_timeline_separates_executor_queue_and_worker_time(self):
+        connector = HomeOpsConnector("http://homeops.example")
+        events = []
+        token = timeline_reporter.set(events.append)
+        try:
+            with patch.object(connector, "_get_json", return_value=[]):
+                self.assertEqual({"measurements": []},
+                                 await connector.get_current_measurements({}))
+        finally:
+            timeline_reporter.reset(token)
+
+        finished = next(event for event in events if event["moment"] == "finished")
+        self.assertEqual("homeops.request", finished["operation"])
+        self.assertEqual("latest_measurements", finished["request"])
+        self.assertGreaterEqual(finished["executor_queue_seconds"], 0)
+        self.assertGreaterEqual(finished["worker_seconds"], 0)
+
     async def test_first_poll_is_silent_and_timestamp_only_update_is_suppressed(self):
         connector = FakeHomeOpsConnector([
             [measurement("1", 20.0, "2026-09-15T08:00:00Z")],

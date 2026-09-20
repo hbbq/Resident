@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 
 from .capabilities import Capability
 from .config import DisplayConfig
+from .observability import to_thread_timed
 
 
 class DisplayConnector:
@@ -58,5 +59,7 @@ class DisplayConnector:
                 f"HomeOps display {display_id!r} returned HTTP status {status}; expected 204")
 
     async def show_text(self, display_id: str, text: str) -> dict[str, Any]:
-        await asyncio.to_thread(self._post_text, display_id, text)
+        await to_thread_timed(
+            "homeops.display_request", self._post_text, display_id, text,
+            display_id=display_id, request_timeout_seconds=self.request_timeout_seconds)
         return {"display_id": display_id, "status": "queued"}

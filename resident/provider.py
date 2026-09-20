@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import Future
@@ -11,6 +12,11 @@ from typing import Any, Callable, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
 from .memory import SessionHistoryUnavailable, SessionItemPage
+from .observability import to_thread_timed
+
+
+_agents_http_trace: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "agents_http_trace", default=None)
 
 
 class ModelProvider(Protocol):
@@ -64,7 +70,7 @@ class OpenAIResponsesProvider:
             "store": False,
             "include": ["reasoning.encrypted_content"],
         }
-        raw = await asyncio.to_thread(self._post, body)
+        raw = await to_thread_timed("openai.responses_request", self._post, body)
         status = raw.get("status")
         if status not in (None, "completed"):
             error = raw.get("error") or raw.get("incomplete_details") or "no details"
@@ -426,10 +432,19 @@ class OpenAIAgentsProvider:
             return completed.result()
 
         lifecycle_token = self._lifecycle_writer.set(lifecycle_on_event_loop)
+        http_trace: list[dict[str, Any]] = []
+        trace_token = _agents_http_trace.set(http_trace)
         try:
-            return await asyncio.to_thread(
-                self._respond_sync, context, tools, results, previous_response_id)
+            return await to_thread_timed(
+                "openai.agents_lifecycle", self._respond_sync,
+                context, tools, results, previous_response_id,
+                request=("tool_results" if results else "wake"),
+                tool_result_count=len(results), turn_id=previous_response_id)
         finally:
+            from .observability import emit_timeline
+            for event in http_trace:
+                emit_timeline("openai.agents_http", "finished", **event)
+            _agents_http_trace.reset(trace_token)
             self._lifecycle_writer.reset(lifecycle_token)
             self._binding_writer.reset(token)
 
@@ -1190,6 +1205,8 @@ class OpenAIAgentsProvider:
         request = urllib.request.Request(
             f"{self.base_url}{path}", data=data, method=method,
             headers=headers)
+        started = time.monotonic()
+        outcome = "ok"
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 payload = response.read()
@@ -1197,5 +1214,25 @@ class OpenAIAgentsProvider:
                     return {}
                 return json.loads(payload)
         except urllib.error.HTTPError as exc:
+            outcome = "error"
             detail = exc.read().decode(errors="replace")[:2000]
             raise RuntimeError(f"OpenAI Agents API returned HTTP {exc.code}: {detail}") from exc
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            trace = _agents_http_trace.get()
+            if trace is not None:
+                if "/events" in path:
+                    operation = "session_events"
+                elif "/turns" in path and "/items" in path:
+                    operation = "turn_items"
+                elif "/turns" in path:
+                    operation = "turns"
+                else:
+                    operation = "session"
+                trace.append({
+                    "request": f"{method.lower()}_{operation}", "outcome": outcome,
+                    "duration_seconds": time.monotonic() - started,
+                    "request_timeout_seconds": self.timeout_seconds,
+                })

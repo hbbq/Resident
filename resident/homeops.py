@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from .capabilities import Capability
 from .domain import WakeEvent
 from .readiness import ReadinessItem, ReadinessResult
+from .observability import to_thread_timed
 from .store import utc_now
 
 
@@ -69,7 +70,11 @@ class HomeOpsConnector:
             return json.load(response)
 
     async def _request(self, path: str, query: dict[str, Any] | None = None) -> Any:
-        return await asyncio.to_thread(self._get_json, path, query)
+        operation = ("latest_measurements" if path == "/api/measurements/latest"
+                     else "measurement_history")
+        return await to_thread_timed(
+            "homeops.request", self._get_json, path, query,
+            request=operation, request_timeout_seconds=self.request_timeout_seconds)
 
     @staticmethod
     def _measurement_list(payload: Any) -> list[dict[str, Any]]:

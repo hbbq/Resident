@@ -352,6 +352,31 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(line.startswith("wake.finished ") for line in diagnostics))
             runtime.close()
 
+    async def test_timeline_is_opt_in_and_omits_tool_arguments_and_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), timeline=True),
+                SingleToolProvider("clock", {"timezone": "sensitive-argument"}),
+                owner_output=lambda _: None, diagnostic_output=lambda _: None,
+            )
+
+            await runtime.process(WakeEvent(
+                "event", "test", "timeline", utc_now(), {}))
+
+            rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' ORDER BY sequence"
+            ).fetchall()
+            events = [json.loads(row[0]) for row in rows]
+            operations = {event["operation"] for event in events}
+            self.assertIn("wake.process", operations)
+            self.assertIn("provider.turn", operations)
+            self.assertIn("tool.execute", operations)
+            serialized = json.dumps(events)
+            self.assertNotIn("sensitive-argument", serialized)
+            runtime.close()
+            self.assertTrue(all("arguments" not in event and "result" not in event
+                                for event in events))
+
     async def test_default_diagnostics_show_actionable_runtime_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             diagnostics: list[str] = []

@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
+from .observability import emit_timeline
 from .store import Store
 
 
@@ -301,6 +303,9 @@ class MemoryCurator:
             seen_pages: set[tuple[str, tuple[str, ...] | str]] = set()
             more_pages = False
             while pages < self.max_batches:
+                batch_started = time.monotonic()
+                emit_timeline("curator.batch", "started", phase="final" if final else "incremental",
+                              round=pages + 1)
                 page = await self.source.session_items(cursor, self.batch_size)
                 more_pages = page.has_more
                 safe_items = tuple(item for raw in page.items
@@ -352,6 +357,9 @@ class MemoryCurator:
                     self.store.fail_curator_job(job_id, type(exc).__name__)
                     raise
                 cursor = next_cursor
+                emit_timeline(
+                    "curator.batch", "finished", phase="final" if final else "incremental",
+                    round=pages, outcome="ok", duration_seconds=time.monotonic() - batch_started)
                 if not page.has_more:
                     break
             if final and more_pages:
