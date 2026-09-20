@@ -7,6 +7,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -484,6 +486,113 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         serialized = json.dumps(events)
         self.assertNotIn("sensitive", serialized)
         self.assertNotIn("/agents/", serialized)
+
+    async def test_agents_sse_parser_and_timeline_are_payload_safe(self):
+        class FakeSocket:
+            def settimeout(self, _timeout):
+                pass
+
+        class FakeStreamResponse:
+            def __init__(self):
+                self.lines = iter([
+                    b"event: ignored-envelope-name\n",
+                    b'data: {"type":"agent.session.turn.in_progress",\n',
+                    b'data: "session_id":"session-1","turn_id":"turn-secret"}\n',
+                    b"\n",
+                ])
+                self.closed = False
+                self.fp = type("File", (), {
+                    "raw": type("Raw", (), {"_sock": FakeSocket()})()
+                })()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self.lines)
+
+            def close(self):
+                self.closed = True
+
+        provider = OpenAIAgentsProvider("test-key", "model")
+        response = FakeStreamResponse()
+
+        def fake_lifecycle(*_):
+            with provider._open_event_stream("session-1") as stream:
+                observed = list(stream)
+            self.assertEqual("agent.session.turn.in_progress", observed[0]["type"])
+            return ModelTurn("turn", message="done")
+
+        provider._respond_sync = fake_lifecycle
+        events = []
+        token = timeline_reporter.set(events.append)
+        try:
+            with patch("resident.provider.urllib.request.urlopen",
+                       return_value=response) as urlopen:
+                await provider.respond("sensitive context", [], [])
+        finally:
+            timeline_reporter.reset(token)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual("text/event-stream", request.get_header("Accept"))
+        self.assertTrue(response.closed)
+        stream_events = [event for event in events
+                         if event["operation"] == "openai.agents_stream"]
+        self.assertEqual(1, len(stream_events))
+        self.assertEqual(1, stream_events[0]["event_count"])
+        self.assertNotIn("turn-secret", json.dumps(events))
+
+    def test_agents_sse_stall_near_deadline_uses_only_remaining_timeout(self):
+        clock = [100.0]
+
+        class FakeSocket:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, timeout):
+                self.timeouts.append(timeout)
+
+        class FakeStreamResponse:
+            def __init__(self):
+                self.socket = FakeSocket()
+                self.fp = type("File", (), {
+                    "raw": type("Raw", (), {"_sock": self.socket})()
+                })()
+                self.reads = 0
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.reads += 1
+                if self.reads == 1:
+                    clock[0] = 100.9
+                    return b": keepalive\n"
+                raise TimeoutError("simulated stalled read")
+
+            def close(self):
+                self.closed = True
+
+        provider = OpenAIAgentsProvider(
+            "test-key", "model", timeout_seconds=1.0)
+        response = FakeStreamResponse()
+
+        def open_near_deadline(*_args, **_kwargs):
+            clock[0] = 100.4
+            return response
+
+        with patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("resident.provider.urllib.request.urlopen",
+                      side_effect=open_near_deadline):
+            with self.assertRaisesRegex(TimeoutError, "simulated stalled read"):
+                with provider._open_event_stream("session-1") as stream:
+                    list(stream)
+
+        self.assertEqual(2, response.reads)
+        self.assertAlmostEqual(0.6, response.socket.timeouts[0])
+        self.assertAlmostEqual(0.1, response.socket.timeouts[1])
+        self.assertTrue(response.closed)
 
     async def test_default_diagnostics_show_actionable_runtime_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3465,6 +3574,603 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             {"Idempotency-Key": "resident-tool:turn-1:call-1"},
             kwargs["extra_headers"])
         self.assertTrue(kwargs["allow_empty"])
+
+    def test_agents_stream_is_healthy_wait_path_and_persists_completion(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        saved = []
+        provider.bind_session_store(
+            lambda: None, lambda session_id, agent_id, turn_id:
+            saved.append((session_id, agent_id, turn_id)))
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        posts = []
+
+        def fake_request(method, path, body=None, **_):
+            self.assertEqual("POST", method)
+            posts.append((path, body))
+            return {}
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.turn.item.added", "session_id": "session-1",
+                "turn_id": "turn-1", "item": {
+                    "type": "message", "role": "user", "turn_id": "turn-1",
+                    "content": [{"type": "input_text", "text": context}],
+                },
+            }, {
+                "type": "agent.session.turn.item.added", "session_id": "session-1",
+                "turn_id": "turn-1", "output_index": 0, "item": {
+                    "id": "output-1", "type": "message", "role": "assistant",
+                    "turn_id": "turn-1", "status": "in_progress", "content": [],
+                },
+            }, {
+                "type": "agent.session.turn.item.done", "session_id": "session-1",
+                "turn_id": "turn-1", "output_index": 0, "item": {
+                    "id": "output-1", "type": "message", "role": "assistant",
+                    "turn_id": "turn-1", "status": "completed",
+                    "content": [{"type": "output_text", "text": "streamed"}],
+                },
+            }, {
+                "type": "agent.session.turn.completed", "session_id": "session-1",
+                "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"},
+                "usage": {"input_tokens": 4, "output_tokens": 2},
+            }])
+
+        provider._request = fake_request
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = lambda *_args, **_kwargs: self.fail(
+            "successful streaming must not reconcile")
+        turn = provider._submit_wake("session-1", context, "wake-1", correlation)
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual("streamed", turn.message)
+        self.assertEqual(4, turn.input_tokens)
+        self.assertEqual([("session-1", None, "turn-1")], saved)
+        self.assertEqual(1, len(posts))
+
+    def test_agents_definitive_wake_rejection_propagates_without_reconciliation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(())
+
+        rejection = urllib.error.HTTPError(
+            "https://example.invalid/events", 400, "rejected", {}, None)
+
+        def reject_submission(*_args, **_kwargs):
+            raise RuntimeError("OpenAI Agents API returned HTTP 400: rejected") from rejection
+
+        provider._open_event_stream = fake_stream
+        provider._request = reject_submission
+        provider._fallback_wait = lambda *_args, **_kwargs: self.fail(
+            "definitive rejection must not reconcile")
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+            provider._submit_wake(
+                "session-1", context, "wake-1", correlation)
+
+    def test_agents_definitive_tool_result_rejection_does_not_rediscover_action(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._ensure_session = lambda *_args, **_kwargs: (
+            {"id": "session-1", "status": "requires_action"}, False)
+        requests = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(())
+
+        rejection = urllib.error.HTTPError(
+            "https://example.invalid/events", 422, "invalid result", {}, None)
+
+        def fake_request(method, path, body=None, **_kwargs):
+            requests.append((method, path, body))
+            if method == "POST" and path.endswith("/events"):
+                raise RuntimeError(
+                    "OpenAI Agents API returned HTTP 422: invalid result") from rejection
+            raise AssertionError("definitive rejection must not rediscover the pending action")
+
+        provider._open_event_stream = fake_stream
+        provider._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 422"):
+            provider._respond_sync(
+                "wake", [], [ToolResult("call-1", {"ok": True})], "turn-1")
+
+        self.assertEqual(1, len(requests))
+        self.assertEqual("POST", requests[0][0])
+        self.assertEqual({}, provider._submitted_call_ids)
+
+    def test_agents_uncertain_submission_failure_enters_exact_reconciliation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(())
+
+        def uncertain_submission():
+            raise urllib.error.URLError("connection reset after send")
+
+        def fake_fallback(session_id, expected_turn_id, correlation, wake_key, reason):
+            fallbacks.append(
+                (session_id, expected_turn_id, correlation, wake_key, reason))
+            return ModelTurn("turn-1", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+
+        turn = provider._submit_and_stream(
+            "session-1", uncertain_submission, expected_turn_id="turn-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", "turn-1", None, None,
+              "stream_timeout_or_disconnect")], fallbacks)
+
+    def _agents_stream_completion(self, events):
+        provider = OpenAIAgentsProvider(
+            "test-key", "gpt-5.6-luna", poll_seconds=0)
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path))
+            if path == "/agents/sessions/session-1":
+                return {"id": "session-1", "status": "idle"}
+            if path.endswith("/turns/turn-1"):
+                return {"id": "turn-1", "status": "completed"}
+            if "/items?" in path:
+                return {"data": [{
+                    "id": "exact-output", "type": "message", "role": "assistant",
+                    "turn_id": "turn-1", "status": "completed",
+                    "content": [{"type": "output_text", "text": "reconciled"}],
+                }]}
+            raise AssertionError((method, path, body))
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(events)
+
+        provider._request = fake_request
+        provider._open_event_stream = fake_stream
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, expected_turn_id="turn-1")
+        return turn, requests
+
+    def test_agents_stream_missing_output_index_uses_exact_items(self):
+        events = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 1, "item": {
+                "id": "output-2", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        }]
+
+        turn, requests = self._agents_stream_completion(events)
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertIn(("GET", "/agents/sessions/session-1/items?order=desc&limit=100"),
+                      requests)
+
+    def test_agents_stream_duplicate_output_index_uses_exact_items(self):
+        events = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": item_id, "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        } for item_id in ("output-1", "output-conflict")]
+
+        turn, requests = self._agents_stream_completion(events)
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertIn(("GET", "/agents/sessions/session-1/items?order=desc&limit=100"),
+                      requests)
+
+    def test_agents_stream_incomplete_or_missing_assistant_uses_exact_items(self):
+        incomplete_assistant = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "incomplete",
+                "content": [{"type": "output_text", "text": "partial"}],
+            },
+        }]
+        missing_assistant = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "reasoning-1", "type": "reasoning", "turn_id": "turn-1",
+                "status": "in_progress", "summary": [],
+            },
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "reasoning-1", "type": "reasoning", "turn_id": "turn-1",
+                "status": "completed", "summary": [],
+            },
+        }]
+        completed = {
+            "type": "agent.session.turn.completed", "session_id": "session-1",
+            "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"},
+        }
+
+        for name, output_events in (
+                ("incomplete", incomplete_assistant),
+                ("missing", missing_assistant)):
+            with self.subTest(name=name):
+                turn, requests = self._agents_stream_completion(
+                    [*output_events, completed])
+                self.assertEqual("reconciled", turn.message)
+                self.assertIn(
+                    ("GET", "/agents/sessions/session-1/items?order=desc&limit=100"),
+                    requests)
+
+    def test_agents_wake_stream_accepts_one_absent_turn_id(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        events = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "item": {
+                "id": "input-1", "type": "message", "role": "user",
+                "turn_id": "turn-1", "status": "completed",
+                "content": [{"type": "input_text", "text": context}],
+            },
+        }, {
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "in_progress", "content": [],
+            },
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "completed",
+                "content": [{"type": "output_text", "text": "streamed"}],
+            },
+        }, {
+            "type": "agent.session.turn.completed", "session_id": "session-1",
+            "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"},
+        }]
+
+        turn = provider._consume_event_stream(
+            "session-1", iter(events), expected_turn_id=None,
+            correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual("streamed", turn.message)
+
+    def test_agents_wake_stream_conflicting_turn_ids_uses_exact_reconciliation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.turn.item.added", "session_id": "session-1",
+                "turn_id": "turn-event", "item": {
+                    "id": "input-1", "type": "message", "role": "user",
+                    "turn_id": "turn-item", "status": "completed",
+                    "content": [{"type": "input_text", "text": context}],
+                },
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, fallback_correlation,
+                          wake_key, reason):
+            fallbacks.append((session_id, expected_turn_id, fallback_correlation,
+                              wake_key, reason))
+            return ModelTurn("turn-exact", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("turn-exact", turn.response_id)
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", None, correlation, "wake-1", "stream_malformed")],
+            fallbacks)
+
+    def test_agents_stream_correlated_wake_terminal_event_is_definitive(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        provider._fallback_wait = lambda *_args, **_kwargs: self.fail(
+            "correlated terminal event must not reconcile")
+
+        for event_type, message in (
+                ("agent.session.turn.failed", "turn failed"),
+                ("agent.session.turn.cancelled", "turn was cancelled")):
+            with self.subTest(event_type=event_type):
+                @contextmanager
+                def fake_stream(_session_id):
+                    yield iter([{
+                        "type": "agent.session.turn.item.added",
+                        "session_id": "session-1", "turn_id": "turn-1",
+                        "item": {
+                            "id": "input-1", "type": "message", "role": "user",
+                            "turn_id": "turn-1", "status": "completed",
+                            "content": [{"type": "input_text", "text": context}],
+                        },
+                    }, {
+                        "type": event_type, "session_id": "session-1",
+                        "turn_id": "turn-1", "turn": {
+                            "id": "turn-1", "status": event_type.rsplit(".", 1)[-1],
+                            "error": "test failure",
+                        },
+                    }])
+
+                provider._open_event_stream = fake_stream
+                with self.assertRaisesRegex(RuntimeError, message):
+                    provider._submit_and_stream(
+                        "session-1", lambda: None, correlation=correlation,
+                        wake_key="wake-1")
+
+    def test_agents_stream_uncorrelated_terminal_event_uses_exact_reconciliation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        _, correlation = provider._correlated_context("wake", "wake-1")
+
+        for name, event_turn_id in (("missing", None), ("unrelated", "turn-other")):
+            with self.subTest(name=name):
+                fallbacks = []
+
+                @contextmanager
+                def fake_stream(_session_id):
+                    event = {
+                        "type": "agent.session.turn.failed",
+                        "session_id": "session-1", "turn": {
+                            "status": "failed", "error": "not our failure",
+                        },
+                    }
+                    if event_turn_id is not None:
+                        event["turn_id"] = event_turn_id
+                    yield iter([event])
+
+                def fake_fallback(session_id, expected_turn_id,
+                                  fallback_correlation, wake_key, reason):
+                    fallbacks.append((session_id, expected_turn_id,
+                                      fallback_correlation, wake_key, reason))
+                    return ModelTurn("turn-exact", message="reconciled")
+
+                provider._open_event_stream = fake_stream
+                provider._fallback_wait = fake_fallback
+                turn = provider._submit_and_stream(
+                    "session-1", lambda: None, correlation=correlation,
+                    wake_key="wake-1")
+
+                self.assertEqual("reconciled", turn.message)
+                self.assertEqual(
+                    [("session-1", None, correlation, "wake-1", "stream_eof")],
+                    fallbacks)
+
+    def test_agents_stream_identityless_error_reconciles_submitted_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        _, correlation = provider._correlated_context("wake", "wake-1")
+        submissions = []
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{"type": "error", "error": "stream failed"}])
+
+        def fake_fallback(session_id, expected_turn_id, fallback_correlation,
+                          wake_key, reason):
+            fallbacks.append((session_id, expected_turn_id, fallback_correlation,
+                              wake_key, reason))
+            return ModelTurn("turn-exact", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: submissions.append("submitted"),
+            correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(["submitted"], submissions)
+        self.assertEqual(
+            [("session-1", None, correlation, "wake-1", "stream_error")],
+            fallbacks)
+
+    def test_agents_stream_matching_session_error_reconciles_submitted_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        _, correlation = provider._correlated_context("wake", "wake-1")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "error", "session_id": "session-1",
+                "error": "stream failed",
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, fallback_correlation,
+                          wake_key, reason):
+            fallbacks.append((session_id, expected_turn_id, fallback_correlation,
+                              wake_key, reason))
+            return ModelTurn("turn-exact", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", None, correlation, "wake-1", "stream_error")],
+            fallbacks)
+
+    def test_agents_stream_matching_turn_error_reconciles_continuation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "error", "turn_id": "turn-1", "error": "stream failed",
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, correlation, wake_key,
+                          reason):
+            fallbacks.append(
+                (session_id, expected_turn_id, correlation, wake_key, reason))
+            return ModelTurn("turn-1", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, expected_turn_id="turn-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", "turn-1", None, None, "stream_error")], fallbacks)
+
+    def test_agents_stream_mismatched_error_cannot_terminate_wake(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.turn.item.added",
+                "session_id": "session-1", "turn_id": "turn-1", "item": {
+                    "id": "input-1", "type": "message", "role": "user",
+                    "turn_id": "turn-1", "status": "completed",
+                    "content": [{"type": "input_text", "text": context}],
+                },
+            }, {
+                "type": "error", "session_id": "session-1",
+                "turn_id": "turn-other", "error": "not our failure",
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, fallback_correlation,
+                          wake_key, reason):
+            fallbacks.append((session_id, expected_turn_id, fallback_correlation,
+                              wake_key, reason))
+            return ModelTurn("turn-1", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, correlation=correlation, wake_key="wake-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", None, correlation, "wake-1", "stream_error")],
+            fallbacks)
+
+    def test_agents_stream_mismatched_error_cannot_terminate_continuation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "error", "session_id": "session-1",
+                "turn_id": "turn-other", "error": "not our failure",
+            }])
+
+        def fake_fallback(session_id, expected_turn_id, correlation, wake_key,
+                          reason):
+            fallbacks.append(
+                (session_id, expected_turn_id, correlation, wake_key, reason))
+            return ModelTurn("turn-1", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, expected_turn_id="turn-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", "turn-1", None, None, "stream_error")], fallbacks)
+
+    def test_agents_stream_expected_continuation_terminal_event_is_definitive(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.turn.failed", "session_id": "session-1",
+                "turn_id": "turn-1", "turn": {
+                    "id": "turn-1", "status": "failed", "error": "tool failed",
+                },
+            }])
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = lambda *_args, **_kwargs: self.fail(
+            "expected-turn terminal event must not reconcile")
+
+        with self.assertRaisesRegex(RuntimeError, "tool failed"):
+            provider._submit_and_stream(
+                "session-1", lambda: None, expected_turn_id="turn-1")
+
+    def test_agents_stream_returns_only_expected_turn_required_actions(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._request = lambda *_args, **_kwargs: {}
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter([{
+                "type": "agent.session.requires_action", "session": {
+                    "id": "session-1", "status": "requires_action",
+                    "required_actions": [{
+                        "type": "function_call", "turn_id": "turn-1",
+                        "call_id": "call-1", "name": "clock", "arguments": {},
+                    }],
+                },
+            }])
+
+        provider._open_event_stream = fake_stream
+        turn = provider._submit_and_stream(
+            "session-1", lambda: None, expected_turn_id="turn-1")
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual(("call-1",), tuple(call.id for call in turn.tool_calls))
+
+    def test_agents_stream_eof_falls_back_to_exact_reconciliation(self):
+        provider = OpenAIAgentsProvider(
+            "test-key", "gpt-5.6-luna", poll_seconds=0)
+        context, correlation = provider._correlated_context("wake", "wake-1")
+        operations = []
+
+        def fake_request(method, path, body=None, **_):
+            operations.append((method, path))
+            if method == "POST":
+                return {}
+            if path == "/agents/sessions/session-1":
+                return {"id": "session-1", "status": "idle"}
+            if "/items?" in path:
+                return {"data": [{
+                    "type": "message", "role": "assistant", "turn_id": "turn-1",
+                    "content": [{"type": "output_text", "text": "reconciled"}],
+                }, {
+                    "type": "message", "role": "user", "turn_id": "turn-1",
+                    "content": [{"type": "input_text", "text": context}],
+                }]}
+            if path.endswith("/turns/turn-1"):
+                return {"id": "turn-1", "status": "completed"}
+            raise AssertionError((method, path, body))
+
+        @contextmanager
+        def empty_stream(_session_id):
+            yield iter(())
+
+        provider._request = fake_request
+        provider._open_event_stream = empty_stream
+        turn = provider._submit_wake("session-1", context, "wake-1", correlation)
+
+        self.assertEqual("turn-1", turn.response_id)
+        self.assertEqual("reconciled", turn.message)
+        self.assertIn(("GET", "/agents/sessions/session-1/turns/turn-1"), operations)
 
     async def test_recovered_requires_action_finishes_before_new_ordinary_wake(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna", poll_seconds=0)
