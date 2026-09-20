@@ -15,7 +15,7 @@ from .memory import SessionHistoryUnavailable, SessionItemPage
 from .observability import to_thread_timed
 
 
-_agents_http_trace: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+_agents_http_trace: ContextVar[dict[str, Any] | None] = ContextVar(
     "agents_http_trace", default=None)
 
 
@@ -432,18 +432,31 @@ class OpenAIAgentsProvider:
             return completed.result()
 
         lifecycle_token = self._lifecycle_writer.set(lifecycle_on_event_loop)
-        http_trace: list[dict[str, Any]] = []
+        http_trace: dict[str, Any] = {
+            "lifecycle_started": time.monotonic(), "events": []}
         trace_token = _agents_http_trace.set(http_trace)
+
+        def flush_http_trace() -> None:
+            from .observability import emit_timeline
+            previous_finished = http_trace["lifecycle_started"]
+            for event in http_trace["events"]:
+                started = event["started_monotonic_seconds"]
+                emit_timeline(
+                    "openai.agents_http", "finished",
+                    gap_since_previous_seconds=max(0.0, started - previous_finished),
+                    lifecycle_offset_seconds=max(
+                        0.0, started - http_trace["lifecycle_started"]),
+                    **event)
+                previous_finished = event["finished_monotonic_seconds"]
+
         try:
             return await to_thread_timed(
                 "openai.agents_lifecycle", self._respond_sync,
                 context, tools, results, previous_response_id,
+                timeline_before_finished=flush_http_trace,
                 request=("tool_results" if results else "wake"),
                 tool_result_count=len(results), turn_id=previous_response_id)
         finally:
-            from .observability import emit_timeline
-            for event in http_trace:
-                emit_timeline("openai.agents_http", "finished", **event)
             _agents_http_trace.reset(trace_token)
             self._lifecycle_writer.reset(lifecycle_token)
             self._binding_writer.reset(token)
@@ -1223,16 +1236,38 @@ class OpenAIAgentsProvider:
         finally:
             trace = _agents_http_trace.get()
             if trace is not None:
-                if "/events" in path:
-                    operation = "session_events"
-                elif "/turns" in path and "/items" in path:
-                    operation = "turn_items"
-                elif "/turns" in path:
-                    operation = "turns"
-                else:
-                    operation = "session"
-                trace.append({
-                    "request": f"{method.lower()}_{operation}", "outcome": outcome,
-                    "duration_seconds": time.monotonic() - started,
+                finished = time.monotonic()
+                trace["events"].append({
+                    "request": self._request_operation(method, path, body),
+                    "outcome": outcome,
+                    "duration_seconds": finished - started,
+                    "started_monotonic_seconds": started,
+                    "finished_monotonic_seconds": finished,
                     "request_timeout_seconds": self.timeout_seconds,
                 })
+
+    @staticmethod
+    def _request_operation(method: str, path: str, body: dict | None) -> str:
+        """Classify an Agents request without retaining its URL or content."""
+        resource = path.split("?", 1)[0].rstrip("/")
+        if method == "POST" and resource == "/agents/sessions":
+            return "create_session"
+        if resource.endswith("/events"):
+            event_types = {
+                event.get("type") for event in (body or {}).get("events", [])
+                if isinstance(event, dict)
+            }
+            if event_types and event_types <= {"agent.session.input.tool_result"}:
+                return "submit_tool_results"
+            return "submit_wake"
+        if "/items" in resource:
+            return "retrieve_items"
+        if "/turns/" in resource:
+            return "poll_turn"
+        if resource.endswith("/turns"):
+            return "reconcile_turns"
+        if method == "GET":
+            return "poll_session"
+        if method == "PATCH":
+            return "update_session"
+        return "session_request"

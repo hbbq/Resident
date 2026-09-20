@@ -9,7 +9,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 from .capabilities import Capability
 from .domain import WakeEvent
 from .mailbox import DEFAULT_TTL_SECONDS, Mailbox
-from .observability import timeline_reporter
+from .observability import ObservedQueue, timeline_reporter
 from .readiness import ReadinessItem, ReadinessResult
 from .runtime import EventProducer, ResidentRuntime
 from .store import utc_now
@@ -79,7 +79,11 @@ class RuntimeHost:
         self.default_id = default_id
         self.diagnostic_output = diagnostic_output or (lambda message: None)
         self.queues: dict[str, asyncio.Queue[WakeEvent | None]] = {
-            instance_id: asyncio.Queue() for instance_id in runtimes
+            instance_id: ObservedQueue(
+                lambda item, depth, runtime=runtimes[instance_id]:
+                runtime.observe_enqueue(item, depth)
+                if item is not None else None)
+            for instance_id in runtimes
         }
         self._stopping = False
 
@@ -92,8 +96,6 @@ class RuntimeHost:
         for instance_id, policy in self.policies.items():
             if policy.receives(event):
                 await self.queues[instance_id].put(event)
-                self.runtimes[instance_id].observe_enqueue(
-                    event, self.queues[instance_id].qsize())
                 delivered.append(instance_id)
         return tuple(delivered)
 
@@ -109,8 +111,6 @@ class RuntimeHost:
                 )
                 if self.policies[recipient].receives(event):
                     await self.queues[recipient].put(event)
-                    self.runtimes[recipient].observe_enqueue(
-                        event, self.queues[recipient].qsize())
                     delivered += int(self.mailbox.delivered(message["id"]))
             # Unknown/offline logical addresses remain pending until TTL expiry.
         return delivered
@@ -221,20 +221,23 @@ class RuntimeHost:
             "All systems GO" if all(result.ok for _, result in results)
             else "Startup completed with connector errors.")
 
+    async def _probe_event_loop_lag(self, stop: asyncio.Event,
+                                    interval: float = 0.5) -> None:
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + interval
+        while not stop.is_set():
+            await asyncio.sleep(max(0.0, expected - loop.time()))
+            now = loop.time()
+            lag = max(0.0, now - expected)
+            for runtime in self.runtimes.values():
+                runtime.observe_event_loop_lag(lag)
+            # Probe bookkeeping and observation are deliberately outside the next
+            # interval, so the probe never attributes its own work to loop lag.
+            expected = loop.time() + interval
+
     async def run(self, *, interactive: bool = True) -> None:
         stop = asyncio.Event()
         shared_queue: asyncio.Queue[WakeEvent] = asyncio.Queue()
-
-        async def loop_lag_probe() -> None:
-            interval = 0.5
-            expected = asyncio.get_running_loop().time() + interval
-            while not stop.is_set():
-                await asyncio.sleep(interval)
-                now = asyncio.get_running_loop().time()
-                lag = max(0.0, now - expected)
-                for runtime in self.runtimes.values():
-                    runtime.observe_event_loop_lag(lag)
-                expected = now + interval
 
         async def router() -> None:
             while not stop.is_set():
@@ -253,7 +256,6 @@ class RuntimeHost:
                 if text.strip():
                     event = runtime.owner_message_event(text)
                     await self.queues[self.default_id].put(event)
-                    runtime.observe_enqueue(event, self.queues[self.default_id].qsize())
 
         workers: list[asyncio.Task[None]] = []
         tasks: list[asyncio.Task[None]] = []
@@ -265,7 +267,7 @@ class RuntimeHost:
                            for item in self.runtimes)
             tasks.extend((asyncio.create_task(router()),
                           asyncio.create_task(self._mailbox_loop(stop)),
-                          asyncio.create_task(loop_lag_probe())))
+                          asyncio.create_task(self._probe_event_loop_lag(stop))))
             if interactive:
                 tasks.append(asyncio.create_task(terminal()))
             self.diagnostic_output(

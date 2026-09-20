@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import tempfile
@@ -206,6 +207,95 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("event", (await self.host.queues["b"].get()).id)
         ignored = WakeEvent("ignored", "camera", "changed", utc_now(), {})
         self.assertEqual((), await self.host.route(ignored))
+
+    async def test_instance_producer_queue_boundary_records_queue_wait(self):
+        class DirectProducer:
+            def __init__(self):
+                self.produced = asyncio.Event()
+
+            async def run(self, queue, stop):
+                await queue.put(WakeEvent(
+                    "direct-event", "telegram", "message", utc_now(), {}))
+                self.produced.set()
+                await stop.wait()
+
+        root = Path(self.temporary.name)
+        runtime = ResidentRuntime(
+            Config(root / "direct", instance_id="direct", timeline=True),
+            IdleProvider(), capabilities=[], owner_output=lambda _: None,
+            diagnostic_output=lambda _: None)
+        mailbox = Mailbox(root / "direct-mailbox.sqlite3")
+        producer = DirectProducer()
+        host = RuntimeHost(
+            {"direct": runtime}, {"direct": InstancePolicy(frozenset({"*"}))},
+            mailbox, default_id="direct", instance_producers={"direct": (producer,)})
+        stop = asyncio.Event()
+        tasks = []
+        try:
+            tasks, _ = await host._collect_startup_readiness(asyncio.Queue(), stop)
+            await producer.produced.wait()
+            event = await host.queues["direct"].get()
+            runtime.observe_dequeue(event, host.queues["direct"].qsize())
+            await runtime.process(event)
+
+            rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' "
+                "ORDER BY sequence").fetchall()
+            events = [json.loads(row[0]) for row in rows]
+            enqueue = next(item for item in events
+                           if item["operation"] == "host.enqueue")
+            dequeue = next(item for item in events
+                           if item["operation"] == "host.dequeue")
+            self.assertEqual("direct-event", enqueue["event_id"])
+            self.assertIsNotNone(dequeue["queue_wait_seconds"])
+            self.assertGreaterEqual(dequeue["queue_wait_seconds"], 0.0)
+        finally:
+            stop.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            host.close()
+
+    async def test_event_loop_lag_is_idle_silent_and_aggregated_per_wake(self):
+        class WaitingProvider:
+            async def respond(self, context, tools, results, continuation_id=None):
+                await asyncio.sleep(0.02)
+                return ModelTurn("turn", None, ())
+
+        root = Path(self.temporary.name)
+        runtime = ResidentRuntime(
+            Config(root / "lag", instance_id="lag", timeline=True),
+            WaitingProvider(), capabilities=[], owner_output=lambda _: None,
+            diagnostic_output=lambda _: None)
+        mailbox = Mailbox(root / "lag-mailbox.sqlite3")
+        host = RuntimeHost(
+            {"lag": runtime}, {"lag": InstancePolicy(frozenset({"*"}))},
+            mailbox, default_id="lag")
+        stop = asyncio.Event()
+        probe = asyncio.create_task(host._probe_event_loop_lag(stop, interval=0.001))
+        try:
+            await asyncio.sleep(0.005)
+            idle_count = runtime.store.connection.execute(
+                "SELECT count(*) FROM journal WHERE event_type='timeline'"
+            ).fetchone()[0]
+            self.assertEqual(0, idle_count)
+
+            await runtime.process(WakeEvent(
+                "lag-event", "test", "lag", utc_now(), {}))
+            lag_rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline'"
+            ).fetchall()
+            lag_events = [event for row in lag_rows
+                          if (event := json.loads(row[0])).get("operation")
+                          == "event_loop.lag"]
+            self.assertEqual(1, len(lag_events))
+            self.assertEqual("summary", lag_events[0]["moment"])
+            self.assertGreater(lag_events[0]["sample_count"], 0)
+            self.assertGreaterEqual(lag_events[0]["max_event_loop_lag_seconds"], 0.0)
+        finally:
+            stop.set()
+            await probe
+            host.close()
 
     async def test_durable_message_handoff_and_reply_are_independent(self):
         send_a = messaging_capability(self.mailbox, "a", lambda: self.host.recipients)

@@ -15,7 +15,7 @@ from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider, RemoteSessionUnavailable
 from .memory import MemoryCurator, SessionHistoryUnavailable
-from .observability import emit_timeline, timeline_reporter
+from .observability import ObservedQueue, emit_timeline, timeline_reporter
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
@@ -143,6 +143,8 @@ class ResidentRuntime:
         self._enqueue_times: dict[str, float] = {}
         self._dequeue_observations: dict[str, tuple[float | None, int]] = {}
         self._active_max_loop_lag = 0.0
+        self._active_total_loop_lag = 0.0
+        self._active_loop_lag_samples = 0
 
     def bind_curator(self, curator: MemoryCurator) -> None:
         self.curator = curator
@@ -196,7 +198,6 @@ class ResidentRuntime:
         self._capabilities = replacement
         if event is not None and self._event_queue is not None:
             self._event_queue.put_nowait(event)
-            self.observe_enqueue(event, self._event_queue.qsize())
         return event
 
     def register_capabilities(self, capabilities: Sequence[Capability]) -> WakeEvent | None:
@@ -221,10 +222,8 @@ class ResidentRuntime:
             event = self._owner_message_wake(
                 message["id"], message["content"], message["created_at"])
             await queue.put(event)
-            self.observe_enqueue(event, queue.qsize())
         if self._pending_capability_event is not None:
             await queue.put(self._pending_capability_event)
-            self.observe_enqueue(self._pending_capability_event, queue.qsize())
             self._pending_capability_event = None
 
     def close(self) -> None:
@@ -271,13 +270,10 @@ class ResidentRuntime:
                 self._enqueue_times.pop(event.id, None), queue_depth)
 
     def observe_event_loop_lag(self, lag_seconds: float) -> None:
-        if self.config.timeline:
-            if self._active_run_id is not None:
-                self._active_max_loop_lag = max(self._active_max_loop_lag, lag_seconds)
-            self.store.journal("timeline", {
-                "operation": "event_loop.lag", "moment": "sample",
-                "lag_seconds": lag_seconds,
-            }, self._active_run_id)
+        if self.config.timeline and self._active_run_id is not None:
+            self._active_max_loop_lag = max(self._active_max_loop_lag, lag_seconds)
+            self._active_total_loop_lag += lag_seconds
+            self._active_loop_lag_samples += 1
 
     def observe_external_timeline(self, data: dict) -> None:
         if not self.config.timeline:
@@ -375,6 +371,9 @@ class ResidentRuntime:
         started = time.monotonic()
         run_id = self.store.start_run(event)
         self._active_run_id, self._active_event = run_id, event
+        self._active_max_loop_lag = 0.0
+        self._active_total_loop_lag = 0.0
+        self._active_loop_lag_samples = 0
         calls = 0
         status = "failed"
         continuation_id: str | None = None
@@ -680,12 +679,21 @@ class ResidentRuntime:
             self.store.finish_run(
                 run_id, status, duration, calls, schedule_id, owner_message_id)
             emit_timeline(
+                "event_loop.lag", "summary",
+                sample_count=self._active_loop_lag_samples,
+                max_event_loop_lag_seconds=self._active_max_loop_lag,
+                average_event_loop_lag_seconds=(
+                    self._active_total_loop_lag / self._active_loop_lag_samples
+                    if self._active_loop_lag_samples else 0.0))
+            emit_timeline(
                 "wake.process", "finished", outcome=status,
                 duration_seconds=time.monotonic() - started,
                 max_event_loop_lag_seconds=self._active_max_loop_lag)
             self._owner_event_authorizations.pop(event.id, None)
             self._active_run_id, self._active_event = None, None
             self._active_max_loop_lag = 0.0
+            self._active_total_loop_lag = 0.0
+            self._active_loop_lag_samples = 0
             if timeline_token is not None:
                 timeline_reporter.reset(timeline_token)
 
@@ -696,7 +704,6 @@ class ResidentRuntime:
                 {"schedule_id": scheduled["id"], "scheduled_for": scheduled["due_at"],
                  "context": scheduled["context"]})
             await queue.put(event)
-            self.observe_enqueue(event, queue.qsize())
 
     async def scheduler_loop(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -759,7 +766,9 @@ class ResidentRuntime:
             else "Startup completed with connector errors.")
 
     async def run_interactive(self) -> None:
-        queue: asyncio.Queue[WakeEvent | None] = asyncio.Queue()
+        queue: asyncio.Queue[WakeEvent | None] = ObservedQueue(
+            lambda item, depth: self.observe_enqueue(item, depth)
+            if item is not None else None)
         self._event_queue = queue
         await self.enqueue_startup_wakeups(queue)
         stop = asyncio.Event()
@@ -782,7 +791,6 @@ class ResidentRuntime:
                 if text.strip():
                     event = self.owner_message_event(text)
                     await queue.put(event)
-                    self.observe_enqueue(event, queue.qsize())
 
         terminal = asyncio.create_task(terminal_input())
         self.diagnostic_output(

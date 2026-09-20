@@ -79,7 +79,7 @@ The runtime persists a safe public snapshot of available capabilities. The first
 
 ### Latency timeline diagnostics
 
-Pass `--timeline` or set `RESIDENT_TIMELINE=true` to record opt-in structured `timeline` journal events. The timeline separates host queue wait, wake processing, provider preflight and rounds, local tool execution, HomeOps/display requests, Agents/Responses default-executor queue and worker time, Curator batches and tail, and sampled event-loop lag. Payloads contain safe identifiers, operation classes, durations, counts, configured timeouts, and outcomes; they exclude prompts, tool arguments or results, credentials, headers, request URLs, and attachment contents. `--verbose` also renders the records. Instrumentation does not change per-Resident serialization or Curator placement.
+Pass `--timeline` or set `RESIDENT_TIMELINE=true` to record opt-in structured `timeline` journal events. The timeline separates host queue wait, wake processing, provider preflight and rounds, local tool execution, HomeOps/display requests, Agents/Responses default-executor queue and worker time, Curator batches and tail, and event-loop lag aggregated per active wake. Agents HTTP operations retain monotonic span placement and inter-request gaps inside their lifecycle, including submission, polling/reconciliation, and item retrieval. Payloads contain safe identifiers, operation classes, timings, counts, configured timeouts, and outcomes; they exclude prompts, tool arguments or results, credentials, headers, request URLs, and attachment contents. `--verbose` also renders the records. Instrumentation does not change per-Resident serialization or Curator placement.
 
 ## Experimental HomeOps connector
 
