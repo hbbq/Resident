@@ -55,11 +55,8 @@ def _create_request_configuration(request: dict[str, Any]) -> tuple[dict, dict]:
         "environment": request.get("environment"),
         "security_policy_revision": 1,
     }
-    mutable = {
-        "model": agent.get("model"),
-        "reasoning": agent.get("reasoning"),
-        "service_tier": agent.get("service_tier"),
-    }
+    mutable = {key: agent[key] for key in ("model", "reasoning", "service_tier")
+               if key in agent}
     return protocol, mutable
 
 

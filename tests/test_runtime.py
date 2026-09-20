@@ -1403,7 +1403,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("GET", "/agents/sessions/session-1", None)], requests)
         self.assertIsNotNone(provider._tool_fingerprint)
 
-    def test_agents_mutable_settings_can_be_cleared(self):
+    def test_agents_unmanaged_mutable_defaults_do_not_trigger_patch(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
         provider._session_id = "session-1"
         remote_agent = provider._agent_config([])
@@ -1425,8 +1425,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(created)
         self.assertEqual("session-1", session["id"])
-        self.assertEqual({"agent": {"reasoning": None, "service_tier": None}},
-                         requests[-1][2])
+        self.assertEqual([("GET", "/agents/sessions/session-1", None)], requests)
 
     def test_agents_mutable_settings_cover_all_transitions(self):
         cases = (
@@ -1435,11 +1434,17 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             ("set to different", {"reasoning": {"effort": "low"},
                                   "service_tier": "default"}, "high", "priority",
              {"reasoning": {"effort": "high"}, "service_tier": "priority"}),
-            ("set to unset", {"reasoning": {"effort": "high"},
-                              "service_tier": "priority"}, None, None,
-             {"reasoning": None, "service_tier": None}),
+            ("server defaults unmanaged", {"reasoning": {"effort": "high"},
+                                           "service_tier": "priority"},
+             None, None, {}),
             ("unchanged", {"reasoning": {"effort": "high"},
                            "service_tier": "priority"}, "high", "priority", {}),
+            ("reasoning managed alone", {"reasoning": {"effort": "low"},
+                                         "service_tier": "priority"},
+             "high", None, {"reasoning": {"effort": "high"}}),
+            ("service tier managed alone", {"reasoning": {"effort": "low"},
+                                            "service_tier": "default"},
+             None, "priority", {"service_tier": "priority"}),
             ("unset unchanged", {}, None, None, {}),
         )
         for name, remote_settings, reasoning, service_tier, expected in cases:
@@ -1449,6 +1454,44 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                     service_tier=service_tier)
                 remote = {"model": "gpt-5.6-luna", **remote_settings}
                 self.assertEqual(expected, provider._mutable_patch(remote))
+
+    def test_agents_unmanaged_mutable_settings_are_absent_from_create_payload(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path, body))
+            return {"id": "session-1", "status": "idle"}
+
+        provider._request = fake_request
+        provider._ensure_session([], initial_input="wake")
+
+        agent = requests[0][2]["agent"]
+        self.assertNotIn("reasoning", agent)
+        self.assertNotIn("service_tier", agent)
+        self.assertEqual({"model": "gpt-5.6-luna"},
+                         provider._desired_mutable_settings())
+
+    def test_agents_patch_contains_only_configured_mutable_setting(self):
+        provider = OpenAIAgentsProvider(
+            "test-key", "gpt-5.6-luna", reasoning_effort="high")
+        provider._session_id = "session-1"
+        remote_agent = provider._agent_config([])
+        remote_agent.update(
+            reasoning={"effort": "low"}, service_tier="priority")
+        requests = []
+
+        def fake_request(method, path, body=None, **_):
+            requests.append((method, path, body))
+            if method == "GET":
+                return {"id": "session-1", "status": "idle", "agent": remote_agent}
+            return {"id": "session-1", "status": "idle"}
+
+        provider._request = fake_request
+        provider._ensure_session([], initial_input="wake")
+
+        self.assertEqual(
+            {"agent": {"reasoning": {"effort": "high"}}}, requests[-1][2])
 
     def test_agents_missing_mutable_settings_are_patched_without_rollover(self):
         provider = OpenAIAgentsProvider(
@@ -1634,27 +1677,26 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             runtime.close()
 
             reopened = Store(path)
-            clearing = OpenAIAgentsProvider("test-key", "model-new")
-            clear_requests = []
+            unmanaged = OpenAIAgentsProvider("test-key", "model-new")
+            unmanaged_requests = []
 
-            def clear_request(method, path, body=None, **_):
-                clear_requests.append((method, path, body))
+            def unmanaged_request(method, path, body=None, **_):
+                unmanaged_requests.append((method, path, body))
                 if method == "GET":
                     return {"id": "session-1", "status": "idle", "agent": {}}
                 if method == "POST" and path == "/agents/sessions/session-1":
                     return {"id": "session-1", "status": "idle"}
                 raise AssertionError((method, path, body))
 
-            clearing._request = clear_request
+            unmanaged._request = unmanaged_request
             restarted = ResidentRuntime(
-                Config(Path(temporary)), clearing, store=reopened, capabilities=[],
+                Config(Path(temporary)), unmanaged, store=reopened, capabilities=[],
                 owner_output=lambda _: None, diagnostic_output=lambda _: None)
-            clearing._ensure_session([], initial_input="wake")
-            self.assertEqual({"agent": {
-                "reasoning": None, "service_tier": None,
-            }}, clear_requests[-1][2])
+            unmanaged._ensure_session([], initial_input="wake")
+            self.assertEqual(["GET"], [request[0] for request in unmanaged_requests])
             self.assertEqual({
-                "model": "model-new", "reasoning": None, "service_tier": None,
+                "model": "model-new", "reasoning": {"effort": "high"},
+                "service_tier": "priority",
             }, reopened.session_mutable_settings("openai_agents", "session-1"))
             restarted.close()
 

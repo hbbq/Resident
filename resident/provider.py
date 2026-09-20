@@ -885,36 +885,36 @@ class OpenAIAgentsProvider:
                 "description": tool.description, "parameters": tool.input_schema,
             } for tool in tools],
         }
-        if self.reasoning_effort:
+        if self.reasoning_effort is not None:
             agent["reasoning"] = {"effort": self.reasoning_effort}
-        if self.service_tier:
+        if self.service_tier is not None:
             agent["service_tier"] = self.service_tier
         return agent
 
     def _desired_mutable_settings(self) -> dict[str, Any]:
-        return {
-            "model": self.model,
-            "reasoning": ({"effort": self.reasoning_effort}
-                          if self.reasoning_effort is not None else None),
-            "service_tier": self.service_tier,
-        }
+        settings: dict[str, Any] = {"model": self.model}
+        if self.reasoning_effort is not None:
+            settings["reasoning"] = {"effort": self.reasoning_effort}
+        if self.service_tier is not None:
+            settings["service_tier"] = self.service_tier
+        return settings
 
     def _mutable_patch(self, remote_agent: object) -> dict[str, Any]:
         remote = remote_agent if isinstance(remote_agent, dict) else {}
         desired = self._desired_mutable_settings()
         applied = self._mutable_settings_descriptor or {}
         patch: dict[str, Any] = {}
-        for key in ("model", "reasoning", "service_tier"):
+        for key, desired_value in desired.items():
             if key in remote:
                 known, current = True, remote.get(key)
             elif key in applied:
                 known, current = True, applied.get(key)
             else:
                 known, current = False, None
-            if (known and current != desired[key]) or (
-                    not known and desired[key] is not None
+            if (known and current != desired_value) or (
+                    not known and desired_value is not None
                     and (key != "model" or self._lifecycle_bound)):
-                patch[key] = desired[key]
+                patch[key] = desired_value
         return patch
 
     @staticmethod
