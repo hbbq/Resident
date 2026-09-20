@@ -141,6 +141,15 @@ def build_host(config: Config) -> RuntimeHost:
     recipients = lambda: recipient_addresses
     try:
         for definition in catalog.residents:
+            curator = definition.curator
+            curator_model = curator.model if curator else None
+            curator_api_key = (
+                resolve_environment(curator.api_key_env)
+                if curator and curator_model else None)
+            curator_base_url = (
+                (resolve_environment(curator.base_url_env, required=False)
+                 or "https://api.openai.com/v1").rstrip("/")
+                if curator else "https://api.openai.com/v1")
             instance_config = replace(
                 config, data_dir=config.data_dir / "instances" / definition.id,
                 instance_id=definition.id, resident_name=definition.name,
@@ -150,13 +159,11 @@ def build_host(config: Config) -> RuntimeHost:
                 provider=definition.agent.provider, model=definition.agent.model,
                 reasoning_effort=definition.agent.reasoning_effort,
                 service_tier=definition.agent.service_tier,
-                # Curator policy is process-level configuration shared by each
-                # isolated Resident; keep that inheritance explicit here.
-                curator_model=config.curator_model,
-                curator_api_key=config.curator_api_key,
-                curator_base_url=config.curator_base_url,
-                curator_batch_size=config.curator_batch_size,
-                curator_max_batches=config.curator_max_batches,
+                curator_model=curator_model,
+                curator_api_key=curator_api_key,
+                curator_base_url=curator_base_url,
+                curator_batch_size=curator.batch_size if curator else 50,
+                curator_max_batches=curator.max_batches if curator else 4,
                 # The command-line request intentionally targets every enabled
                 # Resident constructed for this catalog startup, exactly once.
                 new_chapter=config.new_chapter,

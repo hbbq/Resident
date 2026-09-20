@@ -26,6 +26,23 @@ class IdleProvider:
 
 
 class InstanceDefinitionTests(unittest.TestCase):
+    def test_legacy_curator_environment_and_cli_configuration_is_preserved(self):
+        with patch.dict(os.environ, {
+                "RESIDENT_CURATOR_API_KEY": "legacy-key",
+                "RESIDENT_CURATOR_BASE_URL": "https://legacy.example/v1/",
+        }, clear=True):
+            config = Config.from_env_and_args([
+                "--curator-model", "legacy-curator",
+                "--curator-batch-size", "17",
+                "--curator-max-batches", "3",
+            ])
+
+        self.assertEqual("legacy-curator", config.curator_model)
+        self.assertEqual("legacy-key", config.curator_api_key)
+        self.assertEqual("https://legacy.example/v1", config.curator_base_url)
+        self.assertEqual(17, config.curator_batch_size)
+        self.assertEqual(3, config.curator_max_batches)
+
     def test_declarative_reasoning_effort_matches_cli_values(self):
         with tempfile.TemporaryDirectory() as temporary:
             definitions = Path(temporary) / "residents"
@@ -71,32 +88,44 @@ class InstanceDefinitionTests(unittest.TestCase):
                     build_host(Config(root / "data", residents_dir=definitions))
                 provider.assert_not_called()
 
-    def test_catalog_runtimes_inherit_curator_and_explicit_new_chapter(self):
+    def test_catalog_runtimes_use_per_resident_curator_and_explicit_new_chapter(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             definitions = root / "residents"
             definitions.mkdir()
-            for resident_id in ("resident", "helper"):
-                (definitions / f"{resident_id}.yaml").write_text(
-                    f"id: {resident_id}\nname: {resident_id.title()}\n"
-                    "personality: Test.\nrole: Test.\n", encoding="utf-8")
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "curator:\n  model: resident-curator\n  api_key_env: CURATOR_KEY\n"
+                "  base_url_env: CURATOR_URL\n  batch_size: 17\n  max_batches: 3\n",
+                encoding="utf-8")
+            (definitions / "helper.yaml").write_text(
+                "id: helper\nname: Helper\npersonality: Test.\nrole: Test.\n",
+                encoding="utf-8")
             config = Config(
                 root / "data", residents_dir=definitions, new_chapter=True,
-                curator_model="curator-model", curator_api_key="curator-key",
+                curator_model="legacy-curator", curator_api_key="legacy-key",
                 curator_base_url="https://curator.example/v1",
                 curator_batch_size=17, curator_max_batches=3)
 
-            with patch.dict(os.environ, {"OPENAI_API_KEY": "resident-key"}):
+            with patch.dict(os.environ, {
+                    "OPENAI_API_KEY": "resident-key", "CURATOR_KEY": "curator-key",
+                    "CURATOR_URL": "https://per-resident.example/v1/"}):
                 host = build_host(config)
             try:
                 self.assertEqual({"resident", "helper"}, set(host.runtimes))
+                resident = host.runtimes["resident"]
+                self.assertEqual("resident-curator", resident.config.curator_model)
+                self.assertEqual("curator-key", resident.config.curator_api_key)
+                self.assertEqual(
+                    "https://per-resident.example/v1", resident.config.curator_base_url)
+                self.assertEqual(17, resident.curator.batch_size)
+                self.assertEqual(3, resident.curator.max_batches)
+                self.assertEqual("resident-curator", resident.curator.model.model)
+                helper = host.runtimes["helper"]
+                self.assertIsNone(helper.config.curator_model)
+                self.assertIsNone(helper.config.curator_api_key)
+                self.assertIsNone(helper.curator)
                 for runtime in host.runtimes.values():
-                    self.assertEqual("curator-model", runtime.config.curator_model)
-                    self.assertEqual("curator-key", runtime.config.curator_api_key)
-                    self.assertEqual("https://curator.example/v1", runtime.config.curator_base_url)
-                    self.assertEqual(17, runtime.curator.batch_size)
-                    self.assertEqual(3, runtime.curator.max_batches)
-                    self.assertEqual("curator-model", runtime.curator.model.model)
                     self.assertEqual(
                         "explicit_new_chapter",
                         runtime.provider._requested_rollover_reason)
@@ -140,18 +169,56 @@ subscriptions: [homeops]
             with self.assertRaisesRegex(ValueError, "prompt root"):
                 load_resident_catalog(root / "residents")
 
-    def test_rejects_removed_memory_and_curator_policy_fields(self):
+    def test_rejects_removed_memory_policy_field(self):
         with tempfile.TemporaryDirectory() as temporary:
             definitions = Path(temporary) / "residents"
             definitions.mkdir()
             definition = definitions / "resident.yaml"
-            for removed_field in ("memory", "curator"):
-                with self.subTest(field=removed_field):
-                    definition.write_text(
-                        "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
-                        f"{removed_field}: {{}}\n", encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, "Unknown fields"):
+            definition.write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "memory: {}\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unknown fields"):
+                load_resident_catalog(definitions)
+
+    def test_validates_declarative_curator_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            definitions = Path(temporary) / "residents"
+            definitions.mkdir()
+            definition = definitions / "resident.yaml"
+            base = "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\ncurator:\n"
+            cases = (
+                ("  api_key: inline\n", "Inline secret"),
+                ("  api_key_env: not-an-env\n", "must name an environment variable"),
+                ("  batch_size: 0\n", "must be a positive integer"),
+                ("  batch_size: 101\n", "must be at most 100"),
+                ("  max_batches: false\n", "must be a positive integer"),
+                ("  surprise: true\n", "Unknown curator fields"),
+            )
+            for body, message in cases:
+                with self.subTest(body=body):
+                    definition.write_text(base + body, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
                         load_resident_catalog(definitions)
+
+    def test_curator_without_model_is_disabled_and_does_not_resolve_secret(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "curator:\n  api_key_env: MISSING_CURATOR_KEY\n",
+                encoding="utf-8")
+
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "resident-key"}, clear=True):
+                host = build_host(Config(root / "data", residents_dir=definitions))
+            try:
+                runtime = host.runtimes["resident"]
+                self.assertIsNone(runtime.config.curator_model)
+                self.assertIsNone(runtime.config.curator_api_key)
+                self.assertIsNone(runtime.curator)
+            finally:
+                host.close()
 
     def test_rejects_unknown_and_malformed_subscriptions(self):
         with tempfile.TemporaryDirectory() as temporary:

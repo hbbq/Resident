@@ -27,11 +27,14 @@ agent:
   provider: openai-agents
   model: gpt-5.6-luna
   api_key_env: OPENAI_API_KEY
+curator:
+  model: gpt-5.6-luna
+  api_key_env: OPENAI_API_KEY
 capabilities: [messaging]
 subscriptions: []
 ```
 
-Definitions accept inline `personality`/`role` or `personality_prompt`/`role_prompt`, Agent settings, capability grants, event subscriptions, an optional Telegram Owner transport, and optional body metadata. YAML aliases, unknown fields, prompt path traversal, and inline secret-shaped fields are rejected. Secrets are named with `*_env` references and resolved only while constructing local resources. A Telegram transport uses `token_env`, `owner_user_id_env`, and `owner_chat_id_env`; one resolved bot token may serve exactly one Resident. Unsuffixed terminal input targets `--default-resident` (`resident` by default), and configuration changes require restart.
+Definitions accept inline `personality`/`role` or `personality_prompt`/`role_prompt`, Agent settings, per-Resident Curator settings, capability grants, event subscriptions, an optional Telegram Owner transport, and optional body metadata. A Curator is disabled when its block or `model` is omitted; `base_url_env`, `batch_size`, and `max_batches` are optional. YAML aliases, unknown fields, prompt path traversal, and inline secret-shaped fields are rejected. Secrets are named with `*_env` references and resolved only while constructing local resources. A Telegram transport uses `token_env`, `owner_user_id_env`, and `owner_chat_id_env`; one resolved bot token may serve exactly one Resident. Unsuffixed terminal input targets `--default-resident` (`resident` by default), and configuration changes require restart.
 
 Granting `messaging` exposes `messaging_send`. It writes to the process-shared durable mailbox and returns immediately; it is not RPC and does not await a reply. Its tool schema enumerates the configured Resident IDs that can be addressed; Owner communication remains separate through `send_owner_message`. Messages default to a five-minute TTL and move from `pending` to `delivered` only when handed to the recipient event queue; expiry and delivery do not imply that a recipient read, understood, acted, or replied. A reply is another independent message.
 

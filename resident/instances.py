@@ -27,7 +27,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
                            {"*"})
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
-    "role", "role_prompt", "agent", "capabilities",
+    "role", "role_prompt", "agent", "curator", "capabilities",
     "subscriptions", "owner_transport", "body",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
@@ -42,6 +42,15 @@ class AgentDefinition:
     agent_id_env: str | None = None
     reasoning_effort: str | None = None
     service_tier: str | None = None
+
+
+@dataclass(frozen=True)
+class CuratorDefinition:
+    model: str | None = None
+    api_key_env: str = "OPENAI_API_KEY"
+    base_url_env: str = "OPENAI_BASE_URL"
+    batch_size: int = 50
+    max_batches: int = 4
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,7 @@ class ResidentDefinition:
     role: str = ""
     enabled: bool = True
     agent: AgentDefinition = field(default_factory=AgentDefinition)
+    curator: CuratorDefinition | None = None
     capabilities: tuple[str, ...] = ()
     subscriptions: tuple[str, ...] = ()
     owner_transport: OwnerTransportDefinition | None = None
@@ -103,6 +113,14 @@ def _reasoning_effort(value: Any, label: str) -> str:
         allowed = ", ".join(SUPPORTED_REASONING_EFFORTS)
         raise ValueError(f"{label} must be one of: {allowed}")
     return effort
+
+
+def _positive_integer(value: Any, label: str, *, maximum: int | None = None) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{label} must be at most {maximum}")
+    return value
 
 
 def _subscriptions(value: Any, label: str) -> tuple[str, ...]:
@@ -204,6 +222,29 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
             _string(agent_data["service_tier"], "agent.service_tier")
             if agent_data.get("service_tier") is not None else None),
     )
+    curator = None
+    if data.get("curator") is not None:
+        curator_data = _mapping(data["curator"], f"{path.name}.curator")
+        curator_allowed = {"model", "api_key_env", "base_url_env", "batch_size", "max_batches"}
+        if set(curator_data) - curator_allowed:
+            raise ValueError(
+                f"Unknown curator fields in {path.name}: "
+                f"{', '.join(sorted(set(curator_data) - curator_allowed))}")
+        curator = CuratorDefinition(
+            model=(
+                _string(curator_data["model"], "curator.model")
+                if curator_data.get("model") is not None else None),
+            api_key_env=_env_name(
+                curator_data.get("api_key_env", "OPENAI_API_KEY"),
+                "curator.api_key_env"),
+            base_url_env=_env_name(
+                curator_data.get("base_url_env", "OPENAI_BASE_URL"),
+                "curator.base_url_env"),
+            batch_size=_positive_integer(
+                curator_data.get("batch_size", 50), "curator.batch_size", maximum=100),
+            max_batches=_positive_integer(
+                curator_data.get("max_batches", 4), "curator.max_batches"),
+        )
     transport = None
     if data.get("owner_transport") is not None:
         item = _mapping(data["owner_transport"], "owner_transport")
@@ -222,7 +263,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
     if body is not None:
         body = _mapping(body, "body")
     return ResidentDefinition(
-        resident_id, name, personality, role, enabled, agent,
+        resident_id, name, personality, role, enabled, agent, curator,
         _string_list(data.get("capabilities"), "capabilities"),
         _subscriptions(data.get("subscriptions"), "subscriptions"), transport, body,
     )
