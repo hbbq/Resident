@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -3617,6 +3618,8 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         provider._request = fake_request
         provider._open_event_stream = fake_stream
+        provider._fallback_wait = lambda *_args, **_kwargs: self.fail(
+            "successful streaming must not reconcile")
         turn = provider._submit_wake("session-1", context, "wake-1", correlation)
 
         self.assertEqual("turn-1", turn.response_id)
@@ -3624,6 +3627,87 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(4, turn.input_tokens)
         self.assertEqual([("session-1", None, "turn-1")], saved)
         self.assertEqual(1, len(posts))
+
+    def test_agents_definitive_wake_rejection_propagates_without_reconciliation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        context, correlation = provider._correlated_context("wake", "wake-1")
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(())
+
+        rejection = urllib.error.HTTPError(
+            "https://example.invalid/events", 400, "rejected", {}, None)
+
+        def reject_submission(*_args, **_kwargs):
+            raise RuntimeError("OpenAI Agents API returned HTTP 400: rejected") from rejection
+
+        provider._open_event_stream = fake_stream
+        provider._request = reject_submission
+        provider._fallback_wait = lambda *_args, **_kwargs: self.fail(
+            "definitive rejection must not reconcile")
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+            provider._submit_wake(
+                "session-1", context, "wake-1", correlation)
+
+    def test_agents_definitive_tool_result_rejection_does_not_rediscover_action(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._ensure_session = lambda *_args, **_kwargs: (
+            {"id": "session-1", "status": "requires_action"}, False)
+        requests = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(())
+
+        rejection = urllib.error.HTTPError(
+            "https://example.invalid/events", 422, "invalid result", {}, None)
+
+        def fake_request(method, path, body=None, **_kwargs):
+            requests.append((method, path, body))
+            if method == "POST" and path.endswith("/events"):
+                raise RuntimeError(
+                    "OpenAI Agents API returned HTTP 422: invalid result") from rejection
+            raise AssertionError("definitive rejection must not rediscover the pending action")
+
+        provider._open_event_stream = fake_stream
+        provider._request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 422"):
+            provider._respond_sync(
+                "wake", [], [ToolResult("call-1", {"ok": True})], "turn-1")
+
+        self.assertEqual(1, len(requests))
+        self.assertEqual("POST", requests[0][0])
+        self.assertEqual({}, provider._submitted_call_ids)
+
+    def test_agents_uncertain_submission_failure_enters_exact_reconciliation(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        fallbacks = []
+
+        @contextmanager
+        def fake_stream(_session_id):
+            yield iter(())
+
+        def uncertain_submission():
+            raise urllib.error.URLError("connection reset after send")
+
+        def fake_fallback(session_id, expected_turn_id, correlation, wake_key, reason):
+            fallbacks.append(
+                (session_id, expected_turn_id, correlation, wake_key, reason))
+            return ModelTurn("turn-1", message="reconciled")
+
+        provider._open_event_stream = fake_stream
+        provider._fallback_wait = fake_fallback
+
+        turn = provider._submit_and_stream(
+            "session-1", uncertain_submission, expected_turn_id="turn-1")
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertEqual(
+            [("session-1", "turn-1", None, None,
+              "stream_timeout_or_disconnect")], fallbacks)
 
     def _agents_stream_completion(self, events):
         provider = OpenAIAgentsProvider(

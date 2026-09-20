@@ -569,13 +569,20 @@ class OpenAIAgentsProvider:
         """Open a live stream before submission, falling back on uncertainty."""
         if "_request" in self.__dict__ and "_open_event_stream" not in self.__dict__:
             # Existing request-level test doubles model the reconciliation path.
-            submit()
+            try:
+                submit()
+            except Exception as exc:
+                if self._submission_was_definitively_rejected(exc):
+                    raise
+                return self._fallback_wait(
+                    session_id, expected_turn_id, correlation, wake_key,
+                    self._stream_fallback_reason(exc))
             return self._fallback_wait(
                 session_id, expected_turn_id, correlation, wake_key, "stream_unavailable")
-        submission_attempted = False
+        submission_started = False
         try:
             with self._open_event_stream(session_id) as events:
-                submission_attempted = True
+                submission_started = True
                 submit()
                 return self._consume_event_stream(
                     session_id, events, expected_turn_id=expected_turn_id,
@@ -583,14 +590,36 @@ class OpenAIAgentsProvider:
         except _AgentsStreamTerminalError:
             raise
         except Exception as exc:
-            if submission_attempted:
+            if submission_started:
+                if self._submission_was_definitively_rejected(exc):
+                    raise
                 return self._fallback_wait(
                     session_id, expected_turn_id, correlation, wake_key,
                     self._stream_fallback_reason(exc))
-            submit()
+            try:
+                submit()
+            except Exception as submit_exc:
+                if self._submission_was_definitively_rejected(submit_exc):
+                    raise
+                return self._fallback_wait(
+                    session_id, expected_turn_id, correlation, wake_key,
+                    self._stream_fallback_reason(submit_exc))
             return self._fallback_wait(
                 session_id, expected_turn_id, correlation, wake_key,
                 "stream_connect_error")
+
+    @staticmethod
+    def _submission_was_definitively_rejected(exc: Exception) -> bool:
+        """Whether an HTTP response proves that an event submission was rejected."""
+        cause: BaseException | None = exc
+        seen: set[int] = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if (isinstance(cause, urllib.error.HTTPError)
+                    and 400 <= cause.code < 500):
+                return True
+            cause = cause.__cause__ or cause.__context__
+        return False
 
     def _fallback_wait(self, session_id: str, expected_turn_id: str | None,
                        correlation: str | None, wake_key: str | None,
