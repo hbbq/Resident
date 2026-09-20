@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -13,6 +14,7 @@ from resident.domain import ModelTurn, WakeEvent
 from resident.host import InstancePolicy, RuntimeHost, messaging_capability
 from resident.instances import load_resident_catalog, migrate_legacy_state
 from resident.mailbox import Mailbox
+from resident.observability import EventLoopLagProbe
 from resident.readiness import ReadinessItem, ReadinessResult
 from resident.runtime import ResidentRuntime
 from resident.store import utc_now
@@ -271,8 +273,9 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         host = RuntimeHost(
             {"lag": runtime}, {"lag": InstancePolicy(frozenset({"*"}))},
             mailbox, default_id="lag")
-        stop = asyncio.Event()
-        probe = asyncio.create_task(host._probe_event_loop_lag(stop, interval=0.001))
+        probe = EventLoopLagProbe((runtime.observe_event_loop_lag,), interval=0.001)
+        await probe.start()
+        runtime.bind_event_loop_lag_checkpoint(probe.checkpoint)
         try:
             await asyncio.sleep(0.005)
             idle_count = runtime.store.connection.execute(
@@ -293,8 +296,56 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(lag_events[0]["sample_count"], 0)
             self.assertGreaterEqual(lag_events[0]["max_event_loop_lag_seconds"], 0.0)
         finally:
-            stop.set()
-            await probe
+            runtime.bind_event_loop_lag_checkpoint(None)
+            await probe.stop()
+            host.close()
+
+    async def test_end_of_wake_blocking_is_included_in_lag_summary(self):
+        root = Path(self.temporary.name)
+        runtime = ResidentRuntime(
+            Config(root / "final-lag", instance_id="final-lag", timeline=True),
+            IdleProvider(), capabilities=[], owner_output=lambda _: None,
+            diagnostic_output=lambda _: None)
+        mailbox = Mailbox(root / "final-lag-mailbox.sqlite3")
+        host = RuntimeHost(
+            {"final-lag": runtime},
+            {"final-lag": InstancePolicy(frozenset({"*"}))},
+            mailbox, default_id="final-lag")
+        original_finish_run = runtime.store.finish_run
+        host_task = None
+
+        def blocking_finish_run(*args, **kwargs):
+            time.sleep(0.02)
+            return original_finish_run(*args, **kwargs)
+
+        try:
+            fast_probe = lambda observers: EventLoopLagProbe(observers, interval=0.001)
+            with (patch.object(runtime.store, "finish_run", side_effect=blocking_finish_run),
+                  patch("resident.host.EventLoopLagProbe", fast_probe)):
+                host_task = asyncio.create_task(host.run(interactive=False))
+                await host.queues["final-lag"].put(WakeEvent(
+                    "final-lag-event", "test", "lag", utc_now(), {}))
+                for _ in range(100):
+                    row = runtime.store.connection.execute(
+                        "SELECT data_json FROM journal WHERE event_type='timeline' "
+                        "AND json_extract(data_json, '$.operation')='event_loop.lag'"
+                    ).fetchone()
+                    if row is not None:
+                        break
+                    await asyncio.sleep(0.005)
+                else:
+                    self.fail("Hosted wake did not emit a lag summary")
+            row = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' "
+                "AND json_extract(data_json, '$.operation')='event_loop.lag'"
+            ).fetchone()
+            summary = json.loads(row[0])
+            self.assertGreater(summary["sample_count"], 0)
+            self.assertGreater(summary["max_event_loop_lag_seconds"], 0.005)
+        finally:
+            if host_task is not None:
+                host_task.cancel()
+                await asyncio.gather(host_task, return_exceptions=True)
             host.close()
 
     async def test_durable_message_handoff_and_reply_are_independent(self):

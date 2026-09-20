@@ -9,7 +9,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 from .capabilities import Capability
 from .domain import WakeEvent
 from .mailbox import DEFAULT_TTL_SECONDS, Mailbox
-from .observability import ObservedQueue, timeline_reporter
+from .observability import EventLoopLagProbe, ObservedQueue, timeline_reporter
 from .readiness import ReadinessItem, ReadinessResult
 from .runtime import EventProducer, ResidentRuntime
 from .store import utc_now
@@ -221,23 +221,14 @@ class RuntimeHost:
             "All systems GO" if all(result.ok for _, result in results)
             else "Startup completed with connector errors.")
 
-    async def _probe_event_loop_lag(self, stop: asyncio.Event,
-                                    interval: float = 0.5) -> None:
-        loop = asyncio.get_running_loop()
-        expected = loop.time() + interval
-        while not stop.is_set():
-            await asyncio.sleep(max(0.0, expected - loop.time()))
-            now = loop.time()
-            lag = max(0.0, now - expected)
-            for runtime in self.runtimes.values():
-                runtime.observe_event_loop_lag(lag)
-            # Probe bookkeeping and observation are deliberately outside the next
-            # interval, so the probe never attributes its own work to loop lag.
-            expected = loop.time() + interval
-
     async def run(self, *, interactive: bool = True) -> None:
         stop = asyncio.Event()
         shared_queue: asyncio.Queue[WakeEvent] = asyncio.Queue()
+        lag_probe = EventLoopLagProbe(
+            runtime.observe_event_loop_lag for runtime in self.runtimes.values())
+        await lag_probe.start()
+        for runtime in self.runtimes.values():
+            runtime.bind_event_loop_lag_checkpoint(lag_probe.checkpoint)
 
         async def router() -> None:
             while not stop.is_set():
@@ -266,8 +257,7 @@ class RuntimeHost:
             workers.extend(asyncio.create_task(self._worker(item, stop))
                            for item in self.runtimes)
             tasks.extend((asyncio.create_task(router()),
-                          asyncio.create_task(self._mailbox_loop(stop)),
-                          asyncio.create_task(self._probe_event_loop_lag(stop))))
+                          asyncio.create_task(self._mailbox_loop(stop))))
             if interactive:
                 tasks.append(asyncio.create_task(terminal()))
             self.diagnostic_output(
@@ -281,6 +271,9 @@ class RuntimeHost:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, *workers, return_exceptions=True)
+            for runtime in self.runtimes.values():
+                runtime.bind_event_loop_lag_checkpoint(None)
+            await lag_probe.stop()
 
     def close(self) -> None:
         for runtime in self.runtimes.values():

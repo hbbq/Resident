@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextvars import ContextVar
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Callable, Generic, Iterable, TypeVar
 
 
 TimelineReporter = Callable[[dict[str, Any]], None]
@@ -23,6 +23,77 @@ class ObservedQueue(asyncio.Queue[T], Generic[T]):
     def put_nowait(self, item: T) -> None:
         super().put_nowait(item)
         self._on_put(item, self.qsize())
+
+
+class EventLoopLagProbe:
+    """Sample loop scheduling lag and support an explicit sampling checkpoint."""
+
+    def __init__(self, observers: Iterable[Callable[[float], None]],
+                 interval: float = 0.5):
+        self._observers = tuple(observers)
+        self._interval = interval
+        self._wake = asyncio.Event()
+        self._ready = asyncio.Event()
+        self._waiters: list[asyncio.Future[None]] = []
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = False
+
+    async def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("Event-loop lag probe is already started")
+        self._task = asyncio.create_task(self._run())
+        await self._ready.wait()
+
+    async def checkpoint(self) -> None:
+        """Wait until the probe has observed any currently overdue sample."""
+        task = self._task
+        if task is None or task.done():
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        self._wake.set()
+        await waiter
+
+    async def stop(self) -> None:
+        task = self._task
+        if task is None:
+            return
+        self._stopping = True
+        self._wake.set()
+        await task
+        self._task = None
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + self._interval
+        self._ready.set()
+        try:
+            while not self._stopping:
+                try:
+                    await asyncio.wait_for(
+                        self._wake.wait(),
+                        timeout=max(0.0, expected - loop.time()),
+                    )
+                except TimeoutError:
+                    pass
+                self._wake.clear()
+                now = loop.time()
+                if now >= expected:
+                    lag = max(0.0, now - expected)
+                    for observer in self._observers:
+                        observer(lag)
+                    # Observation is outside the next interval so the probe does
+                    # not attribute its own bookkeeping to loop lag.
+                    expected = loop.time() + self._interval
+                waiters, self._waiters = self._waiters, []
+                for waiter in waiters:
+                    if not waiter.done():
+                        waiter.set_result(None)
+        finally:
+            waiters, self._waiters = self._waiters, []
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
 
 
 def emit_timeline(operation: str, moment: str, **fields: Any) -> None:

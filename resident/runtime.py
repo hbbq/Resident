@@ -7,7 +7,7 @@ import time
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from typing import Callable, Protocol, Sequence
+from typing import Awaitable, Callable, Protocol, Sequence
 
 from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
@@ -15,7 +15,7 @@ from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider, RemoteSessionUnavailable
 from .memory import MemoryCurator, SessionHistoryUnavailable
-from .observability import ObservedQueue, emit_timeline, timeline_reporter
+from .observability import EventLoopLagProbe, ObservedQueue, emit_timeline, timeline_reporter
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
@@ -145,6 +145,7 @@ class ResidentRuntime:
         self._active_max_loop_lag = 0.0
         self._active_total_loop_lag = 0.0
         self._active_loop_lag_samples = 0
+        self._event_loop_lag_checkpoint: Callable[[], Awaitable[None]] | None = None
 
     def bind_curator(self, curator: MemoryCurator) -> None:
         self.curator = curator
@@ -274,6 +275,10 @@ class ResidentRuntime:
             self._active_max_loop_lag = max(self._active_max_loop_lag, lag_seconds)
             self._active_total_loop_lag += lag_seconds
             self._active_loop_lag_samples += 1
+
+    def bind_event_loop_lag_checkpoint(
+            self, checkpoint: Callable[[], Awaitable[None]] | None) -> None:
+        self._event_loop_lag_checkpoint = checkpoint
 
     def observe_external_timeline(self, data: dict) -> None:
         if not self.config.timeline:
@@ -678,6 +683,18 @@ class ResidentRuntime:
             )
             self.store.finish_run(
                 run_id, status, duration, calls, schedule_id, owner_message_id)
+            # Finalization above is synchronous. Let the probe account for an
+            # overdue sample before publishing and clearing this wake's summary.
+            if self._event_loop_lag_checkpoint is not None:
+                await self._event_loop_lag_checkpoint()
+            emit_timeline(
+                "wake.process", "finished", outcome=status,
+                duration_seconds=time.monotonic() - started,
+                max_event_loop_lag_seconds=self._active_max_loop_lag)
+            # The final wake timeline write is synchronous too. A second explicit
+            # checkpoint ensures an overdue probe cannot lose that blocking.
+            if self._event_loop_lag_checkpoint is not None:
+                await self._event_loop_lag_checkpoint()
             emit_timeline(
                 "event_loop.lag", "summary",
                 sample_count=self._active_loop_lag_samples,
@@ -685,10 +702,6 @@ class ResidentRuntime:
                 average_event_loop_lag_seconds=(
                     self._active_total_loop_lag / self._active_loop_lag_samples
                     if self._active_loop_lag_samples else 0.0))
-            emit_timeline(
-                "wake.process", "finished", outcome=status,
-                duration_seconds=time.monotonic() - started,
-                max_event_loop_lag_seconds=self._active_max_loop_lag)
             self._owner_event_authorizations.pop(event.id, None)
             self._active_run_id, self._active_event = None, None
             self._active_max_loop_lag = 0.0
@@ -770,11 +783,13 @@ class ResidentRuntime:
             lambda item, depth: self.observe_enqueue(item, depth)
             if item is not None else None)
         self._event_queue = queue
-        await self.enqueue_startup_wakeups(queue)
         stop = asyncio.Event()
-        scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
-        producers, readiness = await self._collect_startup_readiness(queue, stop)
-        self._render_startup_readiness(readiness)
+        probe = EventLoopLagProbe((self.observe_event_loop_lag,))
+        await probe.start()
+        self.bind_event_loop_lag_checkpoint(probe.checkpoint)
+        scheduler: asyncio.Task[None] | None = None
+        terminal: asyncio.Task[None] | None = None
+        producers: list[asyncio.Task[None]] = []
 
         async def terminal_input() -> None:
             while not stop.is_set():
@@ -792,10 +807,14 @@ class ResidentRuntime:
                     event = self.owner_message_event(text)
                     await queue.put(event)
 
-        terminal = asyncio.create_task(terminal_input())
-        self.diagnostic_output(
-            f"Resident {self.resident.address_name} ({self.resident.id}) is sleeping; /quit stops the process")
         try:
+            await self.enqueue_startup_wakeups(queue)
+            scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
+            producers, readiness = await self._collect_startup_readiness(queue, stop)
+            self._render_startup_readiness(readiness)
+            terminal = asyncio.create_task(terminal_input())
+            self.diagnostic_output(
+                f"Resident {self.resident.address_name} ({self.resident.id}) is sleeping; /quit stops the process")
             while True:
                 event = await queue.get()
                 if event is None:
@@ -808,9 +827,16 @@ class ResidentRuntime:
         finally:
             self._event_queue = None
             stop.set()
-            scheduler.cancel()
-            terminal.cancel()
+            if scheduler is not None:
+                scheduler.cancel()
+            if terminal is not None:
+                terminal.cancel()
             for producer in producers:
                 producer.cancel()
-            await asyncio.gather(scheduler, terminal, *producers, return_exceptions=True)
+            await asyncio.gather(
+                *(task for task in (scheduler, terminal, *producers)
+                  if task is not None),
+                return_exceptions=True)
+            self.bind_event_loop_lag_checkpoint(None)
+            await probe.stop()
             self.diagnostic_output(f"Resident {self.resident.address_name} stopped")

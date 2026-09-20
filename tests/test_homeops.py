@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from resident.__main__ import TerminalDiagnostics
 from resident.config import Config
+from resident.domain import ModelTurn
 from resident.homeops import HomeOpsConnector
-from resident.observability import timeline_reporter
+from resident.observability import EventLoopLagProbe, timeline_reporter
 from resident.runtime import ResidentRuntime
 from resident.readiness import ReadinessItem, ReadinessResult
 
@@ -214,6 +217,32 @@ class ReadinessProducer(RecordingProducer):
 
 
 class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interactive_runtime_measures_event_loop_lag(self):
+        class BlockingProvider:
+            async def respond(self, context, tools, results, continuation_id=None):
+                time.sleep(0.02)
+                return ModelTurn("turn", None, ())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), timeline=True), BlockingProvider(),
+                owner_output=lambda _: None, diagnostic_output=lambda _: None,
+            )
+            inputs = AsyncMock(side_effect=["hello", "/quit"])
+            fast_probe = lambda observers: EventLoopLagProbe(observers, interval=0.001)
+            with (patch("resident.runtime.asyncio.to_thread", inputs),
+                  patch("resident.runtime.EventLoopLagProbe", fast_probe)):
+                await runtime.run_interactive()
+
+            row = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' "
+                "AND json_extract(data_json, '$.operation')='event_loop.lag'"
+            ).fetchone()
+            summary = json.loads(row[0])
+            self.assertGreater(summary["sample_count"], 0)
+            self.assertGreater(summary["max_event_loop_lag_seconds"], 0.005)
+            runtime.close()
+
     async def test_interactive_runtime_starts_and_stops_event_producers(self):
         with tempfile.TemporaryDirectory() as temporary:
             producer = RecordingProducer()
