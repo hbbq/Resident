@@ -253,7 +253,10 @@ class OpenAICuratorModel:
                 "operation (create/update/supersede/invalidate), optional memory_id, kind, content, rationale, "
                 "confidence, and provenance entries referencing supplied item_id values."
             ),
-            "input": json.dumps(document, ensure_ascii=False),
+            # JSON mode requires the input itself to mention JSON; instructions are
+            # not considered when the Responses API validates this requirement.
+            "input": "Return the requested result as JSON.\n\n"
+                     + json.dumps(document, ensure_ascii=False),
             "text": {"format": {"type": "json_object"}},
         }
         request = urllib.request.Request(

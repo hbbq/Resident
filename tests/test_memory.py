@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from resident.context import ContextBuilder
 from resident.domain import Identity, WakeEvent
-from resident.memory import MemoryCurator, SessionItemPage
+from resident.memory import MemoryCurator, OpenAICuratorModel, SessionItemPage
 from resident.observability import timeline_reporter
 from resident.store import (MAX_ACTIVE_OWNER_GUIDANCE_BYTES,
                             MAX_ACTIVE_OWNER_GUIDANCE_COUNT,
@@ -79,6 +81,21 @@ class PageSource:
 
 
 class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_openai_curator_json_mode_mentions_json_in_input(self):
+        document = {"session_id": "session-1", "new_session_items": []}
+        response = io.BytesIO(json.dumps({
+            "output_text": json.dumps({"mutations": [], "handover": {"operation": "keep"}}),
+        }).encode())
+
+        with patch("resident.memory.urllib.request.urlopen", return_value=response) as urlopen:
+            result = OpenAICuratorModel("key", "model")._post(document)
+
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertIn("json", body["input"].lower())
+        self.assertEqual(document, json.loads(body["input"].split("\n\n", 1)[1]))
+        self.assertEqual([], result["mutations"])
+
     async def test_curator_batch_timeline_finishes_successfully(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
