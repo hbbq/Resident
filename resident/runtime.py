@@ -589,46 +589,51 @@ class ResidentRuntime:
                     tool_started = time.monotonic()
                     emit_timeline("tool.execute", "started", call_id=call.id,
                                   tool_name=call.name, round=round_number)
-                    prepare = getattr(self.provider, "prepare_tool_call", None)
-                    action = prepare(call) if prepare is not None else None
-                    if action is not None and not action["claimed"]:
-                        ephemeral_result = action.get("ephemeral_result")
-                        if ephemeral_result is not None:
-                            result = ephemeral_result
-                        elif action.get("attachments_ephemeral"):
-                            # Attachment payloads (for example camera frames) are
-                            # intentionally not persisted. Reacquire them after a
-                            # restart instead of submitting an incomplete replay.
+                    tool_outcome = "error"
+                    try:
+                        prepare = getattr(self.provider, "prepare_tool_call", None)
+                        action = prepare(call) if prepare is not None else None
+                        if action is not None and not action["claimed"]:
+                            ephemeral_result = action.get("ephemeral_result")
+                            if ephemeral_result is not None:
+                                result = ephemeral_result
+                            elif action.get("attachments_ephemeral"):
+                                # Attachment payloads (for example camera frames) are
+                                # intentionally not persisted. Reacquire them after a
+                                # restart instead of submitting an incomplete replay.
+                                execution = await registry.execute(call.name, call.arguments)
+                                result = ToolResult(call.id, execution.output, execution.attachments)
+                                record = getattr(self.provider, "record_tool_result", None)
+                                if record is not None:
+                                    record(result)
+                            else:
+                                output = action["output"] or {
+                                    "ok": False,
+                                    "error": "Previous local action outcome is unknown; action was not repeated",
+                                }
+                                result = ToolResult(call.id, output)
+                        else:
                             execution = await registry.execute(call.name, call.arguments)
                             result = ToolResult(call.id, execution.output, execution.attachments)
                             record = getattr(self.provider, "record_tool_result", None)
                             if record is not None:
                                 record(result)
-                        else:
-                            output = action["output"] or {
-                                "ok": False,
-                                "error": "Previous local action outcome is unknown; action was not repeated",
-                            }
-                            result = ToolResult(call.id, output)
-                    else:
-                        execution = await registry.execute(call.name, call.arguments)
-                        result = ToolResult(call.id, execution.output, execution.attachments)
-                        record = getattr(self.provider, "record_tool_result", None)
-                        if record is not None:
-                            record(result)
-                    results.append(result)
-                    completion = {"call_id": call.id, "name": call.name, "result": result.output}
-                    if result.attachments:
-                        completion["attachments"] = [{
-                            "type": "image", "mime_type": attachment.mime_type,
-                            "byte_count": len(attachment.data), "ephemeral": True,
-                        } for attachment in result.attachments]
-                    self._emit("tool.completed", completion)
-                    emit_timeline(
-                        "tool.execute", "finished", call_id=call.id,
-                        tool_name=call.name, round=round_number,
-                        outcome="ok" if result.output.get("ok") is not False else "error",
-                        duration_seconds=time.monotonic() - tool_started)
+                        results.append(result)
+                        completion = {"call_id": call.id, "name": call.name, "result": result.output}
+                        if result.attachments:
+                            completion["attachments"] = [{
+                                "type": "image", "mime_type": attachment.mime_type,
+                                "byte_count": len(attachment.data), "ephemeral": True,
+                            } for attachment in result.attachments]
+                        self._emit("tool.completed", completion)
+                        tool_outcome = (
+                            "ok" if result.output.get("ok") is not False else "error")
+                    finally:
+                        emit_timeline(
+                            "tool.execute", "finished", call_id=call.id,
+                            tool_name=call.name, round=round_number,
+                            outcome=tool_outcome,
+                            duration_seconds=time.monotonic() - tool_started)
                 if not continuation_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")
             if capability_event_state is not None:

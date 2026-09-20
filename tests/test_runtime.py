@@ -359,7 +359,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(
                 Config(Path(temporary), timeline=True),
-                SingleToolProvider("clock", {"timezone": "sensitive-argument"}),
+                SingleToolProvider("diagnostics_current_time", {}),
                 owner_output=lambda _: None, diagnostic_output=lambda _: None,
             )
 
@@ -374,11 +374,57 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("wake.process", operations)
             self.assertIn("provider.turn", operations)
             self.assertIn("tool.execute", operations)
+            tool_events = [event for event in events
+                           if event["operation"] == "tool.execute"]
+            self.assertEqual(["started", "finished"], [
+                event["moment"] for event in tool_events])
+            self.assertEqual("ok", tool_events[1]["outcome"])
+            self.assertEqual(
+                {"call_id": "call", "tool_name": "diagnostics_current_time", "round": 0},
+                {key: tool_events[1][key]
+                 for key in ("call_id", "tool_name", "round")})
+            self.assertGreaterEqual(tool_events[1]["duration_seconds"], 0.0)
             serialized = json.dumps(events)
-            self.assertNotIn("sensitive-argument", serialized)
             runtime.close()
             self.assertTrue(all("arguments" not in event and "result" not in event
                                 for event in events))
+
+    async def test_tool_timeline_finishes_when_preparation_raises(self):
+        failure = RuntimeError("credential=timeline-secret")
+
+        class FailingPreparationProvider(SingleToolProvider):
+            def prepare_tool_call(self, call):
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), timeline=True),
+                FailingPreparationProvider("clock", {"timezone": "sensitive-argument"}),
+                owner_output=lambda _: None, diagnostic_output=lambda _: None,
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                await runtime.process(WakeEvent(
+                    "event", "test", "timeline failure", utc_now(), {}))
+
+            self.assertIs(failure, raised.exception)
+            rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' ORDER BY sequence"
+            ).fetchall()
+            events = [json.loads(row[0]) for row in rows]
+            runtime.close()
+            tool_events = [event for event in events
+                           if event["operation"] == "tool.execute"]
+            self.assertEqual(["started", "finished"], [
+                event["moment"] for event in tool_events])
+            self.assertEqual("error", tool_events[1]["outcome"])
+            self.assertEqual(
+                {"call_id": "call", "tool_name": "clock", "round": 0},
+                {key: tool_events[1][key]
+                 for key in ("call_id", "tool_name", "round")})
+            self.assertGreaterEqual(tool_events[1]["duration_seconds"], 0.0)
+            self.assertNotIn("timeline-secret", json.dumps(tool_events))
+            self.assertNotIn("sensitive-argument", json.dumps(tool_events))
 
     async def test_agents_http_timeline_is_nested_and_preserves_request_gaps(self):
         class FakeResponse:
