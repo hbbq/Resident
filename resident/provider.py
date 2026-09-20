@@ -756,7 +756,7 @@ class OpenAIAgentsProvider:
                 return self._completed_turn(
                     session_id, {}, turn, streamed_message=message)
             if event_type in ("agent.session.turn.failed", "agent.session.turn.cancelled"):
-                if event_turn_id != turn_id:
+                if not event_turn_id or event_turn_id != turn_id:
                     continue
                 turn = event.get("turn") if isinstance(event.get("turn"), dict) else {}
                 if event_type.endswith("failed"):
