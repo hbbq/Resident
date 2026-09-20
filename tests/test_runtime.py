@@ -5,9 +5,11 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from resident.config import Config
 from resident.capabilities import Capability
@@ -16,6 +18,7 @@ from resident.domain import ImageAttachment, ToolResult, ToolSpec
 from resident.provider import (OpenAIAgentsProvider, OpenAIResponsesProvider,
                                RemoteSessionUnavailable, RolloverRecoveryRequired)
 from resident.memory import FinalCatchUpIncomplete, SessionHistoryUnavailable
+from resident.observability import timeline_reporter
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
 
@@ -351,6 +354,136 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(line.startswith("model.message ") for line in diagnostics))
             self.assertTrue(any(line.startswith("wake.finished ") for line in diagnostics))
             runtime.close()
+
+    async def test_timeline_is_opt_in_and_omits_tool_arguments_and_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), timeline=True),
+                SingleToolProvider("diagnostics_current_time", {}),
+                owner_output=lambda _: None, diagnostic_output=lambda _: None,
+            )
+
+            await runtime.process(WakeEvent(
+                "event", "test", "timeline", utc_now(), {}))
+
+            rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' ORDER BY sequence"
+            ).fetchall()
+            events = [json.loads(row[0]) for row in rows]
+            operations = {event["operation"] for event in events}
+            self.assertIn("wake.process", operations)
+            self.assertIn("provider.turn", operations)
+            self.assertIn("tool.execute", operations)
+            tool_events = [event for event in events
+                           if event["operation"] == "tool.execute"]
+            self.assertEqual(["started", "finished"], [
+                event["moment"] for event in tool_events])
+            self.assertEqual("ok", tool_events[1]["outcome"])
+            self.assertEqual(
+                {"call_id": "call", "tool_name": "diagnostics_current_time", "round": 0},
+                {key: tool_events[1][key]
+                 for key in ("call_id", "tool_name", "round")})
+            self.assertGreaterEqual(tool_events[1]["duration_seconds"], 0.0)
+            serialized = json.dumps(events)
+            runtime.close()
+            self.assertTrue(all("arguments" not in event and "result" not in event
+                                for event in events))
+
+    async def test_tool_timeline_finishes_when_preparation_raises(self):
+        failure = RuntimeError("credential=timeline-secret")
+
+        class FailingPreparationProvider(SingleToolProvider):
+            def prepare_tool_call(self, call):
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary), timeline=True),
+                FailingPreparationProvider("clock", {"timezone": "sensitive-argument"}),
+                owner_output=lambda _: None, diagnostic_output=lambda _: None,
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                await runtime.process(WakeEvent(
+                    "event", "test", "timeline failure", utc_now(), {}))
+
+            self.assertIs(failure, raised.exception)
+            rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' ORDER BY sequence"
+            ).fetchall()
+            events = [json.loads(row[0]) for row in rows]
+            runtime.close()
+            tool_events = [event for event in events
+                           if event["operation"] == "tool.execute"]
+            self.assertEqual(["started", "finished"], [
+                event["moment"] for event in tool_events])
+            self.assertEqual("error", tool_events[1]["outcome"])
+            self.assertEqual(
+                {"call_id": "call", "tool_name": "clock", "round": 0},
+                {key: tool_events[1][key]
+                 for key in ("call_id", "tool_name", "round")})
+            self.assertGreaterEqual(tool_events[1]["duration_seconds"], 0.0)
+            self.assertNotIn("timeline-secret", json.dumps(tool_events))
+            self.assertNotIn("sensitive-argument", json.dumps(tool_events))
+
+    async def test_agents_http_timeline_is_nested_and_preserves_request_gaps(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def read():
+                return b"{}"
+
+        provider = OpenAIAgentsProvider("test-key", "model")
+
+        def fake_lifecycle(*_):
+            provider._request("POST", "/agents/sessions/session/events", {
+                "events": [{"type": "message", "content": "sensitive prompt"}]})
+            # Exceed the coarse monotonic clock tick on Windows so the preserved
+            # inter-request gap is observable on every supported platform.
+            time.sleep(0.03)
+            provider._request("GET", "/agents/sessions/session")
+            provider._request("GET", "/agents/sessions/session/turns/turn")
+            provider._request("GET", "/agents/sessions/session/items?limit=100")
+            provider._request("POST", "/agents/sessions/session/events", {
+                "events": [{"type": "agent.session.input.tool_result",
+                            "output": "sensitive result"}]})
+            return ModelTurn("turn", message="done")
+
+        provider._respond_sync = fake_lifecycle
+        events = []
+        token = timeline_reporter.set(events.append)
+        try:
+            with patch("resident.provider.urllib.request.urlopen",
+                       return_value=FakeResponse()):
+                await provider.respond(
+                    "sensitive context", [], [ToolResult("call", {"secret": True})],
+                    "previous-turn")
+        finally:
+            timeline_reporter.reset(token)
+
+        self.assertEqual("openai.agents_lifecycle", events[0]["operation"])
+        self.assertEqual("started", events[0]["moment"])
+        self.assertEqual("openai.agents_lifecycle", events[-1]["operation"])
+        self.assertEqual("finished", events[-1]["moment"])
+        http = [event for event in events
+                if event["operation"] == "openai.agents_http"]
+        self.assertEqual([
+            "submit_wake", "poll_session", "poll_turn", "retrieve_items",
+            "submit_tool_results"], [event["request"] for event in http])
+        self.assertGreater(http[1]["gap_since_previous_seconds"], 0.001)
+        self.assertTrue(all(
+            events[0]["started_monotonic_seconds"]
+            <= event["started_monotonic_seconds"]
+            <= event["finished_monotonic_seconds"]
+            <= events[-1]["finished_monotonic_seconds"] for event in http))
+        serialized = json.dumps(events)
+        self.assertNotIn("sensitive", serialized)
+        self.assertNotIn("/agents/", serialized)
 
     async def test_default_diagnostics_show_actionable_runtime_failure(self):
         with tempfile.TemporaryDirectory() as temporary:

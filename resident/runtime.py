@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from typing import Callable, Protocol, Sequence
+from typing import Awaitable, Callable, Protocol, Sequence
 
 from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
@@ -14,6 +15,7 @@ from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider, RemoteSessionUnavailable
 from .memory import MemoryCurator, SessionHistoryUnavailable
+from .observability import EventLoopLagProbe, ObservedQueue, emit_timeline, timeline_reporter
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
@@ -138,6 +140,12 @@ class ResidentRuntime:
         self._active_event: WakeEvent | None = None
         self._owner_event_authorizations: dict[str, str] = {}
         self.curator: MemoryCurator | None = None
+        self._enqueue_times: dict[str, float] = {}
+        self._dequeue_observations: dict[str, tuple[float | None, int]] = {}
+        self._active_max_loop_lag = 0.0
+        self._active_total_loop_lag = 0.0
+        self._active_loop_lag_samples = 0
+        self._event_loop_lag_checkpoint: Callable[[], Awaitable[None]] | None = None
 
     def bind_curator(self, curator: MemoryCurator) -> None:
         self.curator = curator
@@ -203,13 +211,18 @@ class ResidentRuntime:
 
     async def enqueue_startup_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
         if self.curator is not None:
+            token = timeline_reporter.set(self._timeline) if self.config.timeline else None
             try:
                 await self.curator.catch_up()
             except Exception as exc:
                 self._emit("curator.failed", {"phase": "startup", "error_type": type(exc).__name__})
+            finally:
+                if token is not None:
+                    timeline_reporter.reset(token)
         for message in self.store.pending_owner_messages():
-            await queue.put(self._owner_message_wake(
-                message["id"], message["content"], message["created_at"]))
+            event = self._owner_message_wake(
+                message["id"], message["content"], message["created_at"])
+            await queue.put(event)
         if self._pending_capability_event is not None:
             await queue.put(self._pending_capability_event)
             self._pending_capability_event = None
@@ -242,6 +255,42 @@ class ResidentRuntime:
         if self.config.verbose or event_type in self._NORMAL_DIAGNOSTIC_EVENTS:
             details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             self.diagnostic_output(f"{event_type} {details}")
+
+    def observe_enqueue(self, event: WakeEvent, queue_depth: int) -> None:
+        if not self.config.timeline:
+            return
+        self._enqueue_times[event.id] = time.monotonic()
+        self.store.journal("timeline", {
+            "operation": "host.enqueue", "moment": "finished",
+            "event_id": event.id, "queue_depth": queue_depth,
+        })
+
+    def observe_dequeue(self, event: WakeEvent, queue_depth: int) -> None:
+        if self.config.timeline:
+            self._dequeue_observations[event.id] = (
+                self._enqueue_times.pop(event.id, None), queue_depth)
+
+    def observe_event_loop_lag(self, lag_seconds: float) -> None:
+        if self.config.timeline and self._active_run_id is not None:
+            self._active_max_loop_lag = max(self._active_max_loop_lag, lag_seconds)
+            self._active_total_loop_lag += lag_seconds
+            self._active_loop_lag_samples += 1
+
+    def bind_event_loop_lag_checkpoint(
+            self, checkpoint: Callable[[], Awaitable[None]] | None) -> None:
+        self._event_loop_lag_checkpoint = checkpoint
+
+    def observe_external_timeline(self, data: dict) -> None:
+        if not self.config.timeline:
+            return
+        self.store.journal("timeline", data)
+        if self.config.verbose:
+            details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            self.diagnostic_output(f"timeline {details}")
+
+    def _timeline(self, data: dict) -> None:
+        if self.config.timeline:
+            self._emit("timeline", data)
 
     async def _send_owner_message(self, content: str) -> dict:
         if not content.strip():
@@ -327,10 +376,24 @@ class ResidentRuntime:
         started = time.monotonic()
         run_id = self.store.start_run(event)
         self._active_run_id, self._active_event = run_id, event
+        self._active_max_loop_lag = 0.0
+        self._active_total_loop_lag = 0.0
+        self._active_loop_lag_samples = 0
         calls = 0
         status = "failed"
         continuation_id: str | None = None
         capability_event_state = self._capability_event_states.get(event.id)
+        timeline_token = None
+        if self.config.timeline:
+            timeline_token = timeline_reporter.set(self._timeline)
+            queued_at, queue_depth = self._dequeue_observations.pop(
+                event.id, (None, 0))
+            self._timeline({
+                "operation": "host.dequeue", "moment": "finished",
+                "event_id": event.id, "queue_depth": queue_depth,
+                "queue_wait_seconds": (None if queued_at is None else started - queued_at),
+            })
+            self._timeline({"operation": "wake.process", "moment": "started"})
         try:
             self._emit("wake.started", {
                 "event_id": event.id, "source": event.source, "reason": event.reason,
@@ -338,8 +401,14 @@ class ResidentRuntime:
             })
             capabilities = capability_event_state[0] if capability_event_state else self._capabilities
             preflight_session = getattr(self.provider, "preflight_session", None)
-            unavailable_reason = (
-                await preflight_session() if preflight_session is not None else None)
+            emit_timeline("provider.preflight", "started")
+            preflight_started = time.monotonic()
+            try:
+                unavailable_reason = (
+                    await preflight_session() if preflight_session is not None else None)
+            finally:
+                emit_timeline("provider.preflight", "finished",
+                              duration_seconds=time.monotonic() - preflight_started)
             managed_session = bool(getattr(self.provider, "uses_managed_session", False))
             authoritative_state = self.context_builder.authoritative_state(
                 self.resident, self.owner, capabilities)
@@ -443,6 +512,11 @@ class ResidentRuntime:
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
                 response_session_id = getattr(self.provider, "session_id", None)
+                provider_operation = ("provider.tool_result_continuation" if results
+                                      else "provider.turn")
+                provider_started = time.monotonic()
+                emit_timeline(provider_operation, "started", round=round_number,
+                              tool_result_count=len(results), turn_id=continuation_id)
                 try:
                     turn = await self.provider.respond(
                         context, registry.specs, results, continuation_id)
@@ -480,6 +554,12 @@ class ResidentRuntime:
                         self.resident, self.owner, event, capabilities, handover=handover)
                     turn = await self.provider.respond(
                         context, registry.specs, results, continuation_id)
+                finally:
+                    emit_timeline(
+                        provider_operation, "finished", round=round_number,
+                        tool_result_count=len(results), turn_id=continuation_id,
+                        outcome="error" if sys.exc_info()[0] is not None else "ok",
+                        duration_seconds=time.monotonic() - provider_started)
                 if handover_id is not None:
                     replacement_id = getattr(self.provider, "session_id", None)
                     if replacement_id and replacement_id != response_session_id:
@@ -506,41 +586,54 @@ class ResidentRuntime:
                 results = []
                 for call in turn.tool_calls:
                     self._emit("tool.called", {"call_id": call.id, "name": call.name, "arguments": call.arguments})
-                    prepare = getattr(self.provider, "prepare_tool_call", None)
-                    action = prepare(call) if prepare is not None else None
-                    if action is not None and not action["claimed"]:
-                        ephemeral_result = action.get("ephemeral_result")
-                        if ephemeral_result is not None:
-                            result = ephemeral_result
-                        elif action.get("attachments_ephemeral"):
-                            # Attachment payloads (for example camera frames) are
-                            # intentionally not persisted. Reacquire them after a
-                            # restart instead of submitting an incomplete replay.
+                    tool_started = time.monotonic()
+                    emit_timeline("tool.execute", "started", call_id=call.id,
+                                  tool_name=call.name, round=round_number)
+                    tool_outcome = "error"
+                    try:
+                        prepare = getattr(self.provider, "prepare_tool_call", None)
+                        action = prepare(call) if prepare is not None else None
+                        if action is not None and not action["claimed"]:
+                            ephemeral_result = action.get("ephemeral_result")
+                            if ephemeral_result is not None:
+                                result = ephemeral_result
+                            elif action.get("attachments_ephemeral"):
+                                # Attachment payloads (for example camera frames) are
+                                # intentionally not persisted. Reacquire them after a
+                                # restart instead of submitting an incomplete replay.
+                                execution = await registry.execute(call.name, call.arguments)
+                                result = ToolResult(call.id, execution.output, execution.attachments)
+                                record = getattr(self.provider, "record_tool_result", None)
+                                if record is not None:
+                                    record(result)
+                            else:
+                                output = action["output"] or {
+                                    "ok": False,
+                                    "error": "Previous local action outcome is unknown; action was not repeated",
+                                }
+                                result = ToolResult(call.id, output)
+                        else:
                             execution = await registry.execute(call.name, call.arguments)
                             result = ToolResult(call.id, execution.output, execution.attachments)
                             record = getattr(self.provider, "record_tool_result", None)
                             if record is not None:
                                 record(result)
-                        else:
-                            output = action["output"] or {
-                                "ok": False,
-                                "error": "Previous local action outcome is unknown; action was not repeated",
-                            }
-                            result = ToolResult(call.id, output)
-                    else:
-                        execution = await registry.execute(call.name, call.arguments)
-                        result = ToolResult(call.id, execution.output, execution.attachments)
-                        record = getattr(self.provider, "record_tool_result", None)
-                        if record is not None:
-                            record(result)
-                    results.append(result)
-                    completion = {"call_id": call.id, "name": call.name, "result": result.output}
-                    if result.attachments:
-                        completion["attachments"] = [{
-                            "type": "image", "mime_type": attachment.mime_type,
-                            "byte_count": len(attachment.data), "ephemeral": True,
-                        } for attachment in result.attachments]
-                    self._emit("tool.completed", completion)
+                        results.append(result)
+                        completion = {"call_id": call.id, "name": call.name, "result": result.output}
+                        if result.attachments:
+                            completion["attachments"] = [{
+                                "type": "image", "mime_type": attachment.mime_type,
+                                "byte_count": len(attachment.data), "ephemeral": True,
+                            } for attachment in result.attachments]
+                        self._emit("tool.completed", completion)
+                        tool_outcome = (
+                            "ok" if result.output.get("ok") is not False else "error")
+                    finally:
+                        emit_timeline(
+                            "tool.execute", "finished", call_id=call.id,
+                            tool_name=call.name, round=round_number,
+                            outcome=tool_outcome,
+                            duration_seconds=time.monotonic() - tool_started)
                 if not continuation_id:
                     raise RuntimeError("Provider did not return a response id for tool continuation")
             if capability_event_state is not None:
@@ -558,11 +651,20 @@ class ResidentRuntime:
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
             if self.curator is not None:
+                curator_started = time.monotonic()
+                emit_timeline("curator.catch_up", "started", phase="incremental")
                 try:
                     await self.curator.catch_up()
                 except Exception as exc:
                     self._emit("curator.failed", {
                         "phase": "incremental", "error_type": type(exc).__name__})
+                    emit_timeline("curator.catch_up", "finished", phase="incremental",
+                                  outcome="error",
+                                  duration_seconds=time.monotonic() - curator_started)
+                else:
+                    emit_timeline("curator.catch_up", "finished", phase="incremental",
+                                  outcome="ok",
+                                  duration_seconds=time.monotonic() - curator_started)
             return run_id
         except asyncio.CancelledError as exc:
             self._discard_continuation(continuation_id)
@@ -586,15 +688,40 @@ class ResidentRuntime:
             )
             self.store.finish_run(
                 run_id, status, duration, calls, schedule_id, owner_message_id)
+            # Finalization above is synchronous. Let the probe account for an
+            # overdue sample before publishing and clearing this wake's summary.
+            if self._event_loop_lag_checkpoint is not None:
+                await self._event_loop_lag_checkpoint()
+            emit_timeline(
+                "wake.process", "finished", outcome=status,
+                duration_seconds=time.monotonic() - started,
+                max_event_loop_lag_seconds=self._active_max_loop_lag)
+            # The final wake timeline write is synchronous too. A second explicit
+            # checkpoint ensures an overdue probe cannot lose that blocking.
+            if self._event_loop_lag_checkpoint is not None:
+                await self._event_loop_lag_checkpoint()
+            emit_timeline(
+                "event_loop.lag", "summary",
+                sample_count=self._active_loop_lag_samples,
+                max_event_loop_lag_seconds=self._active_max_loop_lag,
+                average_event_loop_lag_seconds=(
+                    self._active_total_loop_lag / self._active_loop_lag_samples
+                    if self._active_loop_lag_samples else 0.0))
             self._owner_event_authorizations.pop(event.id, None)
             self._active_run_id, self._active_event = None, None
+            self._active_max_loop_lag = 0.0
+            self._active_total_loop_lag = 0.0
+            self._active_loop_lag_samples = 0
+            if timeline_token is not None:
+                timeline_reporter.reset(timeline_token)
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
         for scheduled in self.store.claim_due_wakeups(utc_now()):
-            await queue.put(WakeEvent(
+            event = WakeEvent(
                 str(uuid.uuid4()), "scheduler", scheduled["reason"], utc_now(),
                 {"schedule_id": scheduled["id"], "scheduled_for": scheduled["due_at"],
-                 "context": scheduled["context"]}))
+                 "context": scheduled["context"]})
+            await queue.put(event)
 
     async def scheduler_loop(self, queue: asyncio.Queue[WakeEvent], stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -657,13 +784,17 @@ class ResidentRuntime:
             else "Startup completed with connector errors.")
 
     async def run_interactive(self) -> None:
-        queue: asyncio.Queue[WakeEvent | None] = asyncio.Queue()
+        queue: asyncio.Queue[WakeEvent | None] = ObservedQueue(
+            lambda item, depth: self.observe_enqueue(item, depth)
+            if item is not None else None)
         self._event_queue = queue
-        await self.enqueue_startup_wakeups(queue)
         stop = asyncio.Event()
-        scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
-        producers, readiness = await self._collect_startup_readiness(queue, stop)
-        self._render_startup_readiness(readiness)
+        probe = EventLoopLagProbe((self.observe_event_loop_lag,))
+        await probe.start()
+        self.bind_event_loop_lag_checkpoint(probe.checkpoint)
+        scheduler: asyncio.Task[None] | None = None
+        terminal: asyncio.Task[None] | None = None
+        producers: list[asyncio.Task[None]] = []
 
         async def terminal_input() -> None:
             while not stop.is_set():
@@ -678,16 +809,22 @@ class ResidentRuntime:
                     await queue.put(None)
                     return
                 if text.strip():
-                    await queue.put(self.owner_message_event(text))
+                    event = self.owner_message_event(text)
+                    await queue.put(event)
 
-        terminal = asyncio.create_task(terminal_input())
-        self.diagnostic_output(
-            f"Resident {self.resident.address_name} ({self.resident.id}) is sleeping; /quit stops the process")
         try:
+            await self.enqueue_startup_wakeups(queue)
+            scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
+            producers, readiness = await self._collect_startup_readiness(queue, stop)
+            self._render_startup_readiness(readiness)
+            terminal = asyncio.create_task(terminal_input())
+            self.diagnostic_output(
+                f"Resident {self.resident.address_name} ({self.resident.id}) is sleeping; /quit stops the process")
             while True:
                 event = await queue.get()
                 if event is None:
                     break
+                self.observe_dequeue(event, queue.qsize())
                 try:
                     await self.process(event)
                 except Exception:
@@ -695,9 +832,16 @@ class ResidentRuntime:
         finally:
             self._event_queue = None
             stop.set()
-            scheduler.cancel()
-            terminal.cancel()
+            if scheduler is not None:
+                scheduler.cancel()
+            if terminal is not None:
+                terminal.cancel()
             for producer in producers:
                 producer.cancel()
-            await asyncio.gather(scheduler, terminal, *producers, return_exceptions=True)
+            await asyncio.gather(
+                *(task for task in (scheduler, terminal, *producers)
+                  if task is not None),
+                return_exceptions=True)
+            self.bind_event_loop_lag_checkpoint(None)
+            await probe.stop()
             self.diagnostic_output(f"Resident {self.resident.address_name} stopped")

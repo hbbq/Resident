@@ -1,7 +1,9 @@
 import asyncio
+import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -12,6 +14,7 @@ from resident.domain import ModelTurn, WakeEvent
 from resident.host import InstancePolicy, RuntimeHost, messaging_capability
 from resident.instances import load_resident_catalog, migrate_legacy_state
 from resident.mailbox import Mailbox
+from resident.observability import EventLoopLagProbe
 from resident.readiness import ReadinessItem, ReadinessResult
 from resident.runtime import ResidentRuntime
 from resident.store import utc_now
@@ -206,6 +209,144 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("event", (await self.host.queues["b"].get()).id)
         ignored = WakeEvent("ignored", "camera", "changed", utc_now(), {})
         self.assertEqual((), await self.host.route(ignored))
+
+    async def test_instance_producer_queue_boundary_records_queue_wait(self):
+        class DirectProducer:
+            def __init__(self):
+                self.produced = asyncio.Event()
+
+            async def run(self, queue, stop):
+                await queue.put(WakeEvent(
+                    "direct-event", "telegram", "message", utc_now(), {}))
+                self.produced.set()
+                await stop.wait()
+
+        root = Path(self.temporary.name)
+        runtime = ResidentRuntime(
+            Config(root / "direct", instance_id="direct", timeline=True),
+            IdleProvider(), capabilities=[], owner_output=lambda _: None,
+            diagnostic_output=lambda _: None)
+        mailbox = Mailbox(root / "direct-mailbox.sqlite3")
+        producer = DirectProducer()
+        host = RuntimeHost(
+            {"direct": runtime}, {"direct": InstancePolicy(frozenset({"*"}))},
+            mailbox, default_id="direct", instance_producers={"direct": (producer,)})
+        stop = asyncio.Event()
+        tasks = []
+        try:
+            tasks, _ = await host._collect_startup_readiness(asyncio.Queue(), stop)
+            await producer.produced.wait()
+            event = await host.queues["direct"].get()
+            runtime.observe_dequeue(event, host.queues["direct"].qsize())
+            await runtime.process(event)
+
+            rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' "
+                "ORDER BY sequence").fetchall()
+            events = [json.loads(row[0]) for row in rows]
+            enqueue = next(item for item in events
+                           if item["operation"] == "host.enqueue")
+            dequeue = next(item for item in events
+                           if item["operation"] == "host.dequeue")
+            self.assertEqual("direct-event", enqueue["event_id"])
+            self.assertIsNotNone(dequeue["queue_wait_seconds"])
+            self.assertGreaterEqual(dequeue["queue_wait_seconds"], 0.0)
+        finally:
+            stop.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            host.close()
+
+    async def test_event_loop_lag_is_idle_silent_and_aggregated_per_wake(self):
+        class WaitingProvider:
+            async def respond(self, context, tools, results, continuation_id=None):
+                await asyncio.sleep(0.02)
+                return ModelTurn("turn", None, ())
+
+        root = Path(self.temporary.name)
+        runtime = ResidentRuntime(
+            Config(root / "lag", instance_id="lag", timeline=True),
+            WaitingProvider(), capabilities=[], owner_output=lambda _: None,
+            diagnostic_output=lambda _: None)
+        mailbox = Mailbox(root / "lag-mailbox.sqlite3")
+        host = RuntimeHost(
+            {"lag": runtime}, {"lag": InstancePolicy(frozenset({"*"}))},
+            mailbox, default_id="lag")
+        probe = EventLoopLagProbe((runtime.observe_event_loop_lag,), interval=0.001)
+        await probe.start()
+        runtime.bind_event_loop_lag_checkpoint(probe.checkpoint)
+        try:
+            await asyncio.sleep(0.005)
+            idle_count = runtime.store.connection.execute(
+                "SELECT count(*) FROM journal WHERE event_type='timeline'"
+            ).fetchone()[0]
+            self.assertEqual(0, idle_count)
+
+            await runtime.process(WakeEvent(
+                "lag-event", "test", "lag", utc_now(), {}))
+            lag_rows = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline'"
+            ).fetchall()
+            lag_events = [event for row in lag_rows
+                          if (event := json.loads(row[0])).get("operation")
+                          == "event_loop.lag"]
+            self.assertEqual(1, len(lag_events))
+            self.assertEqual("summary", lag_events[0]["moment"])
+            self.assertGreater(lag_events[0]["sample_count"], 0)
+            self.assertGreaterEqual(lag_events[0]["max_event_loop_lag_seconds"], 0.0)
+        finally:
+            runtime.bind_event_loop_lag_checkpoint(None)
+            await probe.stop()
+            host.close()
+
+    async def test_end_of_wake_blocking_is_included_in_lag_summary(self):
+        root = Path(self.temporary.name)
+        runtime = ResidentRuntime(
+            Config(root / "final-lag", instance_id="final-lag", timeline=True),
+            IdleProvider(), capabilities=[], owner_output=lambda _: None,
+            diagnostic_output=lambda _: None)
+        mailbox = Mailbox(root / "final-lag-mailbox.sqlite3")
+        host = RuntimeHost(
+            {"final-lag": runtime},
+            {"final-lag": InstancePolicy(frozenset({"*"}))},
+            mailbox, default_id="final-lag")
+        original_finish_run = runtime.store.finish_run
+        host_task = None
+
+        def blocking_finish_run(*args, **kwargs):
+            time.sleep(0.02)
+            return original_finish_run(*args, **kwargs)
+
+        try:
+            fast_probe = lambda observers: EventLoopLagProbe(observers, interval=0.001)
+            with (patch.object(runtime.store, "finish_run", side_effect=blocking_finish_run),
+                  patch("resident.host.EventLoopLagProbe", fast_probe)):
+                host_task = asyncio.create_task(host.run(interactive=False))
+                await host.queues["final-lag"].put(WakeEvent(
+                    "final-lag-event", "test", "lag", utc_now(), {}))
+                for _ in range(100):
+                    row = runtime.store.connection.execute(
+                        "SELECT data_json FROM journal WHERE event_type='timeline' "
+                        "AND json_extract(data_json, '$.operation')='event_loop.lag'"
+                    ).fetchone()
+                    if row is not None:
+                        break
+                    await asyncio.sleep(0.005)
+                else:
+                    self.fail("Hosted wake did not emit a lag summary")
+            row = runtime.store.connection.execute(
+                "SELECT data_json FROM journal WHERE event_type='timeline' "
+                "AND json_extract(data_json, '$.operation')='event_loop.lag'"
+            ).fetchone()
+            summary = json.loads(row[0])
+            self.assertGreater(summary["sample_count"], 0)
+            self.assertGreater(summary["max_event_loop_lag_seconds"], 0.005)
+        finally:
+            if host_task is not None:
+                host_task.cancel()
+                await asyncio.gather(host_task, return_exceptions=True)
+            host.close()
 
     async def test_durable_message_handoff_and_reply_are_independent(self):
         send_a = messaging_capability(self.mailbox, "a", lambda: self.host.recipients)

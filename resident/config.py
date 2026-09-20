@@ -183,6 +183,7 @@ class Config:
     camera_onvif_retry_seconds: float = 30.0
     ffmpeg_executable: str = "ffmpeg"
     verbose: bool = False
+    timeline: bool = False
 
     @classmethod
     def from_env_and_args(cls, argv: list[str] | None = None) -> "Config":
@@ -196,6 +197,9 @@ class Config:
                             help="move resident.sqlite3 into instances/resident and exit")
         parser.add_argument("--verbose", action="store_true", default=_environment_flag("RESIDENT_VERBOSE"),
                             help="show detailed runtime and connector diagnostics")
+        parser.add_argument("--timeline", action="store_true",
+                            default=_environment_flag("RESIDENT_TIMELINE"),
+                            help="record structured latency timeline events")
         parser.add_argument("--resident-name", default=os.getenv("RESIDENT_NAME", "Resident"))
         parser.add_argument("--owner-name", default=os.getenv("RESIDENT_OWNER_NAME", "Owner"))
         parser.add_argument("--personality", default=os.getenv("RESIDENT_PERSONALITY", DEFAULT_PERSONALITY))
@@ -269,6 +273,7 @@ class Config:
             raise ValueError("RESIDENT_DISPLAYS requires RESIDENT_HOMEOPS_URL or --homeops-url")
         return cls(
             data_dir=Path(args.data_dir).expanduser(), verbose=args.verbose,
+            timeline=args.timeline,
             residents_dir=Path(args.residents_dir).expanduser() if args.residents_dir else None,
             prompt_root=Path(args.prompt_root).expanduser() if args.prompt_root else None,
             default_resident=args.default_resident, migrate_legacy=args.migrate_legacy,

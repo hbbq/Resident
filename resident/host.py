@@ -9,6 +9,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 from .capabilities import Capability
 from .domain import WakeEvent
 from .mailbox import DEFAULT_TTL_SECONDS, Mailbox
+from .observability import EventLoopLagProbe, ObservedQueue, timeline_reporter
 from .readiness import ReadinessItem, ReadinessResult
 from .runtime import EventProducer, ResidentRuntime
 from .store import utc_now
@@ -78,7 +79,11 @@ class RuntimeHost:
         self.default_id = default_id
         self.diagnostic_output = diagnostic_output or (lambda message: None)
         self.queues: dict[str, asyncio.Queue[WakeEvent | None]] = {
-            instance_id: asyncio.Queue() for instance_id in runtimes
+            instance_id: ObservedQueue(
+                lambda item, depth, runtime=runtimes[instance_id]:
+                runtime.observe_enqueue(item, depth)
+                if item is not None else None)
+            for instance_id in runtimes
         }
         self._stopping = False
 
@@ -128,6 +133,7 @@ class RuntimeHost:
                 event = await queue.get()
                 if event is None:
                     return
+                runtime.observe_dequeue(event, queue.qsize())
                 try:
                     await runtime.process(event)
                 except Exception:
@@ -140,9 +146,12 @@ class RuntimeHost:
     async def _collect_startup_readiness(
             self, shared_queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,
     ) -> tuple[list[asyncio.Task[None]], list[tuple[ReadinessItem, ReadinessResult]]]:
-        producers = [(producer, shared_queue) for producer in self.event_producers]
+        producers = [
+            (producer, shared_queue, tuple(self.runtimes.values()))
+            for producer in self.event_producers
+        ]
         producers.extend(
-            (producer, self.queues[instance_id])
+            (producer, self.queues[instance_id], (self.runtimes[instance_id],))
             for instance_id, items in self.instance_producers.items()
             for producer in items
         )
@@ -151,14 +160,26 @@ class RuntimeHost:
                             asyncio.Queue[ReadinessResult]]] = []
         ordered: list[tuple[ReadinessItem, ReadinessResult]] = []
         try:
-            for producer, queue in producers:
+            for producer, queue, targets in producers:
                 items = tuple(getattr(producer, "readiness_items", ()))
+                async def run_producer(readiness_queue=None, *, item=producer,
+                                       event_queue=queue, observers=targets):
+                    reporter = lambda data: [
+                        runtime.observe_external_timeline(data) for runtime in observers]
+                    token = timeline_reporter.set(reporter)
+                    try:
+                        if readiness_queue is None:
+                            await item.run(event_queue, stop)
+                        else:
+                            await item.run(event_queue, stop, readiness_queue)
+                    finally:
+                        timeline_reporter.reset(token)
                 if items:
                     readiness: asyncio.Queue[ReadinessResult] = asyncio.Queue()
-                    task = asyncio.create_task(producer.run(queue, stop, readiness))
+                    task = asyncio.create_task(run_producer(readiness))
                     watched.append((task, items, readiness))
                 else:
-                    task = asyncio.create_task(producer.run(queue, stop))
+                    task = asyncio.create_task(run_producer())
                 tasks.append(task)
 
             for task, items, readiness in watched:
@@ -203,6 +224,11 @@ class RuntimeHost:
     async def run(self, *, interactive: bool = True) -> None:
         stop = asyncio.Event()
         shared_queue: asyncio.Queue[WakeEvent] = asyncio.Queue()
+        lag_probe = EventLoopLagProbe(
+            runtime.observe_event_loop_lag for runtime in self.runtimes.values())
+        await lag_probe.start()
+        for runtime in self.runtimes.values():
+            runtime.bind_event_loop_lag_checkpoint(lag_probe.checkpoint)
 
         async def router() -> None:
             while not stop.is_set():
@@ -219,7 +245,8 @@ class RuntimeHost:
                     stop.set()
                     return
                 if text.strip():
-                    await self.queues[self.default_id].put(runtime.owner_message_event(text))
+                    event = runtime.owner_message_event(text)
+                    await self.queues[self.default_id].put(event)
 
         workers: list[asyncio.Task[None]] = []
         tasks: list[asyncio.Task[None]] = []
@@ -244,6 +271,9 @@ class RuntimeHost:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, *workers, return_exceptions=True)
+            for runtime in self.runtimes.values():
+                runtime.bind_event_loop_lag_checkpoint(None)
+            await lag_probe.stop()
 
     def close(self) -> None:
         for runtime in self.runtimes.values():

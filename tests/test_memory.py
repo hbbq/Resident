@@ -9,6 +9,7 @@ from pathlib import Path
 from resident.context import ContextBuilder
 from resident.domain import Identity, WakeEvent
 from resident.memory import MemoryCurator, SessionItemPage
+from resident.observability import timeline_reporter
 from resident.store import (MAX_ACTIVE_OWNER_GUIDANCE_BYTES,
                             MAX_ACTIVE_OWNER_GUIDANCE_COUNT,
                             MAX_OWNER_GUIDANCE_ENTRY_BYTES, Store, utc_now)
@@ -78,6 +79,57 @@ class PageSource:
 
 
 class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_curator_batch_timeline_finishes_successfully(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            events = []
+            token = timeline_reporter.set(events.append)
+            try:
+                await MemoryCurator(store, FakeSource(), FakeModel()).catch_up()
+            finally:
+                timeline_reporter.reset(token)
+
+            batch_events = [event for event in events
+                            if event["operation"] == "curator.batch"]
+            self.assertEqual(["started", "finished"], [
+                event["moment"] for event in batch_events])
+            self.assertEqual("ok", batch_events[1]["outcome"])
+            self.assertEqual(
+                {"phase": "incremental", "round": 1},
+                {key: batch_events[1][key] for key in ("phase", "round")})
+            self.assertGreaterEqual(batch_events[1]["duration_seconds"], 0.0)
+            store.close()
+
+    async def test_curator_batch_timeline_finishes_when_model_raises(self):
+        failure = RuntimeError("prompt=curator-secret")
+
+        class FailingModel:
+            async def curate(self, session_id, items, existing, current_handover):
+                raise failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            events = []
+            token = timeline_reporter.set(events.append)
+            try:
+                with self.assertRaises(RuntimeError) as raised:
+                    await MemoryCurator(store, FakeSource(), FailingModel()).catch_up()
+            finally:
+                timeline_reporter.reset(token)
+
+            self.assertIs(failure, raised.exception)
+            batch_events = [event for event in events
+                            if event["operation"] == "curator.batch"]
+            self.assertEqual(["started", "finished"], [
+                event["moment"] for event in batch_events])
+            self.assertEqual("error", batch_events[1]["outcome"])
+            self.assertEqual(
+                {"phase": "incremental", "round": 1},
+                {key: batch_events[1][key] for key in ("phase", "round")})
+            self.assertGreaterEqual(batch_events[1]["duration_seconds"], 0.0)
+            self.assertNotIn("curator-secret", json.dumps(batch_events))
+            store.close()
+
     async def test_resident_memory_tools_expose_only_active_knowledge(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")

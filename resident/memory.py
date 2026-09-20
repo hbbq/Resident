@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
+from .observability import emit_timeline
 from .store import Store
 
 
@@ -301,57 +303,72 @@ class MemoryCurator:
             seen_pages: set[tuple[str, tuple[str, ...] | str]] = set()
             more_pages = False
             while pages < self.max_batches:
-                page = await self.source.session_items(cursor, self.batch_size)
-                more_pages = page.has_more
-                safe_items = tuple(item for raw in page.items
-                                   if (item := _safe_item(raw)) is not None)
-                if not page.items:
-                    if page.has_more:
-                        raise RuntimeError("Curator pagination stalled on an empty page")
-                    break
-                last_item_id = page.items[-1].get("id")
-                next_cursor = page.cursor or last_item_id
-                if next_cursor is None or next_cursor == cursor or next_cursor in seen_cursors:
-                    raise RuntimeError("Curator pagination cursor did not advance")
-                page_identity = _source_page_identity(page)
-                if page_identity in seen_pages:
-                    raise RuntimeError("Curator pagination repeated a page")
-                seen_cursors.add(next_cursor)
-                seen_pages.add(page_identity)
-                pages += 1
-                key_material = f"{session_id}:{cursor or ''}:{next_cursor or ''}"
-                operation_key = hashlib.sha256(key_material.encode()).hexdigest()
-                job_id = hashlib.sha256(f"job:{session_id}:{cursor or ''}".encode()).hexdigest()
-                if not self.store.claim_curator_job(job_id, session_id, cursor):
-                    cursor = next_cursor
-                    if not page.has_more:
-                        break
-                    continue
+                batch_round = pages + 1
+                batch_started = time.monotonic()
+                emit_timeline("curator.batch", "started", phase="final" if final else "incremental",
+                              round=batch_round)
+                batch_outcome = "error"
                 try:
-                    mutations: list[dict[str, Any]] = []
-                    handover_operation = "keep"
-                    proposed_handover = None
-                    if safe_items:
-                        existing = tuple(_safe_existing_memory(memory) for memory in
-                                         self.store.search_memories(limit=20))
-                        decision = await self.model.curate(
-                            session_id, safe_items, existing, handover)
-                        mutations = self._validate_mutations(
-                            decision.get("mutations", []), session_id, safe_items)
-                        handover_operation, proposed_handover = self._validate_handover(
-                            decision.get("handover", {"operation": "keep"}))
-                        if handover_operation == "replace":
-                            handover = proposed_handover
-                        elif handover_operation == "clear":
-                            handover = None
-                    self.store.apply_curator_batch(
-                        "openai_agents", session_id, next_cursor, last_item_id,
-                        operation_key, mutations, handover_operation, proposed_handover)
-                    self.store.finish_curator_job(job_id)
-                except BaseException as exc:
-                    self.store.fail_curator_job(job_id, type(exc).__name__)
-                    raise
-                cursor = next_cursor
+                    page = await self.source.session_items(cursor, self.batch_size)
+                    more_pages = page.has_more
+                    safe_items = tuple(item for raw in page.items
+                                       if (item := _safe_item(raw)) is not None)
+                    if not page.items:
+                        if page.has_more:
+                            raise RuntimeError("Curator pagination stalled on an empty page")
+                        batch_outcome = "ok"
+                        break
+                    last_item_id = page.items[-1].get("id")
+                    next_cursor = page.cursor or last_item_id
+                    if next_cursor is None or next_cursor == cursor or next_cursor in seen_cursors:
+                        raise RuntimeError("Curator pagination cursor did not advance")
+                    page_identity = _source_page_identity(page)
+                    if page_identity in seen_pages:
+                        raise RuntimeError("Curator pagination repeated a page")
+                    seen_cursors.add(next_cursor)
+                    seen_pages.add(page_identity)
+                    pages += 1
+                    key_material = f"{session_id}:{cursor or ''}:{next_cursor or ''}"
+                    operation_key = hashlib.sha256(key_material.encode()).hexdigest()
+                    job_id = hashlib.sha256(f"job:{session_id}:{cursor or ''}".encode()).hexdigest()
+                    if not self.store.claim_curator_job(job_id, session_id, cursor):
+                        cursor = next_cursor
+                        batch_outcome = "ok"
+                        if not page.has_more:
+                            break
+                        continue
+                    try:
+                        mutations: list[dict[str, Any]] = []
+                        handover_operation = "keep"
+                        proposed_handover = None
+                        if safe_items:
+                            existing = tuple(_safe_existing_memory(memory) for memory in
+                                             self.store.search_memories(limit=20))
+                            decision = await self.model.curate(
+                                session_id, safe_items, existing, handover)
+                            mutations = self._validate_mutations(
+                                decision.get("mutations", []), session_id, safe_items)
+                            handover_operation, proposed_handover = self._validate_handover(
+                                decision.get("handover", {"operation": "keep"}))
+                            if handover_operation == "replace":
+                                handover = proposed_handover
+                            elif handover_operation == "clear":
+                                handover = None
+                        self.store.apply_curator_batch(
+                            "openai_agents", session_id, next_cursor, last_item_id,
+                            operation_key, mutations, handover_operation, proposed_handover)
+                        self.store.finish_curator_job(job_id)
+                    except BaseException as exc:
+                        self.store.fail_curator_job(job_id, type(exc).__name__)
+                        raise
+                    cursor = next_cursor
+                    batch_outcome = "ok"
+                finally:
+                    emit_timeline(
+                        "curator.batch", "finished",
+                        phase="final" if final else "incremental",
+                        round=batch_round, outcome=batch_outcome,
+                        duration_seconds=time.monotonic() - batch_started)
                 if not page.has_more:
                     break
             if final and more_pages:

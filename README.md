@@ -77,6 +77,10 @@ Schema version 12 removes the former local `memories` table and the `remember`, 
 
 The runtime persists a safe public snapshot of available capabilities. The first snapshot is silent; on later starts, or after an explicit programmatic registration/removal while running, additions, removals, and description/schema changes produce a normal `runtime` / `capabilities_changed` wake. Detection never invokes or tests a capability. Connectors may independently emit source-specific events when their visible world changes; Resident decides whether either kind of change warrants investigation or communication.
 
+### Latency timeline diagnostics
+
+Pass `--timeline` or set `RESIDENT_TIMELINE=true` to record opt-in structured `timeline` journal events. The timeline separates host queue wait, wake processing, provider preflight and rounds, local tool execution, HomeOps/display requests, Agents/Responses default-executor queue and worker time, Curator batches and tail, and event-loop lag aggregated per active wake. Agents HTTP operations retain monotonic span placement and inter-request gaps inside their lifecycle, including submission, polling/reconciliation, and item retrieval. Payloads contain safe identifiers, operation classes, timings, counts, configured timeouts, and outcomes; they exclude prompts, tool arguments or results, credentials, headers, request URLs, and attachment contents. `--verbose` also renders the records. Instrumentation does not change per-Resident serialization or Curator placement.
+
 ## Experimental HomeOps connector
 
 Set `RESIDENT_HOMEOPS_URL` (or pass `--homeops-url`) to opt into read-only HomeOps observation. With no URL configured, Resident makes no HomeOps requests. The connector silently establishes a baseline from `GET /api/measurements/latest`, then polls every 30 seconds and emits one wake containing all values changed during that poll. New measurement points count as changes; timestamp-only updates do not. Polling failures are retried without waking Resident or discarding the last successful baseline. These recoverable failures are shown with verbose diagnostics and suppressed in the default terminal mode.

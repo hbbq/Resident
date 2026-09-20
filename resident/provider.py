@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import Future
@@ -11,6 +12,11 @@ from typing import Any, Callable, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
 from .memory import SessionHistoryUnavailable, SessionItemPage
+from .observability import to_thread_timed
+
+
+_agents_http_trace: ContextVar[dict[str, Any] | None] = ContextVar(
+    "agents_http_trace", default=None)
 
 
 class ModelProvider(Protocol):
@@ -64,7 +70,7 @@ class OpenAIResponsesProvider:
             "store": False,
             "include": ["reasoning.encrypted_content"],
         }
-        raw = await asyncio.to_thread(self._post, body)
+        raw = await to_thread_timed("openai.responses_request", self._post, body)
         status = raw.get("status")
         if status not in (None, "completed"):
             error = raw.get("error") or raw.get("incomplete_details") or "no details"
@@ -426,10 +432,32 @@ class OpenAIAgentsProvider:
             return completed.result()
 
         lifecycle_token = self._lifecycle_writer.set(lifecycle_on_event_loop)
+        http_trace: dict[str, Any] = {
+            "lifecycle_started": time.monotonic(), "events": []}
+        trace_token = _agents_http_trace.set(http_trace)
+
+        def flush_http_trace() -> None:
+            from .observability import emit_timeline
+            previous_finished = http_trace["lifecycle_started"]
+            for event in http_trace["events"]:
+                started = event["started_monotonic_seconds"]
+                emit_timeline(
+                    "openai.agents_http", "finished",
+                    gap_since_previous_seconds=max(0.0, started - previous_finished),
+                    lifecycle_offset_seconds=max(
+                        0.0, started - http_trace["lifecycle_started"]),
+                    **event)
+                previous_finished = event["finished_monotonic_seconds"]
+
         try:
-            return await asyncio.to_thread(
-                self._respond_sync, context, tools, results, previous_response_id)
+            return await to_thread_timed(
+                "openai.agents_lifecycle", self._respond_sync,
+                context, tools, results, previous_response_id,
+                timeline_before_finished=flush_http_trace,
+                request=("tool_results" if results else "wake"),
+                tool_result_count=len(results), turn_id=previous_response_id)
         finally:
+            _agents_http_trace.reset(trace_token)
             self._lifecycle_writer.reset(lifecycle_token)
             self._binding_writer.reset(token)
 
@@ -1190,6 +1218,8 @@ class OpenAIAgentsProvider:
         request = urllib.request.Request(
             f"{self.base_url}{path}", data=data, method=method,
             headers=headers)
+        started = time.monotonic()
+        outcome = "ok"
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 payload = response.read()
@@ -1197,5 +1227,47 @@ class OpenAIAgentsProvider:
                     return {}
                 return json.loads(payload)
         except urllib.error.HTTPError as exc:
+            outcome = "error"
             detail = exc.read().decode(errors="replace")[:2000]
             raise RuntimeError(f"OpenAI Agents API returned HTTP {exc.code}: {detail}") from exc
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            trace = _agents_http_trace.get()
+            if trace is not None:
+                finished = time.monotonic()
+                trace["events"].append({
+                    "request": self._request_operation(method, path, body),
+                    "outcome": outcome,
+                    "duration_seconds": finished - started,
+                    "started_monotonic_seconds": started,
+                    "finished_monotonic_seconds": finished,
+                    "request_timeout_seconds": self.timeout_seconds,
+                })
+
+    @staticmethod
+    def _request_operation(method: str, path: str, body: dict | None) -> str:
+        """Classify an Agents request without retaining its URL or content."""
+        resource = path.split("?", 1)[0].rstrip("/")
+        if method == "POST" and resource == "/agents/sessions":
+            return "create_session"
+        if resource.endswith("/events"):
+            event_types = {
+                event.get("type") for event in (body or {}).get("events", [])
+                if isinstance(event, dict)
+            }
+            if event_types and event_types <= {"agent.session.input.tool_result"}:
+                return "submit_tool_results"
+            return "submit_wake"
+        if "/items" in resource:
+            return "retrieve_items"
+        if "/turns/" in resource:
+            return "poll_turn"
+        if resource.endswith("/turns"):
+            return "reconcile_turns"
+        if method == "GET":
+            return "poll_session"
+        if method == "PATCH":
+            return "update_session"
+        return "session_request"
