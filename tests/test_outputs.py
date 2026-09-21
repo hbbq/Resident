@@ -7,7 +7,8 @@ from pathlib import Path
 
 from resident.config import Config
 from resident.domain import ModelTurn, ToolCall, WakeEvent
-from resident.outputs import DeliveryPolicy, OutputCapability, output_schema, schema_fingerprint
+from resident.outputs import (DeliveryPolicy, OutputCapability, output_schema,
+                              schema_fingerprint, validate_disposition)
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
 
@@ -97,6 +98,44 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             Config(Path(temporary), **config), provider, capabilities=[],
             output_capabilities=outputs, owner_transport=transport,
             owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+    def test_zero_output_capabilities_produce_valid_silent_only_schema(self):
+        schema = output_schema([])
+        outputs = schema["properties"]["outputs"]
+        self.assertEqual(0, outputs["maxItems"])
+        self.assertEqual([{
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        }], outputs["items"]["anyOf"])
+        self.assertIsNone(validate_disposition({"outputs": []}, schema))
+        self.assertIsNotNone(validate_disposition(
+            {"outputs": [{"type": "display", "content": "not authorized"}]},
+            schema))
+
+    def test_output_schema_fingerprint_is_deterministic(self):
+        schema = output_schema([])
+        reordered = {
+            "additionalProperties": schema["additionalProperties"],
+            "required": schema["required"],
+            "properties": schema["properties"],
+            "type": schema["type"],
+        }
+        self.assertEqual(schema_fingerprint(schema), schema_fingerprint(reordered))
+
+    def test_nonempty_output_schema_shape_and_behavior_are_unchanged(self):
+        capability = display_capability("display1", [], max_length=40)
+        schema = output_schema([capability])
+        outputs = schema["properties"]["outputs"]
+        self.assertEqual(8, outputs["maxItems"])
+        self.assertEqual([capability.schema_branch()], outputs["items"]["anyOf"])
+        self.assertIsNone(validate_disposition({"outputs": [{
+            "type": "display", "target": "display1", "content": "hello",
+        }]}, schema))
+        self.assertIsNotNone(validate_disposition({"outputs": [{
+            "type": "display", "target": "display1", "content": "x" * 41,
+        }]}, schema))
 
     async def test_silent_disposition_is_durable_and_dispatches_nothing(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -521,13 +560,25 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
         reconstructed, _ = _create_request_configuration({
             "environment": {"type": "none"}, "agent": agent})
         self.assertEqual(protocol, reconstructed)
+
+    def test_managed_agent_supports_zero_output_protocol(self):
+        from resident.provider import OpenAIAgentsProvider
+        from resident.store import _create_request_configuration
         empty_schema = output_schema([])
+        fingerprint = schema_fingerprint(empty_schema)
+        provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
         provider.configure_output_protocol(
-            empty_schema, [], schema_fingerprint(empty_schema))
+            empty_schema, [], fingerprint)
         empty_agent = provider._agent_config([])
+        self.assertEqual({
+            "type": "json_schema", "name": "resident_final_disposition",
+            "schema": empty_schema, "strict": True,
+        }, empty_agent["text"]["format"])
+        protocol = provider._agent_protocol(empty_agent)
+        self.assertEqual(fingerprint, protocol["output_schema_fingerprint"])
         empty_reconstructed, _ = _create_request_configuration({
             "environment": {"type": "none"}, "agent": empty_agent})
-        self.assertEqual(provider._agent_protocol(empty_agent), empty_reconstructed)
+        self.assertEqual(protocol, empty_reconstructed)
 
     def test_output_schema_change_requires_rollover(self):
         from resident.provider import OpenAIAgentsProvider

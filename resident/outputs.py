@@ -72,13 +72,22 @@ class OutputCapability:
 
 def output_schema(capabilities: Sequence[OutputCapability]) -> dict[str, Any]:
     branches = [capability.schema_branch() for capability in capabilities]
+    max_items = 8
+    if not branches:
+        branches = [{
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        }]
+        max_items = 0
     return {
         "type": "object",
         "properties": {
             "outputs": {
                 "type": "array",
                 "items": {"anyOf": branches},
-                "maxItems": 8,
+                "maxItems": max_items,
             },
         },
         "required": ["outputs"],
