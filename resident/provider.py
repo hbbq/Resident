@@ -1451,9 +1451,7 @@ class OpenAIAgentsProvider:
         if self._output_schema is not None:
             agent["text"] = {"format": {
                 "type": "json_schema",
-                "name": "resident_final_disposition",
                 "schema": self._output_schema,
-                "strict": True,
             }}
         if self.reasoning_effort is not None:
             agent["reasoning"] = {"effort": self.reasoning_effort}
