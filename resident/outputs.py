@@ -72,22 +72,13 @@ class OutputCapability:
 
 def output_schema(capabilities: Sequence[OutputCapability]) -> dict[str, Any]:
     branches = [capability.schema_branch() for capability in capabilities]
-    max_items = 8
-    if not branches:
-        # Keep the Managed Agents supported nested-anyOf shape while making the
-        # empty capability set authorize only outputs: [].
-        branches = [{
-            "type": "object", "properties": {}, "required": [],
-            "additionalProperties": False,
-        }]
-        max_items = 0
     return {
         "type": "object",
         "properties": {
             "outputs": {
                 "type": "array",
                 "items": {"anyOf": branches},
-                "maxItems": max_items,
+                "maxItems": 8,
             },
         },
         "required": ["outputs"],
