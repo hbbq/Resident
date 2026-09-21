@@ -337,6 +337,75 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("FinalCatchUpIncomplete", request["last_error_type"])
             runtime.close()
 
+    async def test_startup_curator_keeps_request_when_target_spans_pages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime.store.request_curator_catch_up(
+                "openai_agents", "session-restarted", "turn-target")
+            second_page_started = asyncio.Event()
+            release_second_page = asyncio.Event()
+
+            class Source:
+                session_id = "session-restarted"
+
+                async def session_items(self, cursor, limit):
+                    if cursor is None:
+                        return SessionItemPage(({
+                            "id": "target-item-1", "type": "message", "role": "user",
+                            "turn_id": "turn-target", "content": [],
+                        },), "target-item-1", True)
+                    second_page_started.set()
+                    await release_second_page.wait()
+                    return SessionItemPage(({
+                        "id": "target-item-2", "type": "message", "role": "assistant",
+                        "turn_id": "turn-target", "content": [],
+                    },), "target-item-2", False)
+
+            class Model:
+                def __init__(self):
+                    self.item_ids = []
+
+                async def curate(self, session_id, items, existing, current_handover):
+                    self.item_ids.extend(item["id"] for item in items)
+                    return {"mutations": [], "handover": {"operation": "keep"}}
+
+            model = Model()
+            runtime.bind_curator(MemoryCurator(
+                runtime.store, Source(), model, max_batches=1))
+
+            startup = asyncio.create_task(
+                runtime.enqueue_startup_wakeups(asyncio.Queue()))
+            await second_page_started.wait()
+
+            self.assertFalse(
+                startup.done(),
+                "incomplete target turn must not release the startup barrier")
+            request = runtime.store.curator_request(
+                "openai_agents", Source.session_id)
+            self.assertIsNotNone(request)
+            self.assertEqual("turn-target", request["target_turn_id"])
+            self.assertEqual(2, request["attempts"])
+            self.assertEqual("FinalCatchUpIncomplete", request["last_error_type"])
+            checkpoint = runtime.store.curator_checkpoint(
+                "openai_agents", Source.session_id)
+            self.assertEqual(("target-item-1", "turn-target"), (
+                checkpoint["cursor"], checkpoint["last_turn_id"]))
+
+            release_second_page.set()
+            await startup
+
+            self.assertEqual(["target-item-1", "target-item-2"], model.item_ids)
+            self.assertIsNone(runtime.store.curator_request(
+                "openai_agents", Source.session_id))
+            checkpoint = runtime.store.curator_checkpoint(
+                "openai_agents", Source.session_id)
+            self.assertEqual(("target-item-2", "turn-target"), (
+                checkpoint["cursor"], checkpoint["last_turn_id"]))
+            await runtime.stop_background_services()
+            runtime.close()
+
     async def test_startup_curator_does_not_advance_past_exact_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(

@@ -340,9 +340,6 @@ class ResidentRuntime:
         stalled_attempts = 0
         while True:
             checkpoint = self.store.curator_checkpoint(provider, session_id)
-            if checkpoint is not None and checkpoint.get("last_turn_id") == target:
-                self.store.complete_curator_request(provider, session_id, target)
-                return
             before = None if checkpoint is None else (
                 checkpoint.get("cursor"), checkpoint.get("last_turn_id"))
             attempt = self.store.start_curator_request(provider, session_id, target)
@@ -360,9 +357,6 @@ class ResidentRuntime:
                 raise
             except Exception as exc:
                 checkpoint = self.store.curator_checkpoint(provider, session_id)
-                if checkpoint is not None and checkpoint.get("last_turn_id") == target:
-                    self.store.complete_curator_request(provider, session_id, target)
-                    return
                 after = None if checkpoint is None else (
                     checkpoint.get("cursor"), checkpoint.get("last_turn_id"))
                 progressed = after is not None and after != before
