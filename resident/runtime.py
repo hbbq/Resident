@@ -73,6 +73,22 @@ class ResidentRuntime:
                 self.store.begin_agent_tool_action,
                 self.store.complete_agent_tool_action,
             )
+        bind_wake_store = getattr(provider, "bind_wake_submission_store", None)
+        if bind_wake_store is not None:
+            bind_wake_store(
+                lambda session_id, wake_key: self.store.agent_wake_submission(
+                    "openai_agents", session_id, wake_key),
+                lambda session_id, wake_key, correlation:
+                    self.store.mark_agent_wake_submission_attempted(
+                        "openai_agents", session_id, wake_key, correlation),
+                lambda session_id, wake_key, turn_id:
+                    self.store.correlate_agent_wake_submission(
+                        "openai_agents", session_id, wake_key, turn_id),
+                lambda session_id, turn_id: self.store.settle_agent_wake_submission(
+                    "openai_agents", session_id, turn_id),
+                lambda session_id, wake_key: self.store.clear_agent_wake_submission(
+                    "openai_agents", session_id, wake_key),
+            )
         bind_lifecycle_store = getattr(provider, "bind_lifecycle_store", None)
         if bind_lifecycle_store is not None:
             self.store.recover_session_rollovers("openai_agents")

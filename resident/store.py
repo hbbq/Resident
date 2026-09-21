@@ -199,6 +199,12 @@ class Store:
           output_json TEXT, attachments_ephemeral INTEGER NOT NULL DEFAULT 0
             CHECK(attachments_ephemeral IN (0,1)), created_at TEXT NOT NULL, completed_at TEXT,
           PRIMARY KEY(provider,session_id,call_id));
+        CREATE TABLE IF NOT EXISTS agent_wake_submissions(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, wake_key TEXT NOT NULL,
+          correlation TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('possibly_accepted','settled')),
+          turn_id TEXT, attempted_at TEXT NOT NULL, settled_at TEXT,
+          PRIMARY KEY(provider,session_id,wake_key));
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_wake_runs_started ON wake_runs(started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_journal_run_sequence ON journal(run_id, sequence);
@@ -322,7 +328,7 @@ class Store:
                     json.dumps(mutable, sort_keys=True, separators=(",", ":")),
                     row["id"],
                 ))
-        self.connection.execute("UPDATE schema_version SET version=17")
+        self.connection.execute("UPDATE schema_version SET version=18")
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -385,6 +391,59 @@ class Store:
                   session_id=excluded.session_id, agent_id=excluded.agent_id,
                   last_turn_id=excluded.last_turn_id, updated_at=excluded.updated_at
             """, (provider, session_id, agent_id, last_turn_id, now, now))
+
+    def agent_wake_submission(self, provider: str, session_id: str,
+                              wake_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT provider,session_id,wake_key,correlation,state,turn_id,
+                   attempted_at,settled_at
+            FROM agent_wake_submissions
+            WHERE provider=? AND session_id=? AND wake_key=?
+        """, (provider, session_id, wake_key)).fetchone()
+        return None if row is None else dict(row)
+
+    def mark_agent_wake_submission_attempted(self, provider: str, session_id: str,
+                                             wake_key: str,
+                                             correlation: str) -> None:
+        """Durably cross the point of no blind retry before the remote POST."""
+        now = utc_now()
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO agent_wake_submissions(
+                  provider,session_id,wake_key,correlation,state,turn_id,
+                  attempted_at,settled_at)
+                VALUES(?,?,?,?,'possibly_accepted',NULL,?,NULL)
+                ON CONFLICT(provider,session_id,wake_key) DO UPDATE SET
+                  correlation=excluded.correlation,state='possibly_accepted',
+                  turn_id=NULL,attempted_at=excluded.attempted_at,settled_at=NULL
+            """, (provider, session_id, wake_key, correlation, now))
+
+    def correlate_agent_wake_submission(self, provider: str, session_id: str,
+                                        wake_key: str, turn_id: str) -> None:
+        with self.connection:
+            cursor = self.connection.execute("""
+                UPDATE agent_wake_submissions SET turn_id=?
+                WHERE provider=? AND session_id=? AND wake_key=?
+                  AND state='possibly_accepted'
+            """, (turn_id, provider, session_id, wake_key))
+            if cursor.rowcount != 1:
+                raise RuntimeError("Agents wake submission checkpoint is missing")
+
+    def settle_agent_wake_submission(self, provider: str, session_id: str,
+                                     turn_id: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE agent_wake_submissions SET state='settled',settled_at=?
+                WHERE provider=? AND session_id=? AND turn_id=?
+            """, (utc_now(), provider, session_id, turn_id))
+
+    def clear_agent_wake_submission(self, provider: str, session_id: str,
+                                    wake_key: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                DELETE FROM agent_wake_submissions
+                WHERE provider=? AND session_id=? AND wake_key=?
+            """, (provider, session_id, wake_key))
 
     def bind_initial_agent_session(self, provider: str, session_id: str,
                                    agent_id: str | None,
