@@ -609,6 +609,39 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                        "tool-result-secret"):
             self.assertNotIn(secret, serialized)
 
+    async def test_agents_output_conflict_diagnostics_are_specific_and_payload_safe(self):
+        provider = OpenAIAgentsProvider("test-key", "model")
+        provider._wait_for_turn = lambda *_args: ModelTurn(
+            "private-turn", message="private body")
+        reasons = (
+            "output_item_identity_conflict",
+            "output_item_type_conflict",
+            "output_item_role_conflict",
+            "output_item_index_conflict",
+            "output_item_done_without_added",
+        )
+        events = []
+        token = timeline_reporter.set(events.append)
+        try:
+            for reason in reasons:
+                provider._respond_sync = (
+                    lambda *_args, current_reason=reason: provider._fallback_wait(
+                        "private-session", "private-turn", None, None,
+                        current_reason))
+                await provider.respond("private prompt", [], [])
+        finally:
+            timeline_reporter.reset(token)
+
+        fallbacks = [event for event in events
+                     if event["operation"] == "openai.agents_fallback"]
+        self.assertEqual(list(reasons), [event["validation_reason"]
+                                         for event in fallbacks])
+        self.assertTrue(all(event["failure_kind"] == "semantic_uncertainty"
+                            for event in fallbacks))
+        serialized = json.dumps(fallbacks)
+        for secret in ("private-session", "private-turn", "private body"):
+            self.assertNotIn(secret, serialized)
+
     def test_agents_sse_stall_near_deadline_uses_only_remaining_timeout(self):
         clock = [100.0]
 
@@ -3913,9 +3946,23 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             "session-1", iter(tool_round(0, "1")), expected_turn_id="turn-1",
             correlation=None, wake_key=None)
         provider._consume_event_stream(
-            "session-1", iter(tool_round(1, "2")), expected_turn_id="turn-1",
+            "session-1", iter([
+                *tool_round(0, "1")[:2],
+                *tool_round(1, "2"),
+            ]), expected_turn_id="turn-1",
             correlation=None, wake_key=None)
         final = provider._consume_event_stream("session-1", iter([{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 1,
+            "item": {"id": "function-2", "type": "function_call",
+                     "turn_id": "turn-1", "status": "in_progress"},
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 1,
+            "item": {"id": "function-2", "type": "function_call",
+                     "turn_id": "turn-1", "status": "completed",
+                     "arguments": {"richer": True}},
+        }, {
             "type": "agent.session.turn.item.added", "session_id": "session-1",
             "turn_id": "turn-1", "output_index": 2,
             "item": {"id": "message-1", "type": "message", "role": "assistant",
@@ -3932,6 +3979,95 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         }]), expected_turn_id="turn-1", correlation=None, wake_key=None)
 
         self.assertEqual("round three", final.message)
+
+    def test_agents_stream_repeated_item_added_is_idempotent(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        added = {
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0,
+            "item": {"id": "function-1", "type": "function_call",
+                     "turn_id": "turn-1", "status": "in_progress"},
+        }
+        action = provider._consume_event_stream("session-1", iter([
+            added, {**added, "item": {**added["item"], "status": "completed",
+                                      "arguments": {"ignored": True}}}, {
+                "type": "agent.session.turn.item.done", "session_id": "session-1",
+                "turn_id": "turn-1", "output_index": 0,
+                "item": {**added["item"], "status": "completed"},
+            }, {
+                "type": "agent.session.requires_action", "session": {
+                    "id": "session-1", "required_actions": [{
+                        "type": "function_call", "turn_id": "turn-1",
+                        "call_id": "call-1", "name": "clock", "arguments": {},
+                    }],
+                },
+            },
+        ]), expected_turn_id="turn-1", correlation=None, wake_key=None)
+
+        self.assertEqual(("call-1",), tuple(call.id for call in action.tool_calls))
+
+    def test_agents_stream_repeated_item_added_rejects_stable_conflicts(self):
+        base_item = {
+            "id": "item-1", "type": "message", "role": "assistant",
+            "turn_id": "turn-1", "status": "in_progress", "content": [],
+        }
+        cases = (
+            ("output_item_identity_conflict", {**base_item, "id": "item-2"}, 0),
+            ("output_item_type_conflict", {**base_item, "type": "reasoning"}, 0),
+            ("output_item_role_conflict", {**base_item, "role": "user"}, 0),
+            ("output_item_index_conflict", base_item, 1),
+        )
+        for reason, conflicting_item, conflicting_index in cases:
+            with self.subTest(reason=reason):
+                provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+                events = [{
+                    "type": "agent.session.turn.item.added",
+                    "session_id": "session-1", "turn_id": "turn-1",
+                    "output_index": 0, "item": base_item,
+                }, {
+                    "type": "agent.session.turn.item.added",
+                    "session_id": "session-1", "turn_id": "turn-1",
+                    "output_index": conflicting_index, "item": conflicting_item,
+                }]
+                with self.assertRaisesRegex(ValueError, reason):
+                    provider._consume_event_stream(
+                        "session-1", iter(events), expected_turn_id="turn-1",
+                        correlation=None, wake_key=None)
+
+    def test_agents_stream_item_done_can_complete_and_refresh_payload(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        identity = {
+            "id": "message-1", "type": "message", "role": "assistant",
+            "turn_id": "turn-1",
+        }
+        events = [{
+            "type": "agent.session.turn.item.added", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0,
+            "item": {**identity, "status": "in_progress", "content": []},
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0,
+            "item": {**identity, "status": "incomplete", "content": []},
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0,
+            "item": {**identity, "status": "completed", "content": [
+                {"type": "output_text", "text": "richer completion"}]},
+        }, {
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0,
+            "item": {**identity, "status": "completed", "content": [
+                {"type": "output_text", "text": "richer completion"}]},
+        }, {
+            "type": "agent.session.turn.completed", "session_id": "session-1",
+            "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"},
+        }]
+
+        turn = provider._consume_event_stream(
+            "session-1", iter(events), expected_turn_id="turn-1",
+            correlation=None, wake_key=None)
+
+        self.assertEqual("richer completion", turn.message)
 
     def test_agents_stream_preserves_pre_tool_assistant_output(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
@@ -3983,13 +4119,74 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("exact", turn.message)
         self.assertEqual([False], observed)
 
+    def test_agents_lost_reducer_state_continuation_opens_no_stream(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._ensure_session = lambda *_args, **_kwargs: (
+            {"id": "session-1", "status": "requires_action"}, False)
+        submitted = []
+        provider._submit_events = lambda *_args: submitted.append("submitted")
+        provider._open_event_stream = lambda *_args: self.fail(
+            "lost reducer state must not open an SSE stream")
+        provider._wait_for_turn = lambda *_args: ModelTurn("turn-1", message="exact")
+
+        turn = provider._respond_sync(
+            "wake", [], [ToolResult("call-1", {"ok": True})], "turn-1")
+
+        self.assertEqual("exact", turn.message)
+        self.assertEqual(["submitted"], submitted)
+
+    def test_agents_stream_fallback_is_sticky_for_later_tool_rounds(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._stream_states["turn-1"] = type(
+            "StreamState", (), {"unknown_event_count": 0})()
+        wait_results = iter((
+            ModelTurn("turn-1", tool_calls=(ToolCall("call-2", "clock", {}),)),
+            ModelTurn("turn-1", message="settled exactly"),
+        ))
+        provider._wait_for_turn = lambda *_args: next(wait_results)
+
+        action = provider._fallback_wait(
+            "session-1", "turn-1", None, None,
+            "output_item_identity_conflict")
+        self.assertEqual(("call-2",), tuple(call.id for call in action.tool_calls))
+        self.assertIn("turn-1", provider._exact_only_turns)
+        self.assertNotIn("turn-1", provider._stream_states)
+
+        provider._ensure_session = lambda *_args, **_kwargs: (
+            {"id": "session-1", "status": "requires_action"}, False)
+        submitted = []
+        provider._submit_events = lambda *_args: submitted.append("submitted")
+        provider._open_event_stream = lambda *_args: self.fail(
+            "an exact-only turn must not open another SSE stream")
+        provider._fallback_wait = lambda *_args: self.fail(
+            "an exact-only turn should reconcile directly, not report a new fallback")
+
+        completed = provider._respond_sync(
+            "wake", [], [ToolResult("call-2", {"ok": True})], "turn-1")
+
+        self.assertEqual("settled exactly", completed.message)
+        self.assertEqual(["submitted"], submitted)
+
     def test_agents_discard_continuation_discards_stream_reducer_state(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
         provider._stream_states["turn-1"] = object()
+        provider._exact_only_turns.add("turn-1")
 
         provider.discard_continuation("turn-1")
 
         self.assertNotIn("turn-1", provider._stream_states)
+        self.assertNotIn("turn-1", provider._exact_only_turns)
+
+    def test_agents_completed_turn_clears_exact_only_marker(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider._exact_only_turns.add("turn-1")
+
+        turn = provider._completed_turn(
+            "session-1", {}, {"id": "turn-1", "status": "completed"},
+            streamed_message="done")
+
+        self.assertEqual("done", turn.message)
+        self.assertNotIn("turn-1", provider._exact_only_turns)
 
     def test_agents_known_irrelevant_and_unknown_events_are_ignored(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
@@ -4145,6 +4342,22 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "turn_id": "turn-1", "status": "in_progress", "content": [],
             },
         } for item_id in ("output-1", "output-conflict")]
+
+        turn, requests = self._agents_stream_completion(events)
+
+        self.assertEqual("reconciled", turn.message)
+        self.assertIn(("GET", "/agents/sessions/session-1/items?order=desc&limit=100"),
+                      requests)
+
+    def test_agents_stream_item_done_without_added_uses_exact_items(self):
+        events = [{
+            "type": "agent.session.turn.item.done", "session_id": "session-1",
+            "turn_id": "turn-1", "output_index": 0, "item": {
+                "id": "output-1", "type": "message", "role": "assistant",
+                "turn_id": "turn-1", "status": "completed",
+                "content": [{"type": "output_text", "text": "untrusted"}],
+            },
+        }]
 
         turn, requests = self._agents_stream_completion(events)
 

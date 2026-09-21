@@ -42,8 +42,10 @@ class _AgentsStreamSemanticError(ValueError):
 @dataclass
 class _AgentsTurnStreamState:
     output_items: dict[int, tuple[object, object, object]] = field(default_factory=dict)
+    item_indexes: dict[str, int] = field(default_factory=dict)
     completed_output_indexes: set[int] = field(default_factory=set)
     messages: dict[int, list[str]] = field(default_factory=dict)
+    unusable_message_indexes: set[int] = field(default_factory=set)
     saw_complete_message: bool = False
     assistant_content_usable: bool = True
     unknown_event_count: int = 0
@@ -187,6 +189,7 @@ class OpenAIAgentsProvider:
         self._submitted_call_ids: dict[str, set[str]] = {}
         self._pending_wakes: dict[str, tuple[str, str, str]] = {}
         self._stream_states: dict[str, _AgentsTurnStreamState] = {}
+        self._exact_only_turns: set[str] = set()
         self._local_wake_submissions: dict[tuple[str, str], dict[str, Any]] = {}
         self._load_wake_submission: Callable[[str, str], dict | None] = (
             lambda session_id, wake_key:
@@ -366,6 +369,7 @@ class OpenAIAgentsProvider:
         self._preflight_session_status = None
         self._confirmed_rollover_session = None
         self._stream_states.clear()
+        self._exact_only_turns.clear()
         if self._requested_rollover_reason is None:
             self._requested_rollover_reason = reason
 
@@ -541,6 +545,7 @@ class OpenAIAgentsProvider:
         # abandons the connection-local proof accumulated by this process. The
         # next attempt reconciles the exact turn instead of trusting it.
         self._stream_states.pop(continuation_id, None)
+        self._exact_only_turns.discard(continuation_id)
 
     def _respond_sync(self, context: str, tools: Sequence[ToolSpec], results: Sequence[ToolResult],
                       previous_response_id: str | None) -> ModelTurn:
@@ -558,9 +563,11 @@ class OpenAIAgentsProvider:
                 self._submitted_call_ids.setdefault(turn_id, set()).update(
                     result.call_id for result in results)
 
-            # Reducer state is intentionally transient. After restart, submit
-            # the idempotent tool result but trust only exact REST recovery.
-            accept_stream = turn_id in self._stream_states
+            # Reducer state is intentionally transient. After restart, or after
+            # this turn has fallen back once, submit the idempotent result and
+            # trust only exact REST recovery for the rest of the turn.
+            accept_stream = (turn_id in self._stream_states
+                             and turn_id not in self._exact_only_turns)
             turn = self._submit_and_stream(
                 session_id, submit_results, expected_turn_id=turn_id,
                 accept_stream=accept_stream)
@@ -672,6 +679,20 @@ class OpenAIAgentsProvider:
                            wake_key: str | None = None,
                            accept_stream: bool = True) -> ModelTurn:
         """Open a live stream before submission, falling back on uncertainty."""
+        if not accept_stream:
+            try:
+                submit()
+            except Exception as exc:
+                if self._submission_was_definitively_rejected(exc):
+                    raise
+                return self._fallback_wait(
+                    session_id, expected_turn_id, correlation, wake_key,
+                    self._stream_fallback_reason(exc))
+            if expected_turn_id in self._exact_only_turns:
+                return self._wait_for_turn(session_id, expected_turn_id)
+            return self._fallback_wait(
+                session_id, expected_turn_id, correlation, wake_key,
+                "reducer_state_unavailable")
         if "_request" in self.__dict__ and "_open_event_stream" not in self.__dict__:
             # Existing request-level test doubles model the reconciliation path.
             try:
@@ -689,21 +710,19 @@ class OpenAIAgentsProvider:
             with self._open_event_stream(session_id) as events:
                 submission_started = True
                 submit()
-                if not accept_stream:
-                    return self._fallback_wait(
-                        session_id, expected_turn_id, correlation, wake_key,
-                        "reducer_state_unavailable")
                 return self._consume_event_stream(
                     session_id, events, expected_turn_id=expected_turn_id,
                     correlation=correlation, wake_key=wake_key)
         except _AgentsStreamTerminalError:
             if expected_turn_id:
                 self._stream_states.pop(expected_turn_id, None)
+                self._exact_only_turns.discard(expected_turn_id)
             elif wake_key is not None:
                 submission = self._lifecycle_call(
                     self._load_wake_submission, session_id, wake_key)
                 if submission and submission.get("turn_id"):
                     self._stream_states.pop(submission["turn_id"], None)
+                    self._exact_only_turns.discard(submission["turn_id"])
             raise
         except Exception as exc:
             if submission_started:
@@ -750,7 +769,10 @@ class OpenAIAgentsProvider:
         failure_kind = ("parser_failure" if reason.startswith("sse_")
                         else "semantic_uncertainty" if reason in {
                             "session_identity_mismatch", "turn_identity_conflict",
-                            "output_index_gap", "output_metadata_conflict",
+                            "output_index_gap", "output_item_shape_invalid",
+                            "output_item_id_missing", "output_item_identity_conflict",
+                            "output_item_type_conflict", "output_item_role_conflict",
+                            "output_item_index_conflict", "output_item_done_without_added",
                             "assistant_content_unusable",
                             "required_action_turn_mismatch", "terminal_shape_invalid",
                             "reducer_state_unavailable", "stream_semantic_uncertainty"}
@@ -763,14 +785,45 @@ class OpenAIAgentsProvider:
                                  or correlated_turn_id is not None),
             unknown_event_count=state.unknown_event_count if state else 0)
         if expected_turn_id:
+            self._exact_only_turns.add(expected_turn_id)
             self._stream_states.pop(expected_turn_id, None)
         elif correlated_turn_id is not None:
+            self._exact_only_turns.add(correlated_turn_id)
             self._stream_states.pop(correlated_turn_id, None)
         if expected_turn_id:
             return self._wait_for_turn(session_id, expected_turn_id)
         if correlation is None or wake_key is None:
             raise RuntimeError("Agents stream fallback lacks wake correlation")
-        return self._wait_for_submitted_wake(session_id, correlation, wake_key)
+        turn = self._wait_for_submitted_wake(session_id, correlation, wake_key)
+        if turn.tool_calls:
+            self._exact_only_turns.add(turn.response_id)
+            self._stream_states.pop(turn.response_id, None)
+        return turn
+
+    @staticmethod
+    def _output_item_identity(item: dict) -> tuple[str, object, object]:
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            raise _AgentsStreamSemanticError("output_item_id_missing")
+        item_type = item.get("type")
+        if not isinstance(item_type, str) or not item_type:
+            raise _AgentsStreamSemanticError("output_item_shape_invalid")
+        role = item.get("role") if item_type == "message" else None
+        if item_type == "message":
+            if role not in ("assistant", "user"):
+                raise _AgentsStreamSemanticError("output_item_shape_invalid")
+        return item_id, item_type, role
+
+    @staticmethod
+    def _validate_output_item_identity(
+            previous: tuple[object, object, object],
+            current: tuple[object, object, object]) -> None:
+        if previous[0] != current[0]:
+            raise _AgentsStreamSemanticError("output_item_identity_conflict")
+        if previous[1] != current[1]:
+            raise _AgentsStreamSemanticError("output_item_type_conflict")
+        if previous[2] != current[2]:
+            raise _AgentsStreamSemanticError("output_item_role_conflict")
 
     def _consume_event_stream(self, session_id: str, events: Iterator[dict], *,
                               expected_turn_id: str | None,
@@ -804,7 +857,7 @@ class OpenAIAgentsProvider:
                 item = event.get("item")
                 if not isinstance(item, dict):
                     if turn_id is not None and event_turn_id == turn_id:
-                        raise _AgentsStreamSemanticError("output_metadata_conflict")
+                        raise _AgentsStreamSemanticError("output_item_shape_invalid")
                     continue
                 item_turn_id = item.get("turn_id")
                 if (event_turn_id is not None and item_turn_id is not None
@@ -831,15 +884,18 @@ class OpenAIAgentsProvider:
                 if (not isinstance(output_index, int) or isinstance(output_index, bool)
                         or output_index < 0):
                     raise _AgentsStreamSemanticError("output_index_gap")
-                if output_index in state.output_items:
-                    raise _AgentsStreamSemanticError("output_metadata_conflict")
+                metadata = self._output_item_identity(item)
+                previous_index = state.item_indexes.get(metadata[0])
+                if previous_index is not None and previous_index != output_index:
+                    raise _AgentsStreamSemanticError("output_item_index_conflict")
+                previous = state.output_items.get(output_index)
+                if previous is not None:
+                    self._validate_output_item_identity(previous, metadata)
+                    continue
                 if output_index != len(state.output_items):
                     raise _AgentsStreamSemanticError("output_index_gap")
-                item_id = item.get("id")
-                if not isinstance(item_id, str) or not item_id:
-                    raise _AgentsStreamSemanticError("output_metadata_conflict")
-                state.output_items[output_index] = (
-                    item_id, item.get("type"), item.get("role"))
+                state.output_items[output_index] = metadata
+                state.item_indexes[metadata[0]] = output_index
                 continue
             if event_type == "agent.session.requires_action":
                 session = event.get("session")
@@ -866,7 +922,7 @@ class OpenAIAgentsProvider:
                 item = event.get("item")
                 if not isinstance(item, dict):
                     if event_turn_id == turn_id:
-                        raise _AgentsStreamSemanticError("output_metadata_conflict")
+                        raise _AgentsStreamSemanticError("output_item_shape_invalid")
                     continue
                 item_turn_id = item.get("turn_id")
                 if (event_turn_id is not None and item_turn_id is not None
@@ -877,37 +933,48 @@ class OpenAIAgentsProvider:
                 if item_event_turn_id != turn_id:
                     continue
                 output_index = event.get("output_index")
-                if output_index is None and item.get("role") != "assistant":
-                    continue
+                if output_index is None:
+                    raise _AgentsStreamSemanticError("output_item_done_without_added")
                 if (not isinstance(output_index, int) or isinstance(output_index, bool)
                         or output_index < 0):
                     raise _AgentsStreamSemanticError("output_index_gap")
-                if output_index in state.completed_output_indexes:
-                    raise _AgentsStreamSemanticError("output_metadata_conflict")
-                metadata = (item.get("id"), item.get("type"), item.get("role"))
-                if state.output_items.get(output_index) != metadata:
-                    raise _AgentsStreamSemanticError("output_metadata_conflict")
+                metadata = self._output_item_identity(item)
+                previous_index = state.item_indexes.get(metadata[0])
+                if previous_index is not None and previous_index != output_index:
+                    raise _AgentsStreamSemanticError("output_item_index_conflict")
+                previous = state.output_items.get(output_index)
+                if previous is None:
+                    raise _AgentsStreamSemanticError("output_item_done_without_added")
+                self._validate_output_item_identity(previous, metadata)
                 state.completed_output_indexes.add(output_index)
                 if item.get("type") == "message" and item.get("role") == "assistant":
                     if item.get("status") != "completed":
-                        state.assistant_content_usable = False
+                        state.messages.pop(output_index, None)
+                        state.unusable_message_indexes.add(output_index)
                         continue
                     content = item.get("content")
                     if not isinstance(content, list):
-                        state.assistant_content_usable = False
+                        state.messages.pop(output_index, None)
+                        state.unusable_message_indexes.add(output_index)
                         continue
                     texts = []
+                    usable = True
                     for part in content:
                         if not isinstance(part, dict) or part.get("type") != "output_text":
-                            state.assistant_content_usable = False
+                            usable = False
                             continue
                         text = part.get("text")
                         if not isinstance(text, str):
-                            state.assistant_content_usable = False
+                            usable = False
                             continue
                         if text:
                             texts.append(text)
+                    if not usable:
+                        state.messages.pop(output_index, None)
+                        state.unusable_message_indexes.add(output_index)
+                        continue
                     state.messages[output_index] = texts
+                    state.unusable_message_indexes.discard(output_index)
                     state.saw_complete_message = True
                 continue
             if event_type == "agent.session.turn.completed" and event_turn_id == turn_id:
@@ -918,7 +985,8 @@ class OpenAIAgentsProvider:
                 if event.get("usage") is not None:
                     turn = {**turn, "usage": event["usage"]}
                 message: object = _STREAM_MESSAGE_MISSING
-                if not state.assistant_content_usable:
+                if (not state.assistant_content_usable
+                        or state.unusable_message_indexes):
                     raise _AgentsStreamSemanticError("assistant_content_unusable")
                 if (state.saw_complete_message and state.output_items
                         and state.completed_output_indexes == set(state.output_items)):
@@ -928,6 +996,7 @@ class OpenAIAgentsProvider:
                 elif state.output_items:
                     raise _AgentsStreamSemanticError("assistant_content_unusable")
                 self._stream_states.pop(turn_id, None)
+                self._exact_only_turns.discard(turn_id)
                 return self._completed_turn(
                     session_id, {}, turn, streamed_message=message)
             if event_type in ("agent.session.turn.failed", "agent.session.turn.cancelled"):
@@ -940,9 +1009,11 @@ class OpenAIAgentsProvider:
                     raise _AgentsStreamSemanticError("terminal_shape_invalid")
                 if event_type.endswith("failed"):
                     self._stream_states.pop(turn_id, None)
+                    self._exact_only_turns.discard(turn_id)
                     raise _AgentsStreamTerminalError(
                         f"OpenAI Agents turn failed: {turn.get('error') or 'no details'}")
                 self._stream_states.pop(turn_id, None)
+                self._exact_only_turns.discard(turn_id)
                 raise _AgentsStreamTerminalError("OpenAI Agents turn was cancelled")
             if event_type == "agent.session.failed":
                 session = (event.get("session")
@@ -955,6 +1026,7 @@ class OpenAIAgentsProvider:
                         or any(identity != session_id for identity in event_session_ids)):
                     continue
                 self._stream_states.clear()
+                self._exact_only_turns.clear()
                 raise _AgentsStreamTerminalError(
                     f"OpenAI Agents session failed: "
                     f"{event.get('error') or session.get('error') or 'no details'}")
@@ -1163,6 +1235,7 @@ class OpenAIAgentsProvider:
         self._session_id = session_id
         self._last_turn_id = None
         self._stream_states.clear()
+        self._exact_only_turns.clear()
         self._tool_fingerprint = fingerprint
         self._protocol_descriptor = desired_protocol
         self._mutable_settings_descriptor = mutable_settings
@@ -1210,6 +1283,7 @@ class OpenAIAgentsProvider:
             self._requested_rollover_reason = None
             self._session_id, self._last_turn_id = session_id, None
             self._stream_states.clear()
+            self._exact_only_turns.clear()
             self._pending_binding = None
             self._protocol_descriptor = persisted_descriptor
             self._mutable_settings_descriptor = persisted_mutable
@@ -1280,6 +1354,7 @@ class OpenAIAgentsProvider:
                     finalization_status)
             self._session_id, self._last_turn_id = new_session_id, None
             self._stream_states.clear()
+            self._exact_only_turns.clear()
             self._unavailable_session_id = None
             self._unavailable_session_reason = None
             self._requested_rollover_reason = (
@@ -1466,6 +1541,7 @@ class OpenAIAgentsProvider:
         # settled, so a crash can only leave conservative recovery work behind.
         self._lifecycle_call(self._settle_wake_turn, session_id, turn_id)
         self._stream_states.pop(turn_id, None)
+        self._exact_only_turns.discard(turn_id)
         usage = turn.get("usage") or session.get("usage") or {}
         return ModelTurn(turn_id, message=message if isinstance(message, str) else None,
                          input_tokens=usage.get("input_tokens"),
