@@ -133,6 +133,47 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             "test", "Test connector", name, description,
             {"type": "object", "properties": {}, "additionalProperties": False}, handler)
 
+    async def test_routine_curator_does_not_block_later_managed_wake(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = ManagedRecordingProvider()
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            release = asyncio.Event()
+
+            class Source:
+                session_id = "session-existing"
+
+            class BlockingCurator:
+                source = Source()
+
+                def __init__(self):
+                    self.started = asyncio.Event()
+                    self.targets = []
+
+                async def catch_up(self, *, final=False, through_turn_id=None,
+                                   session_id=None):
+                    self.targets.append(through_turn_id)
+                    self.started.set()
+                    await release.wait()
+
+            curator = BlockingCurator()
+            runtime.bind_curator(curator)
+            runtime._curator_coordinator.start()
+            await runtime.process(WakeEvent(
+                "first", "scheduler", "first", utc_now(), {}))
+            await curator.started.wait()
+
+            await asyncio.wait_for(runtime.process(WakeEvent(
+                "second", "scheduler", "second", utc_now(), {})), timeout=.5)
+            request = runtime.store.curator_request(
+                "openai_agents", "session-existing")
+            self.assertEqual("turn-2", request["target_turn_id"])
+
+            release.set()
+            await runtime.stop_background_services()
+            runtime.close()
+
     async def test_standing_owner_guidance_requires_canonical_owner_message_authority(self):
         class GuidanceProvider:
             def __init__(self):
@@ -2892,7 +2933,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(handover)
             self.assertEqual("session-old", first_provider.session_id)
             self.assertEqual(0, len(creates))
-            self.assertEqual([False], first_curator.calls)
+            self.assertEqual([], first_curator.calls)
             self.assertNotIn("new_session_bootstrap", json.loads(submitted_contexts[0]))
             stale_handover_id = store.create_handover(
                 "session-old", "stale handover prepared before deferred activity",
@@ -3238,7 +3279,7 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
             await runtime.process(WakeEvent(
                 "wake-terminal", "scheduler", "due", utc_now(), {}))
 
-            self.assertEqual([True, False], curator.calls)
+            self.assertEqual([True], curator.calls)
             self.assertEqual(1, len(creates))
             bootstrap = json.loads(creates[0]["input"])["new_session_bootstrap"]
             self.assertEqual("authoritative final handover", bootstrap["handover"])

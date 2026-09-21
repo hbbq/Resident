@@ -47,6 +47,102 @@ class CallbackOwnerTransport:
         self.callback(content)
 
 
+class CuratorCoordinator:
+    """One durable, coalescing routine-curation stream for a Resident."""
+
+    def __init__(self, runtime: "ResidentRuntime"):
+        self.runtime = runtime
+        self._signal = asyncio.Event()
+        self._stop = False
+        self._task: asyncio.Task[None] | None = None
+        self._run_lock = asyncio.Lock()
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._stop = False
+            self._task = asyncio.create_task(self._run(), name="resident-curator")
+
+    def signal(self) -> None:
+        self._signal.set()
+
+    async def barrier(self, *, final: bool = False) -> str | None:
+        curator = self.runtime.curator
+        if curator is None:
+            return None
+        async with self._run_lock:
+            session_id = getattr(getattr(curator, "source", None), "session_id", None)
+            handover = await curator.catch_up(final=final)
+            if session_id:
+                self.runtime.store.complete_curator_request("openai_agents", session_id)
+            return handover
+
+    async def stop(self, grace_seconds: float = 2.0) -> None:
+        self._stop = True
+        self._signal.set()
+        task = self._task
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=grace_seconds)
+        except TimeoutError:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        finally:
+            self._task = None
+
+    def cancel(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+
+    async def _run(self) -> None:
+        while not self._stop:
+            curator = self.runtime.curator
+            session_id = (getattr(getattr(curator, "source", None), "session_id", None)
+                          if curator else None)
+            request = (self.runtime.store.curator_request("openai_agents", session_id)
+                       if session_id else None)
+            if request is None:
+                self._signal.clear()
+                await self._signal.wait()
+                continue
+            retry_at = request.get("next_retry_at")
+            if retry_at:
+                delay = max(0.0, (datetime.fromisoformat(retry_at) - datetime.now(UTC)).total_seconds())
+                if delay:
+                    self._signal.clear()
+                    try:
+                        await asyncio.wait_for(self._signal.wait(), timeout=delay)
+                        continue
+                    except TimeoutError:
+                        pass
+            target = request["target_turn_id"]
+            attempt = self.runtime.store.start_curator_request(
+                "openai_agents", session_id, target)
+            if attempt is None:
+                continue
+            self.runtime._emit_background("curator.started", {"attempt": attempt})
+            try:
+                async with self._run_lock:
+                    await curator.catch_up(
+                        through_turn_id=target, session_id=session_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                retry_seconds = min(60.0, float(2 ** min(max(attempt - 1, 0), 6)))
+                if self.runtime.store.retry_curator_request(
+                        "openai_agents", session_id, target,
+                        type(exc).__name__, retry_seconds):
+                    event_type = "curator.degraded" if attempt > 1 else "curator.retry_scheduled"
+                    self.runtime._emit_background(event_type, {
+                        "attempt": attempt, "error_type": type(exc).__name__,
+                        "retry_seconds": retry_seconds})
+            else:
+                if self.runtime.store.complete_curator_request(
+                        "openai_agents", session_id, target):
+                    self.runtime._emit_background("curator.caught_up", {"attempt": attempt})
+
+
 class ResidentRuntime:
     _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"communication.failed", "wake.failed"})
 
@@ -201,6 +297,7 @@ class ResidentRuntime:
         self._active_event: WakeEvent | None = None
         self._owner_event_authorizations: dict[str, str] = {}
         self.curator: MemoryCurator | None = None
+        self._curator_coordinator = CuratorCoordinator(self)
         self._enqueue_times: dict[str, float] = {}
         self._dequeue_observations: dict[str, tuple[float | None, int]] = {}
         self._active_max_loop_lag = 0.0
@@ -312,11 +409,19 @@ class ResidentRuntime:
             token = timeline_reporter.set(self._timeline) if self.config.timeline else None
             try:
                 await self.curator.catch_up()
+                session_id = getattr(getattr(self.curator, "source", None), "session_id", None)
+                if session_id:
+                    self.store.complete_curator_request("openai_agents", session_id)
             except Exception as exc:
                 self._emit("curator.failed", {"phase": "startup", "error_type": type(exc).__name__})
+                binding = self.store.agent_session_binding("openai_agents")
+                if binding is not None and binding.get("last_turn_id"):
+                    self.store.request_curator_catch_up(
+                        "openai_agents", binding["session_id"], binding["last_turn_id"])
             finally:
                 if token is not None:
                     timeline_reporter.reset(token)
+            self._curator_coordinator.start()
         for message in self.store.pending_owner_messages():
             event = self._owner_message_wake(
                 message["id"], message["content"], message["created_at"])
@@ -326,7 +431,11 @@ class ResidentRuntime:
             self._pending_capability_event = None
 
     def close(self) -> None:
+        self._curator_coordinator.cancel()
         self.store.close()
+
+    async def stop_background_services(self) -> None:
+        await self._curator_coordinator.stop()
 
     def owner_message_event(self, content: str) -> WakeEvent:
         message_id = self.store.ingest_owner_message(self.owner.id, content)
@@ -350,6 +459,12 @@ class ResidentRuntime:
 
     def _emit(self, event_type: str, data: dict) -> None:
         self.store.journal(event_type, data, self._active_run_id)
+        if self.config.verbose or event_type in self._NORMAL_DIAGNOSTIC_EVENTS:
+            details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            self.diagnostic_output(f"{event_type} {details}")
+
+    def _emit_background(self, event_type: str, data: dict) -> None:
+        self.store.journal(event_type, data)
         if self.config.verbose or event_type in self._NORMAL_DIAGNOSTIC_EVENTS:
             details = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
             self.diagnostic_output(f"{event_type} {details}")
@@ -773,7 +888,7 @@ class ResidentRuntime:
                     handover_id = pending_handover["id"]
                 elif self.curator is not None and unavailable_reason != "remote_session_missing":
                     try:
-                        handover = await self.curator.catch_up(final=True)
+                        handover = await self._curator_coordinator.barrier(final=True)
                     except SessionHistoryUnavailable as exc:
                         self._emit("curator.failed", {
                             "phase": "final", "error_type": type(exc).__name__,
@@ -834,7 +949,7 @@ class ResidentRuntime:
                     if (self.curator is not None
                             and unavailable_reason != "remote_session_missing"):
                         try:
-                            handover = await self.curator.catch_up(final=True)
+                            handover = await self._curator_coordinator.barrier(final=True)
                         except SessionHistoryUnavailable as exc:
                             self._emit("curator.failed", {
                                 "phase": "final", "error_type": type(exc).__name__,
@@ -963,21 +1078,14 @@ class ResidentRuntime:
                         "openai_agents", synchronized_session_id, synchronized_state)
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
-            if self.curator is not None:
-                curator_started = time.monotonic()
-                emit_timeline("curator.catch_up", "started", phase="incremental")
-                try:
-                    await self.curator.catch_up()
-                except Exception as exc:
-                    self._emit("curator.failed", {
-                        "phase": "incremental", "error_type": type(exc).__name__})
-                    emit_timeline("curator.catch_up", "finished", phase="incremental",
-                                  outcome="error",
-                                  duration_seconds=time.monotonic() - curator_started)
-                else:
-                    emit_timeline("curator.catch_up", "finished", phase="incremental",
-                                  outcome="ok",
-                                  duration_seconds=time.monotonic() - curator_started)
+            if self.curator is not None and managed_session:
+                session_id = getattr(self.provider, "session_id", None)
+                completed_turn_id = turn.response_id
+                if session_id and completed_turn_id:
+                    self.store.request_curator_catch_up(
+                        "openai_agents", session_id, completed_turn_id)
+                    self._emit("curator.requested", {"status": "pending"})
+                    self._curator_coordinator.signal()
             return run_id
         except asyncio.CancelledError as exc:
             self._discard_continuation(continuation_id)
@@ -1159,6 +1267,7 @@ class ResidentRuntime:
                 *(task for task in (scheduler, dispatcher, terminal, *producers)
                   if task is not None),
                 return_exceptions=True)
+            await self.stop_background_services()
             self.bind_event_loop_lag_checkpoint(None)
             await probe.stop()
             self.diagnostic_output(f"Resident {self.resident.address_name} stopped")
