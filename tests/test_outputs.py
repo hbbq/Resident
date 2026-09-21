@@ -7,7 +7,7 @@ from pathlib import Path
 
 from resident.config import Config
 from resident.domain import ModelTurn, ToolCall, WakeEvent
-from resident.outputs import OutputCapability, output_schema, schema_fingerprint
+from resident.outputs import DeliveryPolicy, OutputCapability, output_schema, schema_fingerprint
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
 
@@ -59,7 +59,8 @@ class StructuredProvider:
         return self.recovery[2]
 
 
-def display_capability(target, delivered, *, max_length=40, handler=None):
+def display_capability(target, delivered, *, max_length=40, handler=None,
+                       max_attempts=3):
     async def deliver(payload):
         delivered.append((target, payload["content"]))
         if handler is not None:
@@ -73,6 +74,7 @@ def display_capability(target, delivered, *, max_length=40, handler=None):
                 "type": "string", "minLength": 1, "maxLength": max_length}},
             "required": ["content"], "additionalProperties": False,
         }, f"homeops-display:{target}", deliver, target=target,
+        delivery_policy=DeliveryPolicy(max_attempts=max_attempts),
         legacy_tool_name=f"{target}_show_text")
 
 
@@ -220,6 +222,12 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             store = Store(path)
             store.provision("Resident", "Owner", "")
             store.save_agent_session_binding("openai_agents", "session", None, "turn")
+            store.mark_agent_wake_submission_attempted(
+                "openai_agents", "session", "wake", "correlation",
+                wake_id="wake", wake_source="sensor", wake_reason="changed")
+            store.correlate_agent_wake_submission(
+                "openai_agents", "session", "wake", "turn")
+            store.settle_agent_wake_submission("openai_agents", "session", "turn")
             store.save_session_protocol("openai_agents", "session", {
                 "version": 2, "output_schema": schema,
                 "output_schema_fingerprint": fingerprint,
@@ -234,6 +242,88 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, runtime.store.connection.execute(
                 "SELECT count(*) FROM output_requests").fetchone()[0])
             runtime.close()
+
+    async def test_recovered_owner_wake_retains_immediate_reply_semantics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            initial = self.runtime(
+                temporary, StructuredProvider(), outputs=(), transport=OwnerTransport(),
+                spontaneous_message_limit=0)
+            initial.store.save_agent_session_binding(
+                "openai_agents", "session", None, "turn")
+            initial.store.save_session_protocol("openai_agents", "session", {
+                "version": 2, "output_schema": initial._output_schema,
+                "output_schema_fingerprint": initial._output_schema_fingerprint,
+                "output_capabilities": [
+                    output.semantic_descriptor() for output in initial._output_capabilities],
+            })
+            initial.store.mark_agent_wake_submission_attempted(
+                "openai_agents", "session", "message", "correlation",
+                wake_id="owner-wake", wake_source="owner", wake_reason="owner_message")
+            initial.store.correlate_agent_wake_submission(
+                "openai_agents", "session", "message", "turn")
+            initial.store.settle_agent_wake_submission(
+                "openai_agents", "session", "turn")
+            initial.close()
+
+            transport = OwnerTransport()
+            provider = StructuredProvider(
+                session_id="session",
+                recovery='{"outputs":[{"type":"notify_owner","content":"reply"}]}')
+            recovered = self.runtime(
+                temporary, provider, outputs=(), transport=transport,
+                spontaneous_message_limit=0)
+            self.assertTrue(await recovered.recover_missing_disposition())
+            request = recovered.store.connection.execute(
+                "SELECT delivery_state FROM output_requests").fetchone()
+            message = recovered.store.connection.execute(
+                "SELECT spontaneous,delivery_status FROM messages").fetchone()
+            self.assertEqual("queued", request["delivery_state"])
+            self.assertEqual((0, "pending_delivery"), tuple(message))
+            self.assertTrue(await recovered.dispatch_outputs_once())
+            self.assertEqual(["reply"], transport.messages)
+            recovered.close()
+
+    async def test_recovered_failure_wake_suppresses_recursive_failure_event(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            async def rejected(_):
+                raise ValueError("still unavailable")
+
+            output = display_capability("display1", [], handler=rejected)
+            initial = self.runtime(
+                temporary, StructuredProvider(), outputs=(output,),
+                owner_communication_enabled=False)
+            initial.store.save_agent_session_binding(
+                "openai_agents", "session", None, "turn")
+            initial.store.save_session_protocol("openai_agents", "session", {
+                "version": 2, "output_schema": initial._output_schema,
+                "output_schema_fingerprint": initial._output_schema_fingerprint,
+                "output_capabilities": [output.semantic_descriptor()],
+            })
+            initial.store.mark_agent_wake_submission_attempted(
+                "openai_agents", "session", "failure-schedule", "correlation",
+                wake_id="failure-wake", wake_source="scheduler",
+                wake_reason="output_delivery_failed")
+            initial.store.correlate_agent_wake_submission(
+                "openai_agents", "session", "failure-schedule", "turn")
+            initial.store.settle_agent_wake_submission(
+                "openai_agents", "session", "turn")
+            initial.close()
+
+            recovered = self.runtime(
+                temporary, StructuredProvider(
+                    session_id="session",
+                    recovery=('{"outputs":[{"type":"display","target":"display1",'
+                              '"content":"fallback"}]}')),
+                outputs=(output,), owner_communication_enabled=False)
+            self.assertTrue(await recovered.recover_missing_disposition())
+            self.assertEqual(1, recovered.store.connection.execute(
+                "SELECT failure_event_generated FROM output_requests").fetchone()[0])
+            self.assertTrue(await recovered.dispatch_outputs_once())
+            self.assertEqual("failed_permanent", recovered.store.connection.execute(
+                "SELECT delivery_state FROM output_requests").fetchone()[0])
+            self.assertEqual(0, recovered.store.connection.execute(
+                "SELECT count(*) FROM scheduled_wakeups").fetchone()[0])
+            recovered.close()
 
     async def test_retry_then_success_and_dispatcher_restart_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -267,6 +357,89 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             reopened = Store(Path(temporary) / "resident.sqlite3")
             self.assertEqual("retry_wait", reopened.output_request(claimed["id"])["delivery_state"])
             reopened.close()
+
+    async def test_interrupted_attempts_retry_only_below_persisted_maximum(self):
+        for interrupted_attempt, max_attempts, expected_state in (
+                (1, 3, "retry_wait"), (2, 3, "retry_wait"),
+                (3, 3, "failed_permanent"), (2, 2, "failed_permanent")):
+            with self.subTest(attempt=interrupted_attempt, maximum=max_attempts), \
+                    tempfile.TemporaryDirectory() as temporary:
+                output = display_capability(
+                    "display1", [], max_attempts=max_attempts)
+                runtime = self.runtime(
+                    temporary, StructuredProvider(), outputs=(output,),
+                    owner_communication_enabled=False)
+                receipt = runtime._persist_disposition(
+                    ('{"outputs":[{"type":"display","target":"display1",'
+                     '"content":"x"}]}'),
+                    "session", "turn", run_id=None, wake=None)
+                output_id = receipt["requests"][0]["id"]
+                for attempt in range(1, interrupted_attempt + 1):
+                    claimed = runtime.store.claim_output_request()
+                    self.assertEqual(attempt, claimed["attempt_count"])
+                    if attempt < interrupted_attempt:
+                        runtime.store.finish_output_attempt(
+                            output_id, attempt, "retry_wait",
+                            classification="OSError", retry_delay_seconds=0)
+                runtime.close()
+
+                reopened = Store(Path(temporary) / "resident.sqlite3")
+                request = reopened.output_request(output_id)
+                self.assertEqual(max_attempts, request["max_attempts"])
+                self.assertEqual(expected_state, request["delivery_state"])
+                if interrupted_attempt < max_attempts:
+                    retry = reopened.claim_output_request()
+                    self.assertEqual(interrupted_attempt + 1, retry["attempt_count"])
+                else:
+                    self.assertIsNone(reopened.claim_output_request())
+                    self.assertEqual("retries_exhausted",
+                                     request["last_failure_classification"])
+                reopened.close()
+
+    async def test_maxed_interrupted_attempt_terminalizes_once_without_fourth_call(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            calls = 0
+
+            async def handler(_):
+                nonlocal calls
+                calls += 1
+                return {}
+
+            output = display_capability(
+                "display1", [], handler=handler, max_attempts=3)
+            runtime = self.runtime(
+                temporary, StructuredProvider(), outputs=(output,),
+                owner_communication_enabled=False)
+            receipt = runtime._persist_disposition(
+                ('{"outputs":[{"type":"display","target":"display1",'
+                 '"content":"private"}]}'),
+                "session", "turn", run_id=None, wake=None)
+            output_id = receipt["requests"][0]["id"]
+            for attempt in range(1, 4):
+                runtime.store.claim_output_request()
+                if attempt < 3:
+                    runtime.store.finish_output_attempt(
+                        output_id, attempt, "retry_wait",
+                        classification="OSError", retry_delay_seconds=0)
+            runtime.close()
+
+            for _ in range(2):
+                reopened = Store(Path(temporary) / "resident.sqlite3")
+                self.assertEqual("failed_permanent",
+                                 reopened.output_request(output_id)["delivery_state"])
+                schedules = reopened.connection.execute(
+                    "SELECT reason,context_json FROM scheduled_wakeups").fetchall()
+                self.assertEqual(1, len(schedules))
+                self.assertEqual("output_delivery_failed", schedules[0]["reason"])
+                self.assertNotIn("private", schedules[0]["context_json"])
+                reopened.close()
+
+            recovered = self.runtime(
+                temporary, StructuredProvider(), outputs=(output,),
+                owner_communication_enabled=False)
+            self.assertFalse(await recovered.dispatch_outputs_once())
+            self.assertEqual(0, calls)
+            recovered.close()
 
     async def test_permanent_failure_generates_exactly_one_safe_wake_and_success_none(self):
         with tempfile.TemporaryDirectory() as temporary:

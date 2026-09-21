@@ -83,7 +83,10 @@ class ResidentRuntime:
                     "openai_agents", session_id, wake_key),
                 lambda session_id, wake_key, correlation:
                     self.store.mark_agent_wake_submission_attempted(
-                        "openai_agents", session_id, wake_key, correlation),
+                        "openai_agents", session_id, wake_key, correlation,
+                        wake_id=self._active_event.id if self._active_event else None,
+                        wake_source=self._active_event.source if self._active_event else None,
+                        wake_reason=self._active_event.reason if self._active_event else None),
                 lambda session_id, wake_key, turn_id:
                     self.store.correlate_agent_wake_submission(
                         "openai_agents", session_id, wake_key, turn_id),
@@ -483,6 +486,8 @@ class ResidentRuntime:
                     "payload": payload,
                     "route_identity": capability.route_identity if capability else None,
                     "capability_fingerprint": capability.fingerprint if capability else None,
+                    "max_attempts": (
+                        capability.delivery_policy.max_attempts if capability else 1),
                     "delivery_state": state, "failure_classification": classification,
                     "sender_id": self.resident.id, "spontaneous": spontaneous,
                     "message_status": (
@@ -531,8 +536,13 @@ class ResidentRuntime:
         if recover is None:
             return False
         raw = await recover(session_id, turn_id)
+        wake_context = self.store.disposition_wake_context(
+            "openai_agents", session_id, turn_id)
+        wake = (None if wake_context is None else WakeEvent(
+            wake_context.get("wake_id") or f"recovered:{turn_id}",
+            wake_context["wake_source"], wake_context["wake_reason"], utc_now(), {}))
         self._persist_disposition(
-            raw, session_id, turn_id, run_id=None, wake=None,
+            raw, session_id, turn_id, run_id=None, wake=wake,
             schema=protocol["output_schema"],
             fingerprint=protocol["output_schema_fingerprint"])
         return True
