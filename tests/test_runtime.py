@@ -300,6 +300,75 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await runtime.stop_background_services()
             runtime.close()
 
+    async def test_startup_curator_advances_existing_request_to_bound_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            before_restart = Store(path)
+            before_restart.request_curator_catch_up(
+                "openai_agents", "session-restarted", "turn-1")
+            before_restart.save_agent_session_binding(
+                "openai_agents", "session-restarted", None, "turn-2")
+            before_restart.close()
+
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            second_turn_started = asyncio.Event()
+            release_second_turn = asyncio.Event()
+
+            class Source:
+                session_id = "session-restarted"
+
+                async def session_items(self, cursor, limit):
+                    if cursor is None:
+                        return SessionItemPage(({
+                            "id": "item-1", "type": "message", "role": "assistant",
+                            "turn_id": "turn-1", "content": [],
+                        },), "item-1", True)
+                    second_turn_started.set()
+                    await release_second_turn.wait()
+                    return SessionItemPage(({
+                        "id": "item-2", "type": "message", "role": "assistant",
+                        "turn_id": "turn-2", "content": [],
+                    },), "item-2", False)
+
+            class Model:
+                def __init__(self):
+                    self.item_ids = []
+
+                async def curate(self, session_id, items, existing, current_handover):
+                    self.item_ids.extend(item["id"] for item in items)
+                    return {"mutations": [], "handover": {"operation": "keep"}}
+
+            model = Model()
+            runtime.bind_curator(MemoryCurator(
+                runtime.store, Source(), model, max_batches=1))
+
+            startup = asyncio.create_task(
+                runtime.enqueue_startup_wakeups(asyncio.Queue()))
+            await second_turn_started.wait()
+
+            self.assertFalse(startup.done())
+            request = runtime.store.curator_request(
+                "openai_agents", Source.session_id)
+            self.assertIsNotNone(request)
+            self.assertEqual("turn-2", request["target_turn_id"])
+            self.assertEqual(
+                "turn-1", runtime.store.curator_checkpoint(
+                    "openai_agents", Source.session_id)["last_turn_id"])
+
+            release_second_turn.set()
+            await startup
+
+            self.assertEqual(["item-1", "item-2"], model.item_ids)
+            self.assertEqual(
+                "turn-2", runtime.store.curator_checkpoint(
+                    "openai_agents", Source.session_id)["last_turn_id"])
+            self.assertIsNone(runtime.store.curator_request(
+                "openai_agents", Source.session_id))
+            await runtime.stop_background_services()
+            runtime.close()
+
     async def test_final_catch_up_incomplete_cannot_release_startup_barrier(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(

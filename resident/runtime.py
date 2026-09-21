@@ -322,17 +322,21 @@ class ResidentRuntime:
             return
 
         request = self.store.curator_request(provider, session_id)
-        if request is None:
-            binding = self.store.agent_session_binding(provider)
-            if binding is None or not binding.get("last_turn_id"):
-                return
+        binding = self.store.agent_session_binding(provider)
+        binding_target = None
+        if binding is not None and binding.get("last_turn_id"):
             if binding["session_id"] != session_id:
                 raise SessionHistoryUnavailable(
                     "Bound session does not match the Curator history source")
-            self.store.request_curator_catch_up(
-                provider, session_id, binding["last_turn_id"])
-            request = self.store.curator_request(provider, session_id)
+            binding_target = binding["last_turn_id"]
+            if (request is None
+                    or request["target_turn_id"] != binding_target):
+                self.store.request_curator_catch_up(
+                    provider, session_id, binding_target)
+                request = self.store.curator_request(provider, session_id)
         if request is None:
+            if binding_target is None:
+                return
             raise RuntimeError("Startup Curator request could not be persisted")
 
         target = request["target_turn_id"]
