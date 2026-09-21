@@ -19,7 +19,8 @@ from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.domain import ImageAttachment, ToolResult, ToolSpec
 from resident.provider import (OpenAIAgentsProvider, OpenAIResponsesProvider,
                                RemoteSessionUnavailable, RolloverRecoveryRequired)
-from resident.memory import FinalCatchUpIncomplete, SessionHistoryUnavailable
+from resident.memory import (FinalCatchUpIncomplete, MemoryCurator, SessionHistoryUnavailable,
+                             SessionItemPage)
 from resident.observability import timeline_reporter
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
@@ -172,6 +173,64 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             release.set()
             await runtime.stop_background_services()
+            runtime.close()
+
+    async def test_startup_curator_recovery_keeps_request_until_stored_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            before_restart = Store(path)
+            before_restart.request_curator_catch_up(
+                "openai_agents", "session-restarted", "turn-target")
+            before_restart.close()
+
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            second_page_started = asyncio.Event()
+            release_second_page = asyncio.Event()
+
+            class Source:
+                session_id = "session-restarted"
+
+                async def session_items(self, cursor, limit):
+                    if cursor is None:
+                        return SessionItemPage(({
+                            "id": "item-1", "type": "message", "role": "user",
+                            "turn_id": "turn-1", "content": [],
+                        },), "item-1", True)
+                    second_page_started.set()
+                    await release_second_page.wait()
+                    return SessionItemPage(({
+                        "id": "item-2", "type": "message", "role": "assistant",
+                        "turn_id": "turn-target", "content": [],
+                    },), "item-2", False)
+
+            class Model:
+                async def curate(self, session_id, items, existing, current_handover):
+                    return {"mutations": [], "handover": {"operation": "keep"}}
+
+            runtime.bind_curator(MemoryCurator(
+                runtime.store, Source(), Model(), max_batches=1))
+
+            await runtime.enqueue_startup_wakeups(asyncio.Queue())
+            await second_page_started.wait()
+
+            request = runtime.store.curator_request(
+                "openai_agents", Source.session_id)
+            self.assertIsNotNone(request)
+            self.assertEqual("turn-target", request["target_turn_id"])
+            self.assertEqual(
+                "turn-1", runtime.store.curator_checkpoint(
+                    "openai_agents", Source.session_id)["last_turn_id"])
+
+            release_second_page.set()
+            await runtime.stop_background_services()
+
+            self.assertIsNone(runtime.store.curator_request(
+                "openai_agents", Source.session_id))
+            self.assertEqual(
+                "turn-target", runtime.store.curator_checkpoint(
+                    "openai_agents", Source.session_id)["last_turn_id"])
             runtime.close()
 
     async def test_standing_owner_guidance_requires_canonical_owner_message_authority(self):

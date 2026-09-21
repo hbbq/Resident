@@ -407,17 +407,28 @@ class ResidentRuntime:
                 "error_type": type(exc).__name__, "phase": "disposition_recovery"})
         if self.curator is not None:
             token = timeline_reporter.set(self._timeline) if self.config.timeline else None
+            session_id = getattr(getattr(self.curator, "source", None), "session_id", None)
+            request = (self.store.curator_request("openai_agents", session_id)
+                       if session_id else None)
             try:
-                await self.curator.catch_up()
-                session_id = getattr(getattr(self.curator, "source", None), "session_id", None)
-                if session_id:
-                    self.store.complete_curator_request("openai_agents", session_id)
+                if request is None:
+                    await self.curator.catch_up()
+                else:
+                    target = request["target_turn_id"]
+                    await self.curator.catch_up(
+                        through_turn_id=target, session_id=session_id)
+                    checkpoint = self.store.curator_checkpoint(
+                        "openai_agents", session_id)
+                    if checkpoint is not None and checkpoint.get("last_turn_id") == target:
+                        self.store.complete_curator_request(
+                            "openai_agents", session_id, target)
             except Exception as exc:
                 self._emit("curator.failed", {"phase": "startup", "error_type": type(exc).__name__})
-                binding = self.store.agent_session_binding("openai_agents")
-                if binding is not None and binding.get("last_turn_id"):
-                    self.store.request_curator_catch_up(
-                        "openai_agents", binding["session_id"], binding["last_turn_id"])
+                if request is None:
+                    binding = self.store.agent_session_binding("openai_agents")
+                    if binding is not None and binding.get("last_turn_id"):
+                        self.store.request_curator_catch_up(
+                            "openai_agents", binding["session_id"], binding["last_turn_id"])
             finally:
                 if token is not None:
                     timeline_reporter.reset(token)
