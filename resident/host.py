@@ -144,6 +144,7 @@ class RuntimeHost:
             scheduler.cancel()
             dispatcher.cancel()
             await asyncio.gather(scheduler, dispatcher, return_exceptions=True)
+            await runtime.stop_background_services()
 
     async def _collect_startup_readiness(
             self, shared_queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,

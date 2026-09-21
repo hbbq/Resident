@@ -291,10 +291,15 @@ class MemoryCurator:
         self.batch_size, self.max_batches = max(1, min(batch_size, 100)), max(1, max_batches)
         self._lock = asyncio.Lock()
 
-    async def catch_up(self, *, final: bool = False) -> str | None:
+    async def catch_up(self, *, final: bool = False,
+                       through_turn_id: str | None = None,
+                       session_id: str | None = None) -> str | None:
         """Consolidate bounded pages; checkpoints advance only with durable decisions."""
         async with self._lock:
-            session_id = self.source.session_id
+            source_session_id = self.source.session_id
+            if session_id is not None and source_session_id != session_id:
+                raise SessionHistoryUnavailable("Requested Curator session is no longer bound")
+            session_id = source_session_id
             if not session_id:
                 return None
             checkpoint = self.store.curator_checkpoint("openai_agents", session_id)
@@ -305,6 +310,9 @@ class MemoryCurator:
             seen_cursors = {cursor}
             seen_pages: set[tuple[str, tuple[str, ...] | str]] = set()
             more_pages = False
+            reached_boundary = bool(
+                through_turn_id is not None and checkpoint is not None
+                and checkpoint.get("last_turn_id") == through_turn_id)
             while pages < self.max_batches:
                 batch_round = pages + 1
                 batch_started = time.monotonic()
@@ -313,19 +321,47 @@ class MemoryCurator:
                 batch_outcome = "error"
                 try:
                     page = await self.source.session_items(cursor, self.batch_size)
-                    more_pages = page.has_more
-                    safe_items = tuple(item for raw in page.items
+                    page_items = page.items
+                    if through_turn_id is not None:
+                        boundary_indexes = [
+                            index for index, item in enumerate(page_items)
+                            if item.get("turn_id") == through_turn_id]
+                        if reached_boundary and not boundary_indexes:
+                            batch_outcome = "ok"
+                            more_pages = False
+                            break
+                        if boundary_indexes:
+                            reached_boundary = True
+                            boundary_end = len(page_items)
+                            for index in range(boundary_indexes[0] + 1, len(page_items)):
+                                if page_items[index].get("turn_id") != through_turn_id:
+                                    boundary_end = index
+                                    break
+                            if boundary_end < len(page_items):
+                                page_items = page_items[:boundary_end]
+                                more_pages = False
+                            else:
+                                more_pages = page.has_more
+                        else:
+                            more_pages = page.has_more
+                    else:
+                        more_pages = page.has_more
+                    safe_items = tuple(item for raw in page_items
                                        if (item := _safe_item(raw)) is not None)
-                    if not page.items:
+                    if not page_items:
                         if page.has_more:
                             raise RuntimeError("Curator pagination stalled on an empty page")
+                        if through_turn_id is not None and not reached_boundary:
+                            raise RuntimeError("Completed-turn Curator boundary was not found")
                         batch_outcome = "ok"
                         break
-                    last_item_id = page.items[-1].get("id")
-                    next_cursor = page.cursor or last_item_id
+                    last_item_id = page_items[-1].get("id")
+                    next_cursor = (last_item_id if len(page_items) != len(page.items)
+                                   else page.cursor or last_item_id)
                     if next_cursor is None or next_cursor == cursor or next_cursor in seen_cursors:
                         raise RuntimeError("Curator pagination cursor did not advance")
-                    page_identity = _source_page_identity(page)
+                    bounded_page = SessionItemPage(tuple(page_items), next_cursor, more_pages)
+                    page_identity = _source_page_identity(bounded_page)
                     if page_identity in seen_pages:
                         raise RuntimeError("Curator pagination repeated a page")
                     seen_cursors.add(next_cursor)
@@ -359,7 +395,8 @@ class MemoryCurator:
                                 handover = None
                         self.store.apply_curator_batch(
                             "openai_agents", session_id, next_cursor, last_item_id,
-                            operation_key, mutations, handover_operation, proposed_handover)
+                            operation_key, mutations, handover_operation, proposed_handover,
+                            page_items[-1].get("turn_id"))
                         self.store.finish_curator_job(job_id)
                     except BaseException as exc:
                         self.store.fail_curator_job(job_id, type(exc).__name__)
@@ -372,8 +409,10 @@ class MemoryCurator:
                         phase="final" if final else "incremental",
                         round=batch_round, outcome=batch_outcome,
                         duration_seconds=time.monotonic() - batch_started)
-                if not page.has_more:
+                if not more_pages:
                     break
+            if through_turn_id is not None and (not reached_boundary or more_pages):
+                raise FinalCatchUpIncomplete("Completed-turn Curator boundary was not reached")
             if final and more_pages:
                 raise FinalCatchUpIncomplete(
                     f"Final Curator consolidation incomplete after {self.max_batches} pages")

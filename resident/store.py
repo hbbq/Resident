@@ -41,6 +41,12 @@ _SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "wake.failed": ("error_type",),
     "wake.finished": ("status", "duration_seconds", "model_calls"),
     "wake.sleeping": ("status",),
+    "curator.requested": ("status",),
+    "curator.started": ("attempt",),
+    "curator.caught_up": ("attempt",),
+    "curator.retry_scheduled": ("attempt", "error_type", "retry_seconds"),
+    "curator.degraded": ("attempt", "error_type", "retry_seconds"),
+    "curator.failed": ("phase", "error_type", "history_status"),
     "wakeup.scheduled": ("schedule_id", "due_at"),
 }
 _SAFE_JOURNAL_EVENT_LIMIT = 50
@@ -194,7 +200,7 @@ class Store:
           PRIMARY KEY(guidance_id,revision));
         CREATE TABLE IF NOT EXISTS curator_checkpoints(
           provider TEXT NOT NULL, session_id TEXT NOT NULL, cursor TEXT,
-          last_item_id TEXT, handover_draft TEXT, updated_at TEXT NOT NULL,
+          last_item_id TEXT, last_turn_id TEXT, handover_draft TEXT, updated_at TEXT NOT NULL,
           PRIMARY KEY(provider,session_id));
         CREATE TABLE IF NOT EXISTS curator_operations(
           operation_key TEXT PRIMARY KEY, session_id TEXT NOT NULL,
@@ -204,6 +210,12 @@ class Store:
           status TEXT NOT NULL CHECK(status IN ('claimed','completed','failed')),
           attempts INTEGER NOT NULL, last_error_type TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS curator_requests(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, target_turn_id TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','running','retrying')),
+          attempts INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT, last_error_type TEXT,
+          requested_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY(provider,session_id));
         CREATE TABLE IF NOT EXISTS session_handovers(
           id TEXT PRIMARY KEY, old_session_id TEXT NOT NULL, new_session_id TEXT,
           content TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
@@ -344,6 +356,10 @@ class Store:
             with self.connection:
                 self.connection.execute(
                     "ALTER TABLE curator_checkpoints ADD COLUMN handover_draft TEXT")
+        if "last_turn_id" not in checkpoint_columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE curator_checkpoints ADD COLUMN last_turn_id TEXT")
         wake_submission_columns = {
             row["name"] for row in self.connection.execute(
                 "PRAGMA table_info(agent_wake_submissions)")
@@ -878,7 +894,7 @@ class Store:
 
     def curator_checkpoint(self, provider: str, session_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("""
-            SELECT cursor,last_item_id,handover_draft,updated_at FROM curator_checkpoints
+            SELECT cursor,last_item_id,last_turn_id,handover_draft,updated_at FROM curator_checkpoints
             WHERE provider=? AND session_id=?
         """, (provider, session_id)).fetchone()
         return None if row is None else dict(row)
@@ -887,7 +903,8 @@ class Store:
                             last_item_id: str | None, operation_key: str,
                             mutations: list[dict[str, Any]],
                             handover_operation: str = "keep",
-                            handover_draft: str | None = None) -> bool:
+                            handover_draft: str | None = None,
+                            last_turn_id: str | None = None) -> bool:
         """Atomically apply validated curator decisions and advance its source checkpoint."""
         if any(not mutation.get("provenance") for mutation in mutations):
             raise ValueError("Durable Curator memory requires verified provenance")
@@ -945,17 +962,84 @@ class Store:
                           evidence.get("content_hash")))
             self.connection.execute("""
                 INSERT INTO curator_checkpoints(
-                  provider,session_id,cursor,last_item_id,handover_draft,updated_at)
-                VALUES(?,?,?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
+                  provider,session_id,cursor,last_item_id,last_turn_id,handover_draft,updated_at)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
                   cursor=excluded.cursor,last_item_id=excluded.last_item_id,
+                  last_turn_id=excluded.last_turn_id,
                   handover_draft=CASE ?
                     WHEN 'keep' THEN curator_checkpoints.handover_draft
                     WHEN 'replace' THEN excluded.handover_draft
                     WHEN 'clear' THEN NULL END,
                   updated_at=excluded.updated_at
-            """, (provider, session_id, cursor, last_item_id, handover_draft, now,
+            """, (provider, session_id, cursor, last_item_id, last_turn_id,
+                  handover_draft, now,
                   handover_operation))
         return True
+
+    def request_curator_catch_up(self, provider: str, session_id: str,
+                                 target_turn_id: str) -> None:
+        """Durably coalesce routine work to the newest completed turn."""
+        now = utc_now()
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO curator_requests(
+                  provider,session_id,target_turn_id,status,attempts,requested_at,updated_at)
+                VALUES(?,?,?,'pending',0,?,?)
+                ON CONFLICT(provider,session_id) DO UPDATE SET
+                  target_turn_id=excluded.target_turn_id,status='pending',next_retry_at=NULL,
+                  last_error_type=NULL,requested_at=excluded.requested_at,
+                  updated_at=excluded.updated_at
+            """, (provider, session_id, target_turn_id, now, now))
+
+    def curator_request(self, provider: str, session_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT provider,session_id,target_turn_id,status,attempts,next_retry_at,
+                   last_error_type,requested_at,updated_at
+            FROM curator_requests WHERE provider=? AND session_id=?
+        """, (provider, session_id)).fetchone()
+        return None if row is None else dict(row)
+
+    def start_curator_request(self, provider: str, session_id: str,
+                              target_turn_id: str) -> int | None:
+        now = utc_now()
+        with self.connection:
+            result = self.connection.execute("""
+                UPDATE curator_requests SET status='running',attempts=attempts+1,
+                  next_retry_at=NULL,updated_at=?
+                WHERE provider=? AND session_id=? AND target_turn_id=?
+            """, (now, provider, session_id, target_turn_id))
+            if result.rowcount == 0:
+                return None
+            row = self.connection.execute("""
+                SELECT attempts FROM curator_requests WHERE provider=? AND session_id=?
+            """, (provider, session_id)).fetchone()
+        return int(row["attempts"])
+
+    def retry_curator_request(self, provider: str, session_id: str,
+                              target_turn_id: str, error_type: str,
+                              retry_seconds: float) -> bool:
+        next_retry = (datetime.now(UTC) + timedelta(seconds=retry_seconds)).isoformat()
+        with self.connection:
+            result = self.connection.execute("""
+                UPDATE curator_requests SET status='retrying',next_retry_at=?,
+                  last_error_type=?,updated_at=?
+                WHERE provider=? AND session_id=? AND target_turn_id=?
+            """, (next_retry, error_type[:100], utc_now(), provider, session_id,
+                  target_turn_id))
+        return result.rowcount > 0
+
+    def complete_curator_request(self, provider: str, session_id: str,
+                                 target_turn_id: str | None = None) -> bool:
+        parameters: list[Any] = [provider, session_id]
+        target_clause = ""
+        if target_turn_id is not None:
+            target_clause = " AND target_turn_id=?"
+            parameters.append(target_turn_id)
+        with self.connection:
+            result = self.connection.execute(
+                "DELETE FROM curator_requests WHERE provider=? AND session_id=?" + target_clause,
+                parameters)
+        return result.rowcount > 0
 
     def claim_curator_job(self, job_id: str, session_id: str,
                           source_cursor: str | None) -> bool:

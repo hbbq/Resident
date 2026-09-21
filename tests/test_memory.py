@@ -81,6 +81,28 @@ class PageSource:
 
 
 class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_turn_boundary_excludes_items_from_later_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source = PageSource([SessionItemPage((
+                {"id": "old", "type": "message", "role": "user",
+                 "turn_id": "turn-target", "content": []},
+                {"id": "new", "type": "message", "role": "user",
+                 "turn_id": "turn-in-progress", "content": []},
+            ), "new", False)])
+            model = RecordingModel()
+
+            await MemoryCurator(store, source, model).catch_up(
+                through_turn_id="turn-target", session_id="session-pages")
+
+            self.assertEqual([["old"]], [
+                [item["id"] for item in page] for page in model.pages])
+            checkpoint = store.curator_checkpoint(
+                "openai_agents", "session-pages")
+            self.assertEqual(("old", "turn-target"),
+                             (checkpoint["cursor"], checkpoint["last_turn_id"]))
+            store.close()
+
     def test_openai_curator_json_mode_mentions_json_in_input(self):
         document = {"session_id": "session-1", "new_session_items": []}
         response = io.BytesIO(json.dumps({
