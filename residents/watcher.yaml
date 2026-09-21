@@ -22,11 +22,11 @@ curator:
 capabilities:
   - diagnostics
   - homeops
-  - display
   - messaging
 
 outputs:
   - notify_owner
+  - display/display1
 
 subscriptions:
   - agentcontroller
