@@ -30,6 +30,7 @@ outputs:
 
 subscriptions:
   - agentcontroller
+  - homeops
   - messaging
 
 owner_transport:
