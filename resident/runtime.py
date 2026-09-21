@@ -14,7 +14,7 @@ from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider, RemoteSessionUnavailable
-from .memory import MemoryCurator, SessionHistoryUnavailable
+from .memory import FinalCatchUpIncomplete, MemoryCurator, SessionHistoryUnavailable
 from .observability import EventLoopLagProbe, ObservedQueue, emit_timeline, timeline_reporter
 from .outputs import (OutputCapability, capability_for_output, output_schema,
                       schema_fingerprint, validate_disposition)
@@ -145,6 +145,9 @@ class CuratorCoordinator:
 
 class ResidentRuntime:
     _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"communication.failed", "wake.failed"})
+    _STARTUP_CURATOR_MAX_ATTEMPTS = 100
+    _STARTUP_CURATOR_MAX_STALLED_ATTEMPTS = 3
+    _STARTUP_CURATOR_RETRY_BASE_SECONDS = 0.25
 
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: Sequence[Capability] | None = None,
@@ -308,6 +311,77 @@ class ResidentRuntime:
     def bind_curator(self, curator: MemoryCurator) -> None:
         self.curator = curator
 
+    async def _reconcile_startup_curator(self) -> None:
+        """Reach the durable completed-turn boundary before admitting wakes."""
+        curator = self.curator
+        if curator is None:
+            return
+        provider = "openai_agents"
+        session_id = getattr(getattr(curator, "source", None), "session_id", None)
+        if not session_id:
+            return
+
+        request = self.store.curator_request(provider, session_id)
+        if request is None:
+            binding = self.store.agent_session_binding(provider)
+            if binding is None or not binding.get("last_turn_id"):
+                return
+            if binding["session_id"] != session_id:
+                raise SessionHistoryUnavailable(
+                    "Bound session does not match the Curator history source")
+            self.store.request_curator_catch_up(
+                provider, session_id, binding["last_turn_id"])
+            request = self.store.curator_request(provider, session_id)
+        if request is None:
+            raise RuntimeError("Startup Curator request could not be persisted")
+
+        target = request["target_turn_id"]
+        startup_attempts = 0
+        stalled_attempts = 0
+        while True:
+            checkpoint = self.store.curator_checkpoint(provider, session_id)
+            if checkpoint is not None and checkpoint.get("last_turn_id") == target:
+                self.store.complete_curator_request(provider, session_id, target)
+                return
+            before = None if checkpoint is None else (
+                checkpoint.get("cursor"), checkpoint.get("last_turn_id"))
+            attempt = self.store.start_curator_request(provider, session_id, target)
+            if attempt is None:
+                raise RuntimeError("Startup Curator request changed during reconciliation")
+            startup_attempts += 1
+            try:
+                await curator.catch_up(
+                    through_turn_id=target, session_id=session_id)
+                checkpoint = self.store.curator_checkpoint(provider, session_id)
+                if checkpoint is None or checkpoint.get("last_turn_id") != target:
+                    raise FinalCatchUpIncomplete(
+                        "Completed-turn Curator boundary was not reached")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                checkpoint = self.store.curator_checkpoint(provider, session_id)
+                if checkpoint is not None and checkpoint.get("last_turn_id") == target:
+                    self.store.complete_curator_request(provider, session_id, target)
+                    return
+                after = None if checkpoint is None else (
+                    checkpoint.get("cursor"), checkpoint.get("last_turn_id"))
+                progressed = after is not None and after != before
+                stalled_attempts = 0 if progressed else stalled_attempts + 1
+                retry_seconds = (0.0 if progressed else min(
+                    1.0, self._STARTUP_CURATOR_RETRY_BASE_SECONDS
+                    * (2 ** (stalled_attempts - 1))))
+                self.store.retry_curator_request(
+                    provider, session_id, target, type(exc).__name__, retry_seconds)
+                if (stalled_attempts >= self._STARTUP_CURATOR_MAX_STALLED_ATTEMPTS
+                        or startup_attempts >= self._STARTUP_CURATOR_MAX_ATTEMPTS):
+                    raise RuntimeError(
+                        f"Startup Curator reconciliation failed before target {target!r}") from exc
+                if retry_seconds:
+                    await asyncio.sleep(retry_seconds)
+                continue
+            self.store.complete_curator_request(provider, session_id, target)
+            return
+
     @property
     def capabilities(self) -> tuple[Capability, ...]:
         return self._capabilities
@@ -407,28 +481,11 @@ class ResidentRuntime:
                 "error_type": type(exc).__name__, "phase": "disposition_recovery"})
         if self.curator is not None:
             token = timeline_reporter.set(self._timeline) if self.config.timeline else None
-            session_id = getattr(getattr(self.curator, "source", None), "session_id", None)
-            request = (self.store.curator_request("openai_agents", session_id)
-                       if session_id else None)
             try:
-                if request is None:
-                    await self.curator.catch_up()
-                else:
-                    target = request["target_turn_id"]
-                    await self.curator.catch_up(
-                        through_turn_id=target, session_id=session_id)
-                    checkpoint = self.store.curator_checkpoint(
-                        "openai_agents", session_id)
-                    if checkpoint is not None and checkpoint.get("last_turn_id") == target:
-                        self.store.complete_curator_request(
-                            "openai_agents", session_id, target)
+                await self._reconcile_startup_curator()
             except Exception as exc:
                 self._emit("curator.failed", {"phase": "startup", "error_type": type(exc).__name__})
-                if request is None:
-                    binding = self.store.agent_session_binding("openai_agents")
-                    if binding is not None and binding.get("last_turn_id"):
-                        self.store.request_curator_catch_up(
-                            "openai_agents", binding["session_id"], binding["last_turn_id"])
+                raise
             finally:
                 if token is not None:
                     timeline_reporter.reset(token)
