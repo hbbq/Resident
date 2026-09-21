@@ -580,19 +580,22 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             "environment": {"type": "none"}, "agent": empty_agent})
         self.assertEqual(protocol, empty_reconstructed)
 
-    def test_output_schema_change_requires_rollover(self):
+    def test_changing_output_grants_changes_fingerprint_and_requires_rollover(self):
         from resident.provider import OpenAIAgentsProvider
         provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
-        first = display_capability("display1", [], max_length=40)
+        first = display_capability("display1", [])
         first_schema = output_schema([first])
+        first_fingerprint = schema_fingerprint(first_schema)
         provider.configure_output_protocol(
-            first_schema, [first.semantic_descriptor()], schema_fingerprint(first_schema))
+            first_schema, [first.semantic_descriptor()], first_fingerprint)
         provider._session_id = "session"
         provider._protocol_descriptor = provider._agent_protocol(provider._agent_config([]))
-        second = display_capability("display1", [], max_length=120)
+        second = display_capability("display2", [])
         second_schema = output_schema([second])
+        second_fingerprint = schema_fingerprint(second_schema)
+        self.assertNotEqual(first_fingerprint, second_fingerprint)
         provider.configure_output_protocol(
-            second_schema, [second.semantic_descriptor()], schema_fingerprint(second_schema))
+            second_schema, [second.semantic_descriptor()], second_fingerprint)
         self.assertTrue(provider.protocol_change_requires_rollover([]))
 
     def test_busy_old_session_keeps_legacy_paths_for_recovery(self):

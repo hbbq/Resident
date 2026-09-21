@@ -27,7 +27,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
                            {"*"})
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
-    "role", "role_prompt", "agent", "curator", "capabilities",
+    "role", "role_prompt", "agent", "curator", "capabilities", "outputs",
     "subscriptions", "owner_transport", "body",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
@@ -71,6 +71,7 @@ class ResidentDefinition:
     agent: AgentDefinition = field(default_factory=AgentDefinition)
     curator: CuratorDefinition | None = None
     capabilities: tuple[str, ...] = ()
+    outputs: tuple[str, ...] = ()
     subscriptions: tuple[str, ...] = ()
     owner_transport: OwnerTransportDefinition | None = None
     body: dict[str, Any] | None = None
@@ -263,9 +264,12 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
     if body is not None:
         body = _mapping(body, "body")
     return ResidentDefinition(
-        resident_id, name, personality, role, enabled, agent, curator,
-        _string_list(data.get("capabilities"), "capabilities"),
-        _subscriptions(data.get("subscriptions"), "subscriptions"), transport, body,
+        id=resident_id, name=name, personality=personality, role=role, enabled=enabled,
+        agent=agent, curator=curator,
+        capabilities=_string_list(data.get("capabilities"), "capabilities"),
+        outputs=_string_list(data.get("outputs"), "outputs"),
+        subscriptions=_subscriptions(data.get("subscriptions"), "subscriptions"),
+        owner_transport=transport, body=body,
     )
 
 

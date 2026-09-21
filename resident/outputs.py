@@ -28,6 +28,12 @@ class OutputCapability:
     delivery_policy: DeliveryPolicy = DeliveryPolicy()
     legacy_tool_name: str | None = None
 
+    @property
+    def grant_id(self) -> str:
+        """Stable declarative identifier used to authorize this output."""
+        return (self.output_type if self.target is None
+                else f"{self.output_type}/{self.target}")
+
     def semantic_descriptor(self) -> dict[str, Any]:
         descriptor = {
             "type": self.output_type,

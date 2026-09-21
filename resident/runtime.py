@@ -55,6 +55,7 @@ class ResidentRuntime:
                  output_capabilities: Sequence[OutputCapability] | None = None,
                  event_producers: list[EventProducer] | None = None,
                  owner_transport: OwnerTransport | None = None,
+                 owner_output_enabled: bool | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
         self.config, self.provider = config, provider
@@ -158,9 +159,11 @@ class ResidentRuntime:
         self._output_protocol_enabled = (
             output_capabilities is not None or owner_transport is not None)
         configured_outputs = list(output_capabilities or ())
+        if owner_output_enabled is None:
+            owner_output_enabled = config.owner_communication_enabled
         if (self._output_protocol_enabled
                 and getattr(provider, "supports_output_capabilities", False)
-                and config.owner_communication_enabled):
+                and owner_output_enabled):
             async def notify_owner(payload: dict[str, Any]) -> dict[str, Any]:
                 if self._mirror_owner_output is not None:
                     try:

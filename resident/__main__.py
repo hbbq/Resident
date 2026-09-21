@@ -123,6 +123,29 @@ def _select_capabilities(grants: tuple[str, ...], available: list[Capability]) -
     return selected
 
 
+def _select_outputs(resident_id: str, grants: tuple[str, ...],
+                    available: list[OutputCapability], *,
+                    owner_available: bool) -> tuple[list[OutputCapability], bool]:
+    available_by_id = {output.grant_id: output for output in available}
+    supported = set(available_by_id)
+    if owner_available:
+        supported.add("notify_owner")
+    unavailable = sorted(set(grants) - supported)
+    if unavailable:
+        raise ValueError(
+            f"Unknown or unavailable output grants for {resident_id}: "
+            f"{', '.join(unavailable)}")
+    return ([output for output in available if output.grant_id in grants],
+            "notify_owner" in grants)
+
+
+def _legacy_output_capabilities(
+        selected: list[OutputCapability], available: list[Capability],
+) -> list[Capability]:
+    names = {output.legacy_tool_name for output in selected if output.legacy_tool_name}
+    return [capability for capability in available if capability.name in names]
+
+
 def build_host(config: Config) -> RuntimeHost:
     if config.residents_dir is None:
         raise ValueError("A Resident definitions directory is required")
@@ -158,8 +181,7 @@ def build_host(config: Config) -> RuntimeHost:
                 config, data_dir=config.data_dir / "instances" / definition.id,
                 instance_id=definition.id, resident_name=definition.name,
                 personality=definition.personality, role=definition.role,
-                owner_communication_enabled=(
-                    definition.owner_transport is not None or definition.id == catalog.default_id),
+                owner_communication_enabled=("notify_owner" in definition.outputs),
                 provider=definition.agent.provider, model=definition.agent.model,
                 reasoning_effort=definition.agent.reasoning_effort,
                 service_tier=definition.agent.service_tier,
@@ -191,15 +213,21 @@ def build_host(config: Config) -> RuntimeHost:
                     diagnostic_output=diagnostics.telegram)
                 private_producers[definition.id] = [transport]
             grants = _select_capabilities(definition.capabilities, available)
-            output_grants = [output for output in available_outputs
-                             if ("display" in definition.capabilities
-                                 or output.legacy_tool_name in definition.capabilities)]
+            output_grants, owner_output_enabled = _select_outputs(
+                definition.id, definition.outputs, available_outputs,
+                owner_available=(
+                    definition.owner_transport is not None
+                    or definition.id == catalog.default_id))
+            granted_names = {capability.name for capability in grants}
+            grants.extend(capability for capability in _legacy_output_capabilities(
+                output_grants, available) if capability.name not in granted_names)
             if "messaging" in definition.capabilities:
                 grants.append(messaging_capability(mailbox, definition.id, recipients))
             runtime = ResidentRuntime(
                 instance_config, _provider(definition), capabilities=grants,
                 output_capabilities=output_grants,
                 owner_transport=transport,
+                owner_output_enabled=owner_output_enabled,
                 diagnostic_output=lambda message, item=definition.id:
                     diagnostics.runtime(f"{item}: {message}"))
             _bind_curator(runtime, instance_config)
