@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 from .capabilities import Capability
 from .config import DisplayConfig
 from .observability import to_thread_timed
+from .outputs import OutputCapability
 
 
 class DisplayConnector:
@@ -25,6 +26,25 @@ class DisplayConnector:
         if len(set(display_ids)) != len(display_ids):
             raise ValueError("Duplicate display id")
         self.capabilities = [self._capability(display_id) for display_id in display_ids]
+        self.output_capabilities = [self._output_capability(display) for display in displays]
+
+    def _output_capability(self, display: DisplayConfig) -> OutputCapability:
+        async def deliver(payload: dict[str, Any]) -> dict[str, Any]:
+            return await self.show_text(display.id, payload["content"])
+
+        content_schema: dict[str, Any] = {"type": "string", "minLength": 1}
+        if display.max_length is not None:
+            content_schema["maxLength"] = display.max_length
+        return OutputCapability(
+            output_type="display", target=display.id,
+            description=f"Enqueue plain text for the configured {display.id} display.",
+            payload_schema={
+                "type": "object", "properties": {"content": content_schema},
+                "required": ["content"], "additionalProperties": False,
+            },
+            route_identity=f"homeops-display:{display.id}", handler=deliver,
+            legacy_tool_name=f"{display.id}_show_text",
+        )
 
     def _capability(self, display_id: str) -> Capability:
         async def show_text(arguments: dict[str, Any]) -> dict[str, Any]:

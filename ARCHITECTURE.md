@@ -145,6 +145,14 @@ duration
 
 Metrics should be extensible. v0 only needs to require elapsed runtime, but future model-provider information may add metrics such as model-call count, input/output tokens, cost, latency, or other useful usage measurements.
 
+### Terminal output capabilities
+
+Managed Agents sessions distinguish observations, interactive capabilities, and terminal `OutputCapability` requests. Every completed turn emits `{"outputs": [...]}`; an empty array is intentional silence. The exact authorized Owner/display branches are installed through `agent.text.format` and fingerprinted as immutable session protocol. Runtime parses and validates the final assistant `output_text` against that session snapshot and current local authorization. Schema validity never overrides a revoked local grant.
+
+The completed remote turn and binding checkpoint precede local disposition ingestion. `final_dispositions`, `output_requests`, and `output_attempts` then record the receipt and jobs atomically before the wake completes. A missing receipt for the bound completed turn is recovered from that exact assistant item after restart. Stable disposition/output IDs make stream replay, REST reconciliation, and repeated processing idempotent.
+
+Delivery is owned by a background dispatcher, not the model wake. Jobs move through queued, attempting, retry-wait, accepted-by-transport, permanent-failure, uncertain, and policy/unavailable rejection states. V1 retries retryable and interrupted uncertain attempts up to three times with bounded backoff. Telegram and HomeOps do not provide a complete exactly-once contract, so this is deliberately at-least-once and may duplicate an uncertain delivery. HomeOps acknowledgement means accepted into its queue, not physically rendered. A terminal failure durably schedules one safe `output_delivery_failed` event; failures produced while handling that event cannot recursively schedule another. Operational journal events contain identifiers, states, classifications, targets, and counts but never output content or raw transport errors.
+
 The runtime/journal should make it possible to reconstruct the externally relevant lifecycle of a wake run, including approximately:
 
 ```text

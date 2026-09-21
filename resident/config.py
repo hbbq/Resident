@@ -43,6 +43,7 @@ class CameraConfig:
 @dataclass(frozen=True)
 class DisplayConfig:
     id: str
+    max_length: int | None = None
 
 
 def _displays_from_environment() -> tuple[DisplayConfig, ...]:
@@ -58,16 +59,21 @@ def _displays_from_environment() -> tuple[DisplayConfig, ...]:
     displays: list[DisplayConfig] = []
     seen: set[str] = set()
     for item in items:
-        if not isinstance(item, dict) or set(item) != {"id"}:
-            raise ValueError("Each display must contain only id")
+        if not isinstance(item, dict) or not set(item) <= {"id", "max_length"} or "id" not in item:
+            raise ValueError("Each display must contain id and optional max_length")
         display_id = item.get("id")
         if not isinstance(display_id, str) or not re.fullmatch(
                 r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", display_id):
             raise ValueError("Display id must be 1-64 tool-safe identifier characters")
         if display_id in seen:
             raise ValueError(f"Duplicate display id: {display_id}")
+        max_length = item.get("max_length")
+        if (max_length is not None and
+                (not isinstance(max_length, int) or isinstance(max_length, bool)
+                 or not 1 <= max_length <= 10000)):
+            raise ValueError("Display max_length must be an integer from 1 through 10000")
         seen.add(display_id)
-        displays.append(DisplayConfig(display_id))
+        displays.append(DisplayConfig(display_id, max_length))
     return tuple(displays)
 
 

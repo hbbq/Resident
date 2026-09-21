@@ -15,6 +15,7 @@ from .instances import (ResidentDefinition, load_resident_catalog, migrate_legac
                         resolve_environment)
 from .mailbox import Mailbox
 from .memory import MemoryCurator, OpenAICuratorModel
+from .outputs import OutputCapability
 from .provider import OpenAIAgentsProvider, OpenAIResponsesProvider
 from .runtime import ResidentRuntime
 from .telegram import TelegramTransport
@@ -65,6 +66,7 @@ def _provider(definition: ResidentDefinition):
 def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
     producers = []
     capabilities: list[Capability] = diagnostic_capabilities()
+    output_capabilities: list[OutputCapability] = []
     if config.homeops_url:
         connector = HomeOpsConnector(
             config.homeops_url, poll_seconds=config.homeops_poll_seconds,
@@ -73,9 +75,11 @@ def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
         producers.append(connector)
         capabilities.extend(connector.capabilities)
     if config.displays:
-        capabilities.extend(DisplayConnector(
+        display = DisplayConnector(
             config.homeops_url, config.displays,
-            request_timeout_seconds=config.homeops_request_timeout_seconds).capabilities)
+            request_timeout_seconds=config.homeops_request_timeout_seconds)
+        capabilities.extend(display.capabilities)
+        output_capabilities.extend(display.output_capabilities)
     if config.agentcontroller_snapshot_path is not None:
         connector = AgentControllerConnector(
             config.agentcontroller_snapshot_path,
@@ -95,7 +99,7 @@ def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
             diagnostic_output=diagnostics.camera)
         producers.append(connector)
         capabilities.extend(connector.capabilities)
-    return producers, capabilities
+    return producers, capabilities, output_capabilities
 
 
 def _bind_curator(runtime: ResidentRuntime, config: Config) -> None:
@@ -125,7 +129,7 @@ def build_host(config: Config) -> RuntimeHost:
     catalog = load_resident_catalog(
         config.residents_dir, prompt_root=config.prompt_root, default_id=config.default_resident)
     diagnostics = TerminalDiagnostics(config.verbose)
-    producers, available = _shared_resources(config, diagnostics)
+    producers, available, available_outputs = _shared_resources(config, diagnostics)
     mailbox = Mailbox(config.data_dir / "runtime" / "mailbox.sqlite3")
     for producer in producers:
         bind = getattr(producer, "bind_checkpoint", None)
@@ -187,10 +191,14 @@ def build_host(config: Config) -> RuntimeHost:
                     diagnostic_output=diagnostics.telegram)
                 private_producers[definition.id] = [transport]
             grants = _select_capabilities(definition.capabilities, available)
+            output_grants = [output for output in available_outputs
+                             if ("display" in definition.capabilities
+                                 or output.legacy_tool_name in definition.capabilities)]
             if "messaging" in definition.capabilities:
                 grants.append(messaging_capability(mailbox, definition.id, recipients))
             runtime = ResidentRuntime(
                 instance_config, _provider(definition), capabilities=grants,
+                output_capabilities=output_grants,
                 owner_transport=transport,
                 diagnostic_output=lambda message, item=definition.id:
                     diagnostics.runtime(f"{item}: {message}"))
@@ -225,7 +233,7 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
                 if config.provider == "openai-agents" else
                 OpenAIResponsesProvider(config.openai_api_key, config.model, config.openai_base_url))
     diagnostics = TerminalDiagnostics(config.verbose)
-    producers, capabilities = _shared_resources(config, diagnostics)
+    producers, capabilities, output_capabilities = _shared_resources(config, diagnostics)
     telegram = None
     if config.telegram_bot_token is not None:
         telegram = TelegramTransport(
@@ -236,6 +244,7 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
         producers.append(telegram)
     runtime = ResidentRuntime(
         config, provider, capabilities=capabilities, event_producers=producers,
+        output_capabilities=output_capabilities,
         owner_transport=telegram, diagnostic_output=diagnostics.runtime)
     _bind_curator(runtime, config)
     for producer in producers:
