@@ -597,6 +597,26 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             "environment": {"type": "none"}, "agent": empty_agent})
         self.assertEqual(protocol, empty_reconstructed)
 
+    def test_managed_agent_instructions_require_authorized_owner_wake_reply(self):
+        from resident.provider import RESIDENT_AGENT_INSTRUCTIONS
+
+        self.assertIn(
+            "For an Owner-initiated wake, include a notify_owner output with the reply when that output is "
+            "authorized.", RESIDENT_AGENT_INSTRUCTIONS)
+        self.assertIn(
+            "Other terminal outputs, such as display outputs, do not constitute a reply to the Owner.",
+            RESIDENT_AGENT_INSTRUCTIONS)
+        self.assertIn(
+            "This requirement does not require notifying the Owner for spontaneous or other non-Owner wakes.",
+            RESIDENT_AGENT_INSTRUCTIONS)
+        self.assertIn(
+            "Structured outputs are terminal side-effect requests: Runtime delivers them only after the turn "
+            "has completed, and delivery results are not returned to this turn.",
+            RESIDENT_AGENT_INSTRUCTIONS)
+        self.assertIn(
+            "Follow Resident-specific instructions when choosing other authorized outputs.",
+            RESIDENT_AGENT_INSTRUCTIONS)
+
     def test_managed_agent_session_create_uses_exact_structured_output_wire_shape(self):
         from resident.provider import OpenAIAgentsProvider, RESIDENT_AGENT_INSTRUCTIONS
         provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
