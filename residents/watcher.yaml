@@ -25,6 +25,9 @@ capabilities:
   - display
   - messaging
 
+outputs:
+  - notify_owner
+
 subscriptions:
   - agentcontroller
   - messaging

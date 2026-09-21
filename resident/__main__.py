@@ -15,6 +15,7 @@ from .instances import (ResidentDefinition, load_resident_catalog, migrate_legac
                         resolve_environment)
 from .mailbox import Mailbox
 from .memory import MemoryCurator, OpenAICuratorModel
+from .outputs import OutputCapability
 from .provider import OpenAIAgentsProvider, OpenAIResponsesProvider
 from .runtime import ResidentRuntime
 from .telegram import TelegramTransport
@@ -65,6 +66,7 @@ def _provider(definition: ResidentDefinition):
 def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
     producers = []
     capabilities: list[Capability] = diagnostic_capabilities()
+    output_capabilities: list[OutputCapability] = []
     if config.homeops_url:
         connector = HomeOpsConnector(
             config.homeops_url, poll_seconds=config.homeops_poll_seconds,
@@ -73,9 +75,11 @@ def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
         producers.append(connector)
         capabilities.extend(connector.capabilities)
     if config.displays:
-        capabilities.extend(DisplayConnector(
+        display = DisplayConnector(
             config.homeops_url, config.displays,
-            request_timeout_seconds=config.homeops_request_timeout_seconds).capabilities)
+            request_timeout_seconds=config.homeops_request_timeout_seconds)
+        capabilities.extend(display.capabilities)
+        output_capabilities.extend(display.output_capabilities)
     if config.agentcontroller_snapshot_path is not None:
         connector = AgentControllerConnector(
             config.agentcontroller_snapshot_path,
@@ -95,7 +99,7 @@ def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
             diagnostic_output=diagnostics.camera)
         producers.append(connector)
         capabilities.extend(connector.capabilities)
-    return producers, capabilities
+    return producers, capabilities, output_capabilities
 
 
 def _bind_curator(runtime: ResidentRuntime, config: Config) -> None:
@@ -119,13 +123,36 @@ def _select_capabilities(grants: tuple[str, ...], available: list[Capability]) -
     return selected
 
 
+def _select_outputs(resident_id: str, grants: tuple[str, ...],
+                    available: list[OutputCapability], *,
+                    owner_available: bool) -> tuple[list[OutputCapability], bool]:
+    available_by_id = {output.grant_id: output for output in available}
+    supported = set(available_by_id)
+    if owner_available:
+        supported.add("notify_owner")
+    unavailable = sorted(set(grants) - supported)
+    if unavailable:
+        raise ValueError(
+            f"Unknown or unavailable output grants for {resident_id}: "
+            f"{', '.join(unavailable)}")
+    return ([output for output in available if output.grant_id in grants],
+            "notify_owner" in grants)
+
+
+def _legacy_output_capabilities(
+        selected: list[OutputCapability], available: list[Capability],
+) -> list[Capability]:
+    names = {output.legacy_tool_name for output in selected if output.legacy_tool_name}
+    return [capability for capability in available if capability.name in names]
+
+
 def build_host(config: Config) -> RuntimeHost:
     if config.residents_dir is None:
         raise ValueError("A Resident definitions directory is required")
     catalog = load_resident_catalog(
         config.residents_dir, prompt_root=config.prompt_root, default_id=config.default_resident)
     diagnostics = TerminalDiagnostics(config.verbose)
-    producers, available = _shared_resources(config, diagnostics)
+    producers, available, available_outputs = _shared_resources(config, diagnostics)
     mailbox = Mailbox(config.data_dir / "runtime" / "mailbox.sqlite3")
     for producer in producers:
         bind = getattr(producer, "bind_checkpoint", None)
@@ -154,8 +181,7 @@ def build_host(config: Config) -> RuntimeHost:
                 config, data_dir=config.data_dir / "instances" / definition.id,
                 instance_id=definition.id, resident_name=definition.name,
                 personality=definition.personality, role=definition.role,
-                owner_communication_enabled=(
-                    definition.owner_transport is not None or definition.id == catalog.default_id),
+                owner_communication_enabled=("notify_owner" in definition.outputs),
                 provider=definition.agent.provider, model=definition.agent.model,
                 reasoning_effort=definition.agent.reasoning_effort,
                 service_tier=definition.agent.service_tier,
@@ -187,11 +213,21 @@ def build_host(config: Config) -> RuntimeHost:
                     diagnostic_output=diagnostics.telegram)
                 private_producers[definition.id] = [transport]
             grants = _select_capabilities(definition.capabilities, available)
+            output_grants, owner_output_enabled = _select_outputs(
+                definition.id, definition.outputs, available_outputs,
+                owner_available=(
+                    definition.owner_transport is not None
+                    or definition.id == catalog.default_id))
+            granted_names = {capability.name for capability in grants}
+            grants.extend(capability for capability in _legacy_output_capabilities(
+                output_grants, available) if capability.name not in granted_names)
             if "messaging" in definition.capabilities:
                 grants.append(messaging_capability(mailbox, definition.id, recipients))
             runtime = ResidentRuntime(
                 instance_config, _provider(definition), capabilities=grants,
+                output_capabilities=output_grants,
                 owner_transport=transport,
+                owner_output_enabled=owner_output_enabled,
                 diagnostic_output=lambda message, item=definition.id:
                     diagnostics.runtime(f"{item}: {message}"))
             _bind_curator(runtime, instance_config)
@@ -225,7 +261,7 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
                 if config.provider == "openai-agents" else
                 OpenAIResponsesProvider(config.openai_api_key, config.model, config.openai_base_url))
     diagnostics = TerminalDiagnostics(config.verbose)
-    producers, capabilities = _shared_resources(config, diagnostics)
+    producers, capabilities, output_capabilities = _shared_resources(config, diagnostics)
     telegram = None
     if config.telegram_bot_token is not None:
         telegram = TelegramTransport(
@@ -236,6 +272,7 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
         producers.append(telegram)
     runtime = ResidentRuntime(
         config, provider, capabilities=capabilities, event_producers=producers,
+        output_capabilities=output_capabilities,
         owner_transport=telegram, diagnostic_output=diagnostics.runtime)
     _bind_curator(runtime, config)
     for producer in producers:

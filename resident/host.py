@@ -128,6 +128,7 @@ class RuntimeHost:
         runtime._event_queue = queue
         await runtime.enqueue_startup_wakeups(queue)
         scheduler = asyncio.create_task(runtime.scheduler_loop(queue, stop))
+        dispatcher = asyncio.create_task(runtime.output_dispatcher_loop(stop))
         try:
             while not stop.is_set():
                 event = await queue.get()
@@ -141,7 +142,8 @@ class RuntimeHost:
         finally:
             runtime._event_queue = None
             scheduler.cancel()
-            await asyncio.gather(scheduler, return_exceptions=True)
+            dispatcher.cancel()
+            await asyncio.gather(scheduler, dispatcher, return_exceptions=True)
 
     async def _collect_startup_readiness(
             self, shared_queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,

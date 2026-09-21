@@ -7,7 +7,7 @@ import time
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
-from typing import Awaitable, Callable, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
@@ -16,6 +16,8 @@ from .domain import ToolResult, WakeEvent
 from .provider import ModelProvider, RemoteSessionUnavailable
 from .memory import MemoryCurator, SessionHistoryUnavailable
 from .observability import EventLoopLagProbe, ObservedQueue, emit_timeline, timeline_reporter
+from .outputs import (OutputCapability, capability_for_output, output_schema,
+                      schema_fingerprint, validate_disposition)
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
@@ -50,8 +52,10 @@ class ResidentRuntime:
 
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: Sequence[Capability] | None = None,
+                 output_capabilities: Sequence[OutputCapability] | None = None,
                  event_producers: list[EventProducer] | None = None,
                  owner_transport: OwnerTransport | None = None,
+                 owner_output_enabled: bool | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
         self.config, self.provider = config, provider
@@ -80,7 +84,10 @@ class ResidentRuntime:
                     "openai_agents", session_id, wake_key),
                 lambda session_id, wake_key, correlation:
                     self.store.mark_agent_wake_submission_attempted(
-                        "openai_agents", session_id, wake_key, correlation),
+                        "openai_agents", session_id, wake_key, correlation,
+                        wake_id=self._active_event.id if self._active_event else None,
+                        wake_source=self._active_event.source if self._active_event else None,
+                        wake_reason=self._active_event.reason if self._active_event else None),
                 lambda session_id, wake_key, turn_id:
                     self.store.correlate_agent_wake_submission(
                         "openai_agents", session_id, wake_key, turn_id),
@@ -149,6 +156,44 @@ class ResidentRuntime:
         self._remote_owner_transport = owner_transport is not None
         self._mirror_owner_output = self.owner_output if owner_transport is not None else None
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
+        self._output_protocol_enabled = (
+            output_capabilities is not None or owner_transport is not None)
+        configured_outputs = list(output_capabilities or ())
+        if owner_output_enabled is None:
+            owner_output_enabled = config.owner_communication_enabled
+        if (self._output_protocol_enabled
+                and getattr(provider, "supports_output_capabilities", False)
+                and owner_output_enabled):
+            async def notify_owner(payload: dict[str, Any]) -> dict[str, Any]:
+                if self._mirror_owner_output is not None:
+                    try:
+                        self._mirror_owner_output(payload["content"])
+                    except Exception:
+                        pass
+                await self.owner_transport.send_text(payload["content"])
+                return {"status": "accepted_by_transport"}
+
+            configured_outputs.insert(0, OutputCapability(
+                output_type="notify_owner",
+                description="Send a statement or question to the Owner after this turn completes.",
+                payload_schema={
+                    "type": "object",
+                    "properties": {"content": {
+                        "type": "string", "minLength": 1, "maxLength": 4096}},
+                    "required": ["content"], "additionalProperties": False,
+                },
+                route_identity="owner", handler=notify_owner,
+                legacy_tool_name="send_owner_message",
+            ))
+        self._output_capabilities = self._validated_output_capabilities(configured_outputs)
+        self._output_schema = output_schema(self._output_capabilities)
+        self._output_schema_fingerprint = schema_fingerprint(self._output_schema)
+        configure_outputs = getattr(provider, "configure_output_protocol", None)
+        if configure_outputs is not None and self._output_protocol_enabled:
+            configure_outputs(
+                self._output_schema,
+                [capability.semantic_descriptor() for capability in self._output_capabilities],
+                self._output_schema_fingerprint)
         self.context_builder = ContextBuilder(
             self.store, message_limit=config.context_messages,
             role=config.role)
@@ -169,6 +214,38 @@ class ResidentRuntime:
     @property
     def capabilities(self) -> tuple[Capability, ...]:
         return self._capabilities
+
+    @property
+    def output_capabilities(self) -> tuple[OutputCapability, ...]:
+        return self._output_capabilities
+
+    @staticmethod
+    def _validated_output_capabilities(
+            capabilities: Sequence[OutputCapability]) -> tuple[OutputCapability, ...]:
+        snapshot = tuple(capabilities)
+        identities = [(item.output_type, item.target) for item in snapshot]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Duplicate output capability type and target")
+        for capability in snapshot:
+            capability.semantic_descriptor()
+            if capability.delivery_policy.max_attempts < 1:
+                raise ValueError("Output delivery max_attempts must be positive")
+        return snapshot
+
+    def _uses_structured_output_protocol(self) -> bool:
+        return bool(
+            self._output_protocol_enabled
+            and getattr(self.provider, "supports_output_capabilities", False)
+            and (getattr(self.provider, "session_id", None) is None
+                 or getattr(self.provider, "session_uses_output_capabilities", False)
+                 or getattr(self.provider, "rollover_ready", False)))
+
+    def _tool_capabilities_for_protocol(self, structured: bool) -> tuple[Capability, ...]:
+        if not structured:
+            return self._capabilities
+        replaced = {item.legacy_tool_name for item in self._output_capabilities
+                    if item.legacy_tool_name}
+        return tuple(item for item in self._capabilities if item.name not in replaced)
 
     @staticmethod
     def _validated_capabilities(capabilities: Sequence[Capability]) -> tuple[Capability, ...]:
@@ -226,6 +303,11 @@ class ResidentRuntime:
             tuple(capability for capability in self._capabilities if capability.name not in removed))
 
     async def enqueue_startup_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
+        try:
+            await self.recover_missing_disposition()
+        except Exception as exc:
+            self._emit("wake.failed", {
+                "error_type": type(exc).__name__, "phase": "disposition_recovery"})
         if self.curator is not None:
             token = timeline_reporter.set(self._timeline) if self.config.timeline else None
             try:
@@ -346,6 +428,199 @@ class ResidentRuntime:
             self._emit("communication.rejected", result)
         return result
 
+    def _active_output_protocol(self) -> tuple[dict[str, Any], str]:
+        protocol = getattr(self.provider, "active_output_protocol", None)
+        if isinstance(protocol, dict):
+            schema = protocol.get("schema")
+            fingerprint = protocol.get("fingerprint")
+            if isinstance(schema, dict) and isinstance(fingerprint, str):
+                return schema, fingerprint
+        return self._output_schema, self._output_schema_fingerprint
+
+    def _persist_disposition(
+            self, raw: str | None, session_id: str, turn_id: str, *,
+            run_id: str | None, wake: WakeEvent | None,
+            schema: dict[str, Any] | None = None,
+            fingerprint: str | None = None) -> dict[str, Any]:
+        schema = schema or self._output_schema
+        fingerprint = fingerprint or schema_fingerprint(schema)
+        normalized: dict[str, Any] | None = None
+        validation_state = "valid"
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else None
+        except json.JSONDecodeError:
+            parsed = None
+            validation_state = "invalid_json"
+        if validation_state == "valid":
+            error = validate_disposition(parsed, schema)
+            if error:
+                validation_state = "schema_invalid"
+            else:
+                normalized = parsed
+
+        jobs: list[dict[str, Any]] = []
+        spontaneous = not (wake is not None and wake.source == "owner")
+        attention_used = 0
+        if normalized is not None:
+            if spontaneous:
+                since = (datetime.now(UTC) - timedelta(
+                    seconds=self.config.spontaneous_message_window_seconds)).isoformat()
+                attention_used = self.store.spontaneous_attention_count_since(since)
+            for output in normalized["outputs"]:
+                capability = capability_for_output(output, self._output_capabilities)
+                current_error = (None if capability is None else
+                                 validate_disposition(
+                                     {"outputs": [output]}, output_schema([capability])))
+                state = "queued"
+                classification = None
+                if capability is None:
+                    state, classification = "rejected_unavailable", "capability_revoked"
+                elif current_error:
+                    state, classification = "rejected_policy", "current_policy_rejected"
+                elif output["type"] == "notify_owner" and spontaneous:
+                    if attention_used >= self.config.spontaneous_message_limit:
+                        state, classification = "rejected_policy", "attention_budget"
+                    else:
+                        attention_used += 1
+                payload = {key: value for key, value in output.items()
+                           if key not in {"type", "target"}}
+                jobs.append({
+                    "output_type": output["type"], "target": output.get("target"),
+                    "payload": payload,
+                    "route_identity": capability.route_identity if capability else None,
+                    "capability_fingerprint": capability.fingerprint if capability else None,
+                    "max_attempts": (
+                        capability.delivery_policy.max_attempts if capability else 1),
+                    "delivery_state": state, "failure_classification": classification,
+                    "sender_id": self.resident.id, "spontaneous": spontaneous,
+                    "message_status": (
+                        "rejected_attention_budget" if classification == "attention_budget"
+                        else "pending_delivery" if state == "queued"
+                        else state),
+                    "suppress_failure_event": bool(
+                        wake is not None and wake.reason == "output_delivery_failed"),
+                })
+        receipt = self.store.persist_final_disposition(
+            "openai_agents", session_id, turn_id, fingerprint, raw, normalized,
+            validation_state, jobs, run_id=run_id, wake_id=wake.id if wake else None)
+        if receipt["created"]:
+            self._emit("disposition.generated", {
+                "disposition_id": receipt["id"], "turn_id": turn_id,
+                "validation_state": validation_state,
+                "output_count": len(normalized["outputs"]) if normalized else 0,
+            })
+            for request in receipt["requests"]:
+                if request["delivery_state"] == "queued":
+                    self._emit("output.queued", {
+                        "output_id": request["id"], "output_type": request["output_type"],
+                        "target": request.get("target")})
+                else:
+                    self._emit("output.rejected", {
+                        "output_id": request["id"], "output_type": request["output_type"],
+                        "target": request.get("target"),
+                        "classification": request.get("failure_classification")})
+        if validation_state != "valid":
+            raise RuntimeError(f"Managed Agents final disposition is {validation_state}")
+        return receipt
+
+    async def recover_missing_disposition(self) -> bool:
+        if not getattr(self.provider, "supports_output_capabilities", False):
+            return False
+        binding = self.store.agent_session_binding("openai_agents")
+        if binding is None or not binding.get("last_turn_id"):
+            return False
+        session_id, turn_id = binding["session_id"], binding["last_turn_id"]
+        protocol = self.store.session_protocol("openai_agents", session_id)
+        if not protocol or not protocol.get("output_schema_fingerprint"):
+            return False
+        if self.store.has_final_disposition("openai_agents", session_id, turn_id):
+            return False
+        recover = getattr(self.provider, "recover_final_output", None)
+        if recover is None:
+            return False
+        raw = await recover(session_id, turn_id)
+        wake_context = self.store.disposition_wake_context(
+            "openai_agents", session_id, turn_id)
+        wake = (None if wake_context is None else WakeEvent(
+            wake_context.get("wake_id") or f"recovered:{turn_id}",
+            wake_context["wake_source"], wake_context["wake_reason"], utc_now(), {}))
+        self._persist_disposition(
+            raw, session_id, turn_id, run_id=None, wake=wake,
+            schema=protocol["output_schema"],
+            fingerprint=protocol["output_schema_fingerprint"])
+        return True
+
+    async def dispatch_outputs_once(self) -> bool:
+        request = self.store.claim_output_request()
+        if request is None:
+            return False
+        output_id, attempt = request["id"], request["attempt_count"]
+        self._emit("output.delivery_attempted", {
+            "output_id": output_id, "output_type": request["output_type"],
+            "target": request.get("target"), "attempt": attempt})
+        capability = next((item for item in self._output_capabilities
+                           if item.route_identity == request.get("route_identity")
+                           and item.fingerprint == request.get("capability_fingerprint")), None)
+        if capability is None:
+            self.store.finish_output_attempt(
+                output_id, attempt, "rejected_unavailable",
+                classification="capability_unavailable")
+            self._record_terminal_output_failure(request, "capability_unavailable", attempt)
+            return True
+        try:
+            result = await capability.handler(request["payload"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            from .telegram import TelegramPermanentTransportError
+            permanent = isinstance(exc, (TelegramPermanentTransportError,
+                                         ValueError, PermissionError))
+            if not permanent and attempt < capability.delivery_policy.max_attempts:
+                delays = capability.delivery_policy.retry_delays_seconds
+                delay = delays[min(attempt - 1, len(delays) - 1)] if delays else 1.0
+                self.store.finish_output_attempt(
+                    output_id, attempt, "retry_wait",
+                    classification=type(exc).__name__, retry_delay_seconds=delay)
+                self._emit("output.delivery_failed", {
+                    "output_id": output_id, "output_type": request["output_type"],
+                    "target": request.get("target"), "attempt": attempt,
+                    "classification": type(exc).__name__})
+            else:
+                classification = (type(exc).__name__ if permanent else "retries_exhausted")
+                self.store.finish_output_attempt(
+                    output_id, attempt, "failed_permanent", classification=classification)
+                self._record_terminal_output_failure(request, classification, attempt)
+            return True
+        external_id = result.get("external_message_id") if isinstance(result, dict) else None
+        self.store.finish_output_attempt(
+            output_id, attempt, "accepted_by_transport", external_message_id=external_id)
+        self._emit("output.delivery_succeeded", {
+            "output_id": output_id, "output_type": request["output_type"],
+            "target": request.get("target"), "attempt": attempt})
+        return True
+
+    def _record_terminal_output_failure(
+            self, request: dict[str, Any], classification: str, attempt: int) -> None:
+        self._emit("output.delivery_failed", {
+            "output_id": request["id"], "output_type": request["output_type"],
+            "target": request.get("target"), "attempt": attempt,
+            "classification": classification})
+        if self.store.generate_output_failure_event(request["id"]):
+            self._emit("output.failure_event_generated", {
+                "output_id": request["id"], "output_type": request["output_type"],
+                "target": request.get("target"), "classification": classification,
+                "attempt_count": attempt})
+
+    async def output_dispatcher_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            worked = await self.dispatch_outputs_once()
+            if worked:
+                continue
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=0.25)
+            except TimeoutError:
+                pass
+
     def _discard_continuation(self, continuation_id: str | None) -> None:
         if not continuation_id:
             return
@@ -415,7 +690,8 @@ class ResidentRuntime:
                 "event_id": event.id, "source": event.source, "reason": event.reason,
                 "occurred_at": event.occurred_at, "payload": event.payload,
             })
-            capabilities = capability_event_state[0] if capability_event_state else self._capabilities
+            configured_capabilities = (
+                capability_event_state[0] if capability_event_state else self._capabilities)
             preflight_session = getattr(self.provider, "preflight_session", None)
             emit_timeline("provider.preflight", "started")
             preflight_started = time.monotonic()
@@ -426,6 +702,14 @@ class ResidentRuntime:
                 emit_timeline("provider.preflight", "finished",
                               duration_seconds=time.monotonic() - preflight_started)
             managed_session = bool(getattr(self.provider, "uses_managed_session", False))
+            structured_outputs = self._uses_structured_output_protocol()
+            capabilities = (self._tool_capabilities_for_protocol(structured_outputs)
+                            if configured_capabilities is self._capabilities else
+                            tuple(item for item in configured_capabilities
+                                  if not structured_outputs or item.name not in {
+                                      output.legacy_tool_name
+                                      for output in self._output_capabilities
+                                      if output.legacy_tool_name}))
             authoritative_state = self.context_builder.authoritative_state(
                 self.resident, self.owner, capabilities)
             existing_session_id = getattr(self.provider, "session_id", None)
@@ -457,7 +741,8 @@ class ResidentRuntime:
             registry = ToolRegistry(
                 self.store, capabilities, self._send_owner_message, self._emit,
                 current_run_id=run_id,
-                owner_communication_enabled=self.config.owner_communication_enabled,
+                owner_communication_enabled=(
+                    self.config.owner_communication_enabled and not structured_outputs),
                 owner_guidance_authorization=owner_guidance_authorization)
             protocol_rollover = getattr(self.provider, "protocol_change_requires_rollover", None)
             new_session = getattr(self.provider, "session_id", None) is None
@@ -590,9 +875,21 @@ class ResidentRuntime:
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
                     "output_tokens": turn.output_tokens,
                 })
-                if turn.message:
+                active_structured_outputs = bool(
+                    getattr(self.provider, "session_uses_output_capabilities", False))
+                if turn.message and not active_structured_outputs:
                     self._emit("model.message", {"content": turn.message})
                 if not turn.tool_calls:
+                    if active_structured_outputs:
+                        session_id = getattr(self.provider, "session_id", None)
+                        if not session_id or not turn.response_id:
+                            raise RuntimeError(
+                                "Structured final disposition lacks session or turn identity")
+                        schema, fingerprint = self._active_output_protocol()
+                        self._persist_disposition(
+                            turn.message, session_id, turn.response_id,
+                            run_id=run_id, wake=event, schema=schema,
+                            fingerprint=fingerprint)
                     continuation_id = None
                     break
                 continuation_id = turn.response_id
@@ -809,6 +1106,7 @@ class ResidentRuntime:
         await probe.start()
         self.bind_event_loop_lag_checkpoint(probe.checkpoint)
         scheduler: asyncio.Task[None] | None = None
+        dispatcher: asyncio.Task[None] | None = None
         terminal: asyncio.Task[None] | None = None
         producers: list[asyncio.Task[None]] = []
 
@@ -831,6 +1129,7 @@ class ResidentRuntime:
         try:
             await self.enqueue_startup_wakeups(queue)
             scheduler = asyncio.create_task(self.scheduler_loop(queue, stop))
+            dispatcher = asyncio.create_task(self.output_dispatcher_loop(stop))
             producers, readiness = await self._collect_startup_readiness(queue, stop)
             self._render_startup_readiness(readiness)
             terminal = asyncio.create_task(terminal_input())
@@ -850,12 +1149,14 @@ class ResidentRuntime:
             stop.set()
             if scheduler is not None:
                 scheduler.cancel()
+            if dispatcher is not None:
+                dispatcher.cancel()
             if terminal is not None:
                 terminal.cancel()
             for producer in producers:
                 producer.cancel()
             await asyncio.gather(
-                *(task for task in (scheduler, terminal, *producers)
+                *(task for task in (scheduler, dispatcher, terminal, *producers)
                   if task is not None),
                 return_exceptions=True)
             self.bind_event_loop_lag_checkpoint(None)

@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,13 @@ _SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "model.responded": ("tool_call_count", "has_message", "input_tokens", "output_tokens"),
     "tool.called": ("name",),
     "tool.completed": ("name",),
+    "disposition.generated": ("disposition_id", "turn_id", "validation_state", "output_count"),
+    "output.queued": ("output_id", "output_type", "target"),
+    "output.rejected": ("output_id", "output_type", "target", "classification"),
+    "output.delivery_attempted": ("output_id", "output_type", "target", "attempt"),
+    "output.delivery_succeeded": ("output_id", "output_type", "target", "attempt"),
+    "output.delivery_failed": ("output_id", "output_type", "target", "attempt", "classification"),
+    "output.failure_event_generated": ("output_id", "output_type", "target", "classification", "attempt_count"),
     "timeline": (
         "operation", "moment", "outcome", "duration_seconds",
         "executor_queue_seconds", "worker_seconds", "queue_wait_seconds",
@@ -45,8 +52,32 @@ MAX_ACTIVE_OWNER_GUIDANCE_BYTES = 32768
 def _create_request_configuration(request: dict[str, Any]) -> tuple[dict, dict]:
     """Reconstruct the applied descriptors solely from a durable create request."""
     agent = request.get("agent") if isinstance(request.get("agent"), dict) else {}
+    schema = ((agent.get("text") or {}).get("format") or {}).get("schema")
+    output_descriptors = []
+    if isinstance(schema, dict):
+        branches = (((schema.get("properties") or {}).get("outputs") or {})
+                    .get("items", {}).get("anyOf", []))
+        for branch in branches:
+            properties = branch.get("properties", {})
+            type_enum = properties.get("type", {}).get("enum", [])
+            target_enum = properties.get("target", {}).get("enum", [])
+            if len(type_enum) != 1:
+                continue
+            payload_properties = {key: value for key, value in properties.items()
+                                  if key not in {"type", "target"}}
+            payload_required = [key for key in branch.get("required", [])
+                                if key not in {"type", "target"}]
+            output_descriptors.append({
+                "type": type_enum[0] if len(type_enum) == 1 else None,
+                "target": target_enum[0] if len(target_enum) == 1 else None,
+                "description": branch.get("description"),
+                "payload_schema": {
+                    "type": "object", "properties": payload_properties,
+                    "required": payload_required, "additionalProperties": False,
+                },
+            })
     protocol = {
-        "version": 1,
+        "version": 2 if agent.get("text") else 1,
         "instructions": agent.get("instructions"),
         "tools": [{key: tool.get(key) for key in
                    ("type", "name", "description", "parameters")}
@@ -54,6 +85,11 @@ def _create_request_configuration(request: dict[str, Any]) -> tuple[dict, dict]:
         "saved_agent_id": request.get("agent_id"),
         "environment": request.get("environment"),
         "security_policy_revision": 1,
+        "output_schema_fingerprint": (hashlib.sha256(json.dumps(
+            schema, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if schema is not None else None),
+        "output_schema": schema,
+        "output_capabilities": output_descriptors,
     }
     mutable = {key: agent[key] for key in ("model", "reasoning", "service_tier")
                if key in agent}
@@ -203,8 +239,30 @@ class Store:
           provider TEXT NOT NULL, session_id TEXT NOT NULL, wake_key TEXT NOT NULL,
           correlation TEXT NOT NULL,
           state TEXT NOT NULL CHECK(state IN ('possibly_accepted','settled')),
-          turn_id TEXT, attempted_at TEXT NOT NULL, settled_at TEXT,
+          turn_id TEXT, wake_id TEXT, wake_source TEXT, wake_reason TEXT,
+          attempted_at TEXT NOT NULL, settled_at TEXT,
           PRIMARY KEY(provider,session_id,wake_key));
+        CREATE TABLE IF NOT EXISTS final_dispositions(
+          id TEXT PRIMARY KEY, provider TEXT NOT NULL, session_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL, run_id TEXT, wake_id TEXT,
+          schema_fingerprint TEXT NOT NULL, raw_disposition TEXT,
+          normalized_disposition_json TEXT, validation_state TEXT NOT NULL,
+          created_at TEXT NOT NULL, UNIQUE(provider,session_id,turn_id));
+        CREATE TABLE IF NOT EXISTS output_requests(
+          id TEXT PRIMARY KEY, disposition_id TEXT NOT NULL REFERENCES final_dispositions(id),
+          ordinal INTEGER NOT NULL, output_type TEXT NOT NULL, target TEXT,
+          payload_json TEXT NOT NULL, route_identity TEXT, capability_fingerprint TEXT,
+          delivery_state TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 3,
+          next_attempt_at TEXT, last_failure_classification TEXT,
+          message_id TEXT REFERENCES messages(id), failure_event_generated INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(disposition_id,ordinal));
+        CREATE TABLE IF NOT EXISTS output_attempts(
+          output_request_id TEXT NOT NULL REFERENCES output_requests(id),
+          attempt_number INTEGER NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+          outcome TEXT NOT NULL, failure_classification TEXT, external_message_id TEXT,
+          PRIMARY KEY(output_request_id,attempt_number));
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_wake_runs_started ON wake_runs(started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_journal_run_sequence ON journal(run_id, sequence);
@@ -212,6 +270,8 @@ class Store:
         CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory_records(status,updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_memory_provenance_source
           ON memory_provenance(source_session_id,source_item_id);
+        CREATE INDEX IF NOT EXISTS idx_output_dispatch
+          ON output_requests(delivery_state,next_attempt_at,created_at);
         """)
         # An already-provisioned Resident predates capability snapshots. Seed an
         # empty baseline so its first run with this feature sees the currently
@@ -284,6 +344,23 @@ class Store:
             with self.connection:
                 self.connection.execute(
                     "ALTER TABLE curator_checkpoints ADD COLUMN handover_draft TEXT")
+        wake_submission_columns = {
+            row["name"] for row in self.connection.execute(
+                "PRAGMA table_info(agent_wake_submissions)")
+        }
+        with self.connection:
+            for name in ("wake_id", "wake_source", "wake_reason"):
+                if name not in wake_submission_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE agent_wake_submissions ADD COLUMN {name} TEXT")
+        output_request_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(output_requests)")
+        }
+        if "max_attempts" not in output_request_columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE output_requests ADD COLUMN "
+                    "max_attempts INTEGER NOT NULL DEFAULT 3")
         rollover_columns = {
             row["name"] for row in self.connection.execute("PRAGMA table_info(session_rollovers)")
         }
@@ -328,7 +405,58 @@ class Store:
                     json.dumps(mutable, sort_keys=True, separators=(",", ":")),
                     row["id"],
                 ))
-        self.connection.execute("UPDATE schema_version SET version=18")
+        self.connection.execute("UPDATE schema_version SET version=20")
+        # A process may stop after transport acceptance but before recording it.
+        # Retry uncertain attempts only while the persisted delivery policy allows it.
+        now = utc_now()
+        interrupted = self.connection.execute("""
+            SELECT id,output_type,target,attempt_count,max_attempts,message_id,
+                   failure_event_generated
+            FROM output_requests
+            WHERE delivery_state='attempting'
+               OR (delivery_state='retry_wait' AND attempt_count>=max_attempts)
+        """).fetchall()
+        with self.connection:
+            for row in interrupted:
+                exhausted = int(row["attempt_count"]) >= int(row["max_attempts"])
+                self.connection.execute("""
+                    UPDATE output_attempts SET finished_at=?,outcome='delivery_uncertain',
+                      failure_classification='interrupted_attempt'
+                    WHERE output_request_id=? AND attempt_number=? AND outcome='attempting'
+                """, (now, row["id"], row["attempt_count"]))
+                if not exhausted:
+                    self.connection.execute("""
+                        UPDATE output_requests SET delivery_state='retry_wait',next_attempt_at=?,
+                          last_failure_classification='interrupted_attempt',updated_at=?
+                        WHERE id=? AND delivery_state='attempting'
+                    """, (now, now, row["id"]))
+                    continue
+                self.connection.execute("""
+                    UPDATE output_requests SET delivery_state='failed_permanent',
+                      next_attempt_at=NULL,last_failure_classification='retries_exhausted',
+                      updated_at=? WHERE id=?
+                        AND delivery_state IN ('attempting','retry_wait')
+                """, (now, row["id"]))
+                if row["message_id"]:
+                    self.connection.execute(
+                        "UPDATE messages SET delivery_status='transport_failed' WHERE id=?",
+                        (row["message_id"],))
+                if not row["failure_event_generated"]:
+                    context = json.dumps({
+                        "output_id": row["id"], "output_type": row["output_type"],
+                        "target": row["target"],
+                        "failure_classification": "retries_exhausted",
+                        "attempt_count": row["attempt_count"],
+                    }, separators=(",", ":"))
+                    self.connection.execute("""
+                        UPDATE output_requests SET failure_event_generated=1 WHERE id=?
+                    """, (row["id"],))
+                    self.connection.execute("""
+                        INSERT INTO scheduled_wakeups(
+                          id,due_at,reason,context_json,status,created_at)
+                        VALUES(?,?, 'output_delivery_failed',?,'pending',?)
+                        ON CONFLICT(id) DO NOTHING
+                    """, (f"output-failure:{row['id']}", now, context, now))
         self.connection.execute("UPDATE scheduled_wakeups SET status='pending' WHERE status='claimed'")
         self.connection.commit()
 
@@ -396,7 +524,7 @@ class Store:
                               wake_key: str) -> dict[str, Any] | None:
         row = self.connection.execute("""
             SELECT provider,session_id,wake_key,correlation,state,turn_id,
-                   attempted_at,settled_at
+                   wake_id,wake_source,wake_reason,attempted_at,settled_at
             FROM agent_wake_submissions
             WHERE provider=? AND session_id=? AND wake_key=?
         """, (provider, session_id, wake_key)).fetchone()
@@ -404,19 +532,39 @@ class Store:
 
     def mark_agent_wake_submission_attempted(self, provider: str, session_id: str,
                                              wake_key: str,
-                                             correlation: str) -> None:
+                                             correlation: str, *, wake_id: str | None = None,
+                                             wake_source: str | None = None,
+                                             wake_reason: str | None = None) -> None:
         """Durably cross the point of no blind retry before the remote POST."""
         now = utc_now()
         with self.connection:
             self.connection.execute("""
                 INSERT INTO agent_wake_submissions(
-                  provider,session_id,wake_key,correlation,state,turn_id,
-                  attempted_at,settled_at)
-                VALUES(?,?,?,?,'possibly_accepted',NULL,?,NULL)
+                  provider,session_id,wake_key,correlation,state,turn_id,wake_id,
+                  wake_source,wake_reason,attempted_at,settled_at)
+                VALUES(?,?,?,?,'possibly_accepted',NULL,?,?,?,?,NULL)
                 ON CONFLICT(provider,session_id,wake_key) DO UPDATE SET
                   correlation=excluded.correlation,state='possibly_accepted',
-                  turn_id=NULL,attempted_at=excluded.attempted_at,settled_at=NULL
-            """, (provider, session_id, wake_key, correlation, now))
+                  turn_id=NULL,
+                  wake_id=COALESCE(excluded.wake_id,agent_wake_submissions.wake_id),
+                  wake_source=COALESCE(
+                    excluded.wake_source,agent_wake_submissions.wake_source),
+                  wake_reason=COALESCE(
+                    excluded.wake_reason,agent_wake_submissions.wake_reason),
+                  attempted_at=excluded.attempted_at,
+                  settled_at=NULL
+            """, (provider, session_id, wake_key, correlation, wake_id,
+                  wake_source, wake_reason, now))
+
+    def disposition_wake_context(self, provider: str, session_id: str,
+                                 turn_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute("""
+            SELECT wake_id,wake_source,wake_reason FROM agent_wake_submissions
+            WHERE provider=? AND session_id=? AND turn_id=?
+        """, (provider, session_id, turn_id)).fetchone()
+        if row is None or row["wake_source"] is None or row["wake_reason"] is None:
+            return None
+        return dict(row)
 
     def correlate_agent_wake_submission(self, provider: str, session_id: str,
                                         wake_key: str, turn_id: str) -> None:
@@ -1038,6 +1186,165 @@ class Store:
                 WHERE provider=? AND session_id=? AND call_id=? AND status='pending'
             """, (encoded, int(attachments_ephemeral), utc_now(), provider, session_id, call_id))
 
+    @staticmethod
+    def _disposition_id(provider: str, session_id: str, turn_id: str) -> str:
+        return hashlib.sha256(
+            f"{provider}\0{session_id}\0{turn_id}".encode()).hexdigest()
+
+    def has_final_disposition(self, provider: str, session_id: str, turn_id: str) -> bool:
+        return self.connection.execute("""
+            SELECT 1 FROM final_dispositions
+            WHERE provider=? AND session_id=? AND turn_id=?
+        """, (provider, session_id, turn_id)).fetchone() is not None
+
+    def persist_final_disposition(
+            self, provider: str, session_id: str, turn_id: str,
+            schema_fingerprint: str, raw_disposition: str | None,
+            normalized: dict[str, Any] | None, validation_state: str,
+            jobs: list[dict[str, Any]], *, run_id: str | None = None,
+            wake_id: str | None = None) -> dict[str, Any]:
+        disposition_id = self._disposition_id(provider, session_id, turn_id)
+        now = utc_now()
+        normalized_json = (json.dumps(normalized, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":"))
+                           if normalized is not None else None)
+        created_requests: list[dict[str, Any]] = []
+        with self.connection:
+            inserted = self.connection.execute("""
+                INSERT INTO final_dispositions(
+                  id,provider,session_id,turn_id,run_id,wake_id,schema_fingerprint,
+                  raw_disposition,normalized_disposition_json,validation_state,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,session_id,turn_id) DO NOTHING
+            """, (disposition_id, provider, session_id, turn_id, run_id, wake_id,
+                  schema_fingerprint, raw_disposition, normalized_json,
+                  validation_state, now)).rowcount == 1
+            if not inserted:
+                return {"id": disposition_id, "created": False, "requests": []}
+            for ordinal, job in enumerate(jobs):
+                output_id = hashlib.sha256(
+                    f"{disposition_id}\0{ordinal}".encode()).hexdigest()
+                message_id = None
+                if job["output_type"] == "notify_owner":
+                    message_id = output_id
+                    self.connection.execute("""
+                        INSERT INTO messages(
+                          id,direction,sender_id,content,spontaneous,delivery_status,created_at)
+                        VALUES(?,?,?,?,?,?,?)
+                    """, (message_id, "outbound", job["sender_id"],
+                          job["payload"]["content"], int(job.get("spontaneous", False)),
+                          job.get("message_status", "pending_delivery"), now))
+                self.connection.execute("""
+                    INSERT INTO output_requests(
+                      id,disposition_id,ordinal,output_type,target,payload_json,
+                      route_identity,capability_fingerprint,delivery_state,max_attempts,next_attempt_at,
+                      last_failure_classification,message_id,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (output_id, disposition_id, ordinal, job["output_type"],
+                      job.get("target"), json.dumps(job["payload"], ensure_ascii=False,
+                                                   sort_keys=True, separators=(",", ":")),
+                      job.get("route_identity"), job.get("capability_fingerprint"),
+                      job["delivery_state"], job.get("max_attempts", 3),
+                      now if job["delivery_state"] == "queued" else None,
+                      job.get("failure_classification"), message_id, now, now))
+                if job.get("suppress_failure_event"):
+                    self.connection.execute(
+                        "UPDATE output_requests SET failure_event_generated=1 WHERE id=?",
+                        (output_id,))
+                created_requests.append({"id": output_id, **job, "message_id": message_id})
+        return {"id": disposition_id, "created": True, "requests": created_requests}
+
+    def claim_output_request(self, now: str | None = None) -> dict[str, Any] | None:
+        now = now or utc_now()
+        with self.connection:
+            row = self.connection.execute("""
+                SELECT * FROM output_requests
+                WHERE delivery_state IN ('queued','retry_wait')
+                  AND attempt_count < max_attempts
+                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                ORDER BY created_at,ordinal LIMIT 1
+            """, (now,)).fetchone()
+            if row is None:
+                return None
+            attempt = int(row["attempt_count"]) + 1
+            updated = self.connection.execute("""
+                UPDATE output_requests SET delivery_state='attempting',attempt_count=?,
+                  updated_at=? WHERE id=? AND delivery_state IN ('queued','retry_wait')
+            """, (attempt, now, row["id"])).rowcount
+            if updated != 1:
+                return None
+            self.connection.execute("""
+                INSERT INTO output_attempts(
+                  output_request_id,attempt_number,started_at,outcome)
+                VALUES(?,?,?,'attempting')
+            """, (row["id"], attempt, now))
+        result = dict(row)
+        result["attempt_count"] = attempt
+        result["payload"] = json.loads(result.pop("payload_json"))
+        return result
+
+    def finish_output_attempt(
+            self, output_id: str, attempt: int, state: str, *,
+            classification: str | None = None, retry_delay_seconds: float | None = None,
+            external_message_id: str | None = None) -> None:
+        now = utc_now()
+        next_attempt = (datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)).isoformat() \
+            if retry_delay_seconds is not None else None
+        outcome = ("accepted_by_transport" if state == "accepted_by_transport" else
+                   "delivery_uncertain" if state == "delivery_uncertain" else "failed")
+        with self.connection:
+            self.connection.execute("""
+                UPDATE output_attempts SET finished_at=?,outcome=?,failure_classification=?,
+                  external_message_id=? WHERE output_request_id=? AND attempt_number=?
+            """, (now, outcome, classification, external_message_id, output_id, attempt))
+            self.connection.execute("""
+                UPDATE output_requests SET delivery_state=?,next_attempt_at=?,
+                  last_failure_classification=?,updated_at=? WHERE id=?
+            """, (state, next_attempt, classification, now, output_id))
+            row = self.connection.execute(
+                "SELECT message_id FROM output_requests WHERE id=?", (output_id,)).fetchone()
+            if row is not None and row["message_id"]:
+                message_status = {
+                    "accepted_by_transport": "delivered",
+                    "failed_permanent": "transport_failed",
+                    "delivery_uncertain": "pending_delivery",
+                    "retry_wait": "pending_delivery",
+                    "rejected_unavailable": "transport_failed",
+                }.get(state)
+                if message_status:
+                    self.connection.execute(
+                        "UPDATE messages SET delivery_status=? WHERE id=?",
+                        (message_status, row["message_id"]))
+
+    def generate_output_failure_event(self, output_id: str) -> bool:
+        with self.connection:
+            changed = self.connection.execute("""
+                UPDATE output_requests SET failure_event_generated=1,updated_at=?
+                WHERE id=? AND failure_event_generated=0
+            """, (utc_now(), output_id)).rowcount == 1
+            if not changed:
+                return False
+            row = self.connection.execute("""
+                SELECT output_type,target,last_failure_classification,attempt_count
+                FROM output_requests WHERE id=?
+            """, (output_id,)).fetchone()
+            event_id = f"output-failure:{output_id}"
+            context = json.dumps({
+                "output_id": output_id, "output_type": row["output_type"],
+                "target": row["target"],
+                "failure_classification": row["last_failure_classification"],
+                "attempt_count": row["attempt_count"],
+            }, separators=(",", ":"))
+            self.connection.execute("""
+                INSERT INTO scheduled_wakeups(id,due_at,reason,context_json,status,created_at)
+                VALUES(?,?, 'output_delivery_failed',?,'pending',?) ON CONFLICT(id) DO NOTHING
+            """, (event_id, utc_now(), context, utc_now()))
+            return True
+
+    def output_request(self, output_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM output_requests WHERE id=?", (output_id,)).fetchone()
+        return None if row is None else dict(row)
+
     def provision(self, resident_name: str, owner_name: str, personality: str) -> tuple[Identity, Identity]:
         now = utc_now()
         with self.connection:
@@ -1169,6 +1476,13 @@ class Store:
         return int(self.connection.execute(
             "SELECT count(*) FROM messages WHERE direction='outbound' AND spontaneous=1 AND delivery_status='delivered' AND created_at>=?",
             (since,),).fetchone()[0])
+
+    def spontaneous_attention_count_since(self, since: str) -> int:
+        return int(self.connection.execute("""
+            SELECT count(*) FROM messages
+            WHERE direction='outbound' AND spontaneous=1
+              AND delivery_status IN ('pending_delivery','delivered') AND created_at>=?
+        """, (since,)).fetchone()[0])
 
     def create_intention(self, content: str) -> str:
         item_id, now = str(uuid.uuid4()), utc_now()

@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from resident.__main__ import build_host
-from resident.config import Config, SUPPORTED_REASONING_EFFORTS
+from resident.config import Config, DisplayConfig, SUPPORTED_REASONING_EFFORTS
 from resident.domain import ModelTurn, WakeEvent
 from resident.host import InstancePolicy, RuntimeHost, messaging_capability
 from resident.instances import load_resident_catalog, migrate_legacy_state
@@ -23,6 +23,15 @@ from resident.store import utc_now
 class IdleProvider:
     async def respond(self, context, tools, results, continuation_id=None):
         return ModelTurn("turn", None, ())
+
+
+class OutputProvider(IdleProvider):
+    supports_output_capabilities = True
+
+    def configure_output_protocol(self, schema, descriptors, fingerprint):
+        self.schema = schema
+        self.descriptors = descriptors
+        self.fingerprint = fingerprint
 
 
 class InstanceDefinitionTests(unittest.TestCase):
@@ -145,6 +154,7 @@ name: Oracle
 personality_prompt: oracle.md
 role: Answer narrow questions.
 capabilities: [messaging]
+outputs: [notify_owner, display/display1]
 subscriptions: [homeops]
 """, encoding="utf-8")
             catalog = load_resident_catalog(root / "residents", default_id="oracle")
@@ -152,7 +162,154 @@ subscriptions: [homeops]
             self.assertEqual("Be precise.", oracle.personality)
             self.assertEqual("Answer narrow questions.", oracle.role)
             self.assertEqual(("messaging",), oracle.capabilities)
+            self.assertEqual(("notify_owner", "display/display1"), oracle.outputs)
             self.assertEqual(("homeops",), oracle.subscriptions)
+
+    def test_outputs_must_be_a_unique_string_list(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            definitions = Path(temporary) / "residents"
+            definitions.mkdir()
+            definition = definitions / "resident.yaml"
+            base = "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+            for value in ("{notify_owner: true}", "[notify_owner, notify_owner]", "[1]"):
+                with self.subTest(value=value):
+                    definition.write_text(f"{base}outputs: {value}\n", encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "outputs"):
+                        load_resident_catalog(definitions)
+
+    def test_per_resident_output_grants_resolve_against_shared_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "capabilities: [display]\noutputs: [notify_owner, display/display1]\n",
+                encoding="utf-8")
+            (definitions / "helper.yaml").write_text(
+                "id: helper\nname: Helper\npersonality: Test.\nrole: Test.\n"
+                "outputs: [display/display2]\n", encoding="utf-8")
+            config = Config(
+                root / "data", residents_dir=definitions,
+                homeops_url="http://homeops.test",
+                displays=(DisplayConfig("display1"), DisplayConfig("display2")))
+
+            with patch("resident.__main__._provider", side_effect=lambda _: OutputProvider()):
+                host = build_host(config)
+            try:
+                resident = host.runtimes["resident"]
+                helper = host.runtimes["helper"]
+                self.assertEqual(
+                    ["notify_owner", "display/display1"],
+                    [output.grant_id for output in resident.output_capabilities])
+                self.assertEqual(
+                    ["display/display2"],
+                    [output.grant_id for output in helper.output_capabilities])
+                self.assertNotIn("display2", json.dumps(resident._output_schema))
+                self.assertNotIn("display1", json.dumps(helper._output_schema))
+                self.assertNotEqual(
+                    resident._output_schema_fingerprint,
+                    helper._output_schema_fingerprint)
+                # The compatibility function is present for Responses/old-session
+                # protocols even though the new structured protocol filters it.
+                self.assertIn("display2_show_text", [item.name for item in helper.capabilities])
+                self.assertNotIn(
+                    "display2_show_text",
+                    [item.name for item in helper._tool_capabilities_for_protocol(True)])
+            finally:
+                host.close()
+
+    def test_available_owner_route_is_not_an_implicit_grant_and_empty_outputs_is_silent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "outputs: []\n", encoding="utf-8")
+            with patch("resident.__main__._provider", return_value=OutputProvider()):
+                host = build_host(Config(root / "data", residents_dir=definitions))
+            try:
+                runtime = host.runtimes["resident"]
+                self.assertEqual((), runtime.output_capabilities)
+                self.assertEqual(0, runtime._output_schema["properties"]["outputs"]["maxItems"])
+                self.assertEqual([], runtime.provider.descriptors)
+            finally:
+                host.close()
+
+    def test_configured_owner_transport_is_available_but_not_granted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "outputs: []\nowner_transport:\n  type: telegram\n"
+                "  token_env: TEST_BOT_TOKEN\n  owner_user_id_env: TEST_OWNER_USER\n"
+                "  owner_chat_id_env: TEST_OWNER_CHAT\n", encoding="utf-8")
+            environment = {
+                "TEST_BOT_TOKEN": "token", "TEST_OWNER_USER": "1", "TEST_OWNER_CHAT": "1",
+            }
+            with (patch.dict(os.environ, environment, clear=True),
+                  patch("resident.__main__._provider", return_value=OutputProvider())):
+                host = build_host(Config(root / "data", residents_dir=definitions))
+            try:
+                runtime = host.runtimes["resident"]
+                self.assertTrue(runtime._remote_owner_transport)
+                self.assertEqual((), runtime.output_capabilities)
+                self.assertFalse(runtime.config.owner_communication_enabled)
+            finally:
+                host.close()
+
+    def test_output_grants_do_not_come_from_callable_capabilities(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "capabilities: [display]\noutputs: []\n", encoding="utf-8")
+            config = Config(
+                root / "data", residents_dir=definitions,
+                homeops_url="http://homeops.test", displays=(DisplayConfig("display1"),))
+            with patch("resident.__main__._provider", return_value=OutputProvider()):
+                host = build_host(config)
+            try:
+                runtime = host.runtimes["resident"]
+                self.assertEqual((), runtime.output_capabilities)
+                self.assertIn("display1_show_text", [item.name for item in runtime.capabilities])
+            finally:
+                host.close()
+
+    def test_unavailable_output_grants_fail_before_provider_creation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\noutputs: [display/missing]\n",
+                encoding="utf-8")
+            with patch("resident.__main__._provider") as provider:
+                with self.assertRaisesRegex(
+                        ValueError, "Unknown or unavailable output grants for resident: display/missing"):
+                    build_host(Config(root / "data", residents_dir=definitions))
+                provider.assert_not_called()
+
+    def test_notify_owner_grant_requires_an_owner_route(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\noutputs: []\n",
+                encoding="utf-8")
+            (definitions / "helper.yaml").write_text(
+                "id: helper\nname: Helper\npersonality: Test.\nrole: Test.\n"
+                "outputs: [notify_owner]\n", encoding="utf-8")
+            with patch("resident.__main__._provider", return_value=OutputProvider()):
+                with self.assertRaisesRegex(
+                        ValueError, "Unknown or unavailable output grants for helper: notify_owner"):
+                    build_host(Config(root / "data", residents_dir=definitions))
 
     def test_rejects_inline_secrets_and_prompt_traversal(self):
         with tempfile.TemporaryDirectory() as temporary:

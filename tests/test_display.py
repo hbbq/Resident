@@ -33,6 +33,16 @@ class DisplayConnectorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(["text"], connector.capabilities[0].input_schema["required"])
 
+    async def test_each_display_exposes_a_target_specific_output_capability(self):
+        connector = DisplayConnector("http://homeops.test", [
+            DisplayConfig("display1", 40), DisplayConfig("display2", 120),
+        ])
+
+        first, second = connector.output_capabilities
+        self.assertEqual(("display", "display1"), (first.output_type, first.target))
+        self.assertEqual(40, first.payload_schema["properties"]["content"]["maxLength"])
+        self.assertEqual(120, second.payload_schema["properties"]["content"]["maxLength"])
+
     async def test_show_text_posts_json_to_escaped_display_endpoint_and_accepts_204(self):
         connector = DisplayConnector(
             "http://homeops.test/root/", [DisplayConfig("display1")],
@@ -85,6 +95,14 @@ class DisplayConfigTests(unittest.TestCase):
         self.assertEqual((DisplayConfig("display1"),), enabled.displays)
         self.assertEqual("http://homeops.test", enabled.homeops_url)
         self.assertEqual(4, enabled.homeops_request_timeout_seconds)
+
+    def test_display_configuration_accepts_target_specific_max_length(self):
+        with patch.dict(os.environ, {
+            "RESIDENT_DISPLAYS": '[{"id":"display1","max_length":40}]',
+            "RESIDENT_HOMEOPS_URL": "http://homeops.test",
+        }):
+            config = Config.from_env_and_args(["--data-dir", ".resident"])
+        self.assertEqual((DisplayConfig("display1", 40),), config.displays)
 
     def test_displays_require_homeops_url(self):
         with patch.dict(os.environ, {

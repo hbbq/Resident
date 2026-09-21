@@ -154,7 +154,7 @@ class HomeOpsConnectorTests(unittest.IsolatedAsyncioTestCase):
 
 class HomeOpsConfigTests(unittest.TestCase):
     def test_homeops_is_disabled_by_default_and_cli_can_enable_it(self):
-        with patch.dict(os.environ, {"RESIDENT_HOMEOPS_URL": ""}):
+        with patch.dict(os.environ, {"RESIDENT_HOMEOPS_URL": "", "RESIDENT_DISPLAYS": ""}):
             disabled = Config.from_env_and_args(["--data-dir", ".resident"])
         enabled = Config.from_env_and_args([
             "--data-dir", ".resident", "--homeops-url", "http://homeops.test/",
