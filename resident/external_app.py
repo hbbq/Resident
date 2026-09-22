@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import asyncio
-from http.client import HTTPException
+from http.client import HTTPConnection, HTTPSConnection, HTTPException
 import json
 import socket
+import threading
+import time
 import uuid
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .capabilities import Capability, current_invocation_id
 from .instances import ExternalApplicationDefinition, ExternalOperationDefinition
@@ -17,11 +17,6 @@ from .observability import to_thread_timed
 
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 1024 * 1024
-
-
-class _NoRedirects(HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, msg, headers, newurl):
-        return None
 
 
 class ExternalApplicationConnector:
@@ -52,15 +47,70 @@ class ExternalApplicationConnector:
         ) for operation in self.definition.operations]
 
     def _post(self, payload: bytes) -> Any:
+        deadline = time.monotonic() + self.definition.request_timeout_seconds
+        url = urlsplit(f"{self.base_url}/api/capabilities/invoke")
+        connection = (HTTPSConnection if url.scheme == "https" else HTTPConnection)(
+            url.hostname, url.port, timeout=self.definition.request_timeout_seconds)
+        active_socket: list[socket.socket] = []
+
+        def abort() -> None:
+            # Closing alone does not reliably wake a blocked recv on every platform.
+            for sock in active_socket:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            connection.close()
+
+        expired = threading.Event()
+
+        def expire() -> None:
+            expired.set()
+            abort()
+
+        timer = threading.Timer(self.definition.request_timeout_seconds, expire)
+        timer.daemon = True
+        timer.start()
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if self.bearer_token is not None:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
-        request = Request(
-            f"{self.base_url}/api/capabilities/invoke", data=payload,
-            headers=headers, method="POST")
-        with build_opener(_NoRedirects()).open(
-                request, timeout=self.definition.request_timeout_seconds) as response:
-            raw = response.read(_MAX_RESPONSE_BYTES + 1)
+        try:
+            connection.connect()
+            if expired.is_set() or time.monotonic() >= deadline:
+                raise TimeoutError
+            active_socket.append(connection.sock)
+            connection.sock.settimeout(max(deadline - time.monotonic(), 1e-6))
+            connection.request("POST", url.path, body=payload, headers=headers)
+            response = connection.getresponse()
+            if not 200 <= response.status < 300:
+                raise HTTPError(url.geturl(), response.status, response.reason,
+                                response.headers, response)
+            chunks = []
+            size = 0
+            while size <= _MAX_RESPONSE_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                active_socket[0].settimeout(remaining)
+                chunk = response.read1(min(65536, _MAX_RESPONSE_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            raw = b"".join(chunks)
+            if expired.is_set() or time.monotonic() >= deadline:
+                raise TimeoutError
+        except (OSError, HTTPException) as exc:
+            if expired.is_set() or time.monotonic() >= deadline:
+                raise TimeoutError from exc
+            raise
+        finally:
+            timer.cancel()
+            abort()
         if len(raw) > _MAX_RESPONSE_BYTES:
             raise ValueError("response_too_large")
         try:
@@ -94,15 +144,11 @@ class ExternalApplicationConnector:
             return self._failure(
                 "request_too_large", "External operation request is too large", request_id)
         try:
-            result = await asyncio.wait_for(
-                to_thread_timed(
-                    "external_application.request", self._post, payload,
-                    provider=self.definition.id, external_operation=operation.operation,
-                    mutating=operation.mutating,
-                    request_timeout_seconds=self.definition.request_timeout_seconds),
-                timeout=self.definition.request_timeout_seconds)
-        except asyncio.CancelledError:
-            raise
+            result = await to_thread_timed(
+                "external_application.request", self._post, payload,
+                provider=self.definition.id, external_operation=operation.operation,
+                mutating=operation.mutating,
+                request_timeout_seconds=self.definition.request_timeout_seconds)
         except HTTPError as exc:
             if 300 <= exc.code < 400:
                 if operation.mutating:

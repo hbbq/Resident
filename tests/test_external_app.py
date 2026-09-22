@@ -154,30 +154,30 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
     def test_optional_bearer_token_is_transport_only(self):
         connector = self.connector()
         captured = {}
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                captured["authorization"] = self.headers.get("Authorization")
+                self.send_response(200)
+                self.send_header("Content-Length", "14")
+                self.end_headers()
+                self.wfile.write(b'{"ready":true}')
 
-        class Response:
-            def __enter__(self):
-                return self
+            def log_message(self, *_):
+                pass
 
-            def __exit__(self, *_):
-                return None
-
-            def read(self, _):
-                return b'{"ready":true}'
-
-        def open_request(request, timeout):
-            captured["authorization"] = request.get_header("Authorization")
-            captured["timeout"] = timeout
-            return Response()
-
-        class Opener:
-            open = staticmethod(open_request)
-
-        with patch("resident.external_app.build_opener", return_value=Opener()):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connector.base_url = f"http://127.0.0.1:{server.server_port}"
             result = connector._post(b"{}")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
         self.assertEqual({"ready": True}, result)
         self.assertEqual("Bearer private-token", captured["authorization"])
-        self.assertEqual(3, captured["timeout"])
 
     async def test_redirect_does_not_forward_bearer_token_to_another_origin(self):
         received = []
@@ -195,9 +195,11 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
 
         class Redirect(BaseHTTPRequestHandler):
             def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
                 self.send_response(307)
                 self.send_header(
                     "Location", f"http://127.0.0.1:{destination.server_port}/stolen")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
 
             def log_message(self, *_):
@@ -227,40 +229,37 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_responses_preserve_mutating_request_id(self):
         connector = self.connector()
 
-        class Response:
-            def __init__(self, raw):
-                self.raw = raw
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return None
-
-            def read(self, _):
-                return self.raw
-
-        class Opener:
-            def __init__(self, raw):
-                self.raw = raw
-                self.request_id = None
-
-            def open(self, request, timeout):
-                self.request_id = json.loads(request.data)["request_id"]
-                return Response(self.raw)
-
         for raw in (b"not json", b"true", b" " * (1024 * 1024 + 1)):
+            captured = {}
+            class Handler(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    length = int(self.headers["Content-Length"])
+                    captured["request_id"] = json.loads(
+                        self.rfile.read(length))["request_id"]
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(raw)
+
+                def log_message(self, *_):
+                    pass
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connector.base_url = f"http://127.0.0.1:{server.server_port}"
             for operation, expected in ((connector.definition.operations[0], "unknown_outcome"),
                                         (connector.definition.operations[1], "invalid_response")):
                 with self.subTest(raw=raw[:16], mutating=operation.mutating):
-                    opener = Opener(raw)
-                    with patch("resident.external_app.build_opener", return_value=opener), patch(
-                            "resident.external_app.current_invocation_id", return_value="managed-call-42"):
+                    with patch("resident.external_app.current_invocation_id",
+                               return_value="managed-call-42"):
                         result = await connector.invoke(operation, {})
                     self.assertEqual(expected, result["error_code"])
-                    self.assertEqual("managed-call-42", opener.request_id)
-                    self.assertEqual(opener.request_id, result["request_id"])
+                    self.assertEqual("managed-call-42", captured["request_id"])
+                    self.assertEqual(captured["request_id"], result["request_id"])
                     self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     async def test_invocation_uses_stable_call_id_and_server_side_bindings(self):
         connector = self.connector()
@@ -310,6 +309,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_incremental_response_cannot_extend_overall_deadline(self):
         class Trickle(BaseHTTPRequestHandler):
             def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", "100")
@@ -332,6 +332,17 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
             connector = self.connector()
             connector.base_url = f"http://127.0.0.1:{server.server_port}"
             connector.definition = replace(connector.definition, request_timeout_seconds=0.15)
+            original_post = connector._post
+            worker_done = threading.Event()
+
+            def tracked_post(payload):
+                worker_done.clear()
+                try:
+                    return original_post(payload)
+                finally:
+                    worker_done.set()
+
+            connector._post = tracked_post
             for operation, expected in (
                     (connector.definition.operations[0], "unknown_outcome"),
                     (connector.definition.operations[1], "timeout")):
@@ -344,6 +355,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(expected, result["error_code"])
                     self.assertEqual("managed-call-42", result["request_id"])
                     self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
+                    self.assertTrue(worker_done.is_set(), "HTTP worker remained active after invoke")
         finally:
             server.shutdown()
             server.server_close()
