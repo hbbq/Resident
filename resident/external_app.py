@@ -103,7 +103,7 @@ class ExternalApplicationConnector:
         try:
             decoded = json.loads(raw, parse_constant=_reject_non_finite,
                                  parse_float=_finite_float)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValueError("invalid_json_response") from exc
         if not isinstance(decoded, (dict, list)):
             raise ValueError("invalid_response_shape")

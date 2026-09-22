@@ -323,6 +323,48 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
             server.server_close()
             thread.join()
 
+    async def test_deep_json_response_is_sanitized_for_both_operation_types(self):
+        connector = self.connector()
+        raw = b"[" * 2000 + b"0" + b"]" * 2000
+        captured = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                captured.append(request["request_id"])
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connector.base_url = f"http://127.0.0.1:{server.server_port}"
+            for operation, expected_code, expected_message in (
+                    (connector.definition.operations[1], "invalid_response",
+                     "External application returned an invalid response"),
+                    (connector.definition.operations[0], "unknown_outcome",
+                     "External operation outcome is unknown after an invalid response; "
+                     "reconcile by request_id")):
+                with self.subTest(mutating=operation.mutating), patch(
+                        "resident.external_app.current_invocation_id",
+                        return_value="managed-call-42"):
+                    result = await connector.invoke(operation, {})
+                    self.assertEqual(expected_code, result["error_code"])
+                    self.assertEqual(expected_message, result["error"])
+                    self.assertEqual("managed-call-42", result["request_id"])
+                    self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
+            self.assertEqual(["managed-call-42"] * 2, captured)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     async def test_invocation_uses_stable_call_id_and_server_side_bindings(self):
         connector = self.connector()
         captured = {}
