@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -148,7 +149,8 @@ def _positive_integer(value: Any, label: str, *, maximum: int | None = None) -> 
 
 
 def _positive_number(value: Any, label: str, *, maximum: float | None = None) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+    if (not isinstance(value, (int, float)) or isinstance(value, bool) or
+            (isinstance(value, float) and not math.isfinite(value)) or value <= 0):
         raise ValueError(f"{label} must be a positive number")
     if maximum is not None and value > maximum:
         raise ValueError(f"{label} must be at most {maximum:g}")

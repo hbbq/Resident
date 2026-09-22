@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from http.client import HTTPException
 import json
 import socket
 import uuid
@@ -93,11 +94,13 @@ class ExternalApplicationConnector:
             return self._failure(
                 "request_too_large", "External operation request is too large", request_id)
         try:
-            result = await to_thread_timed(
-                "external_application.request", self._post, payload,
-                provider=self.definition.id, external_operation=operation.operation,
-                mutating=operation.mutating,
-                request_timeout_seconds=self.definition.request_timeout_seconds)
+            result = await asyncio.wait_for(
+                to_thread_timed(
+                    "external_application.request", self._post, payload,
+                    provider=self.definition.id, external_operation=operation.operation,
+                    mutating=operation.mutating,
+                    request_timeout_seconds=self.definition.request_timeout_seconds),
+                timeout=self.definition.request_timeout_seconds)
         except asyncio.CancelledError:
             raise
         except HTTPError as exc:
@@ -148,7 +151,7 @@ class ExternalApplicationConnector:
                 "timeout" if is_timeout else "unavailable",
                 "External operation timed out" if is_timeout else "External application is unavailable",
                 request_id)
-        except ValueError:
+        except (ValueError, HTTPException):
             if operation.mutating:
                 return self._failure(
                     "unknown_outcome",

@@ -2,7 +2,10 @@ import json
 import socket
 import tempfile
 import threading
+import time
 import unittest
+from dataclasses import replace
+from http.client import BadStatusLine, IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -86,6 +89,13 @@ class ExternalApplicationDefinitionTests(unittest.TestCase):
             self.load(DEFINITION.replace(
                 "additionalProperties: false\n      - name: realm_get_operation",
                 "additionalProperties: false\n          oneOf: []\n      - name: realm_get_operation"))
+
+    def test_rejects_non_finite_request_timeout(self):
+        for value in (".nan", ".inf", "-.inf"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "request_timeout_seconds must be a positive number"):
+                self.load(DEFINITION.replace("request_timeout_seconds: 3",
+                                             f"request_timeout_seconds: {value}"))
 
     def test_rejects_external_messaging_provider_even_without_a_messaging_grant(self):
         for grants in ("[]", "[messaging]"):
@@ -296,6 +306,70 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("unknown", result["outcome"])
         self.assertIn("request_id", result)
         self.assertNotIn("realm.local", json.dumps(result))
+
+    async def test_incremental_response_cannot_extend_overall_deadline(self):
+        class Trickle(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                for _ in range(100):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    time.sleep(0.02)
+
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connector = self.connector()
+            connector.base_url = f"http://127.0.0.1:{server.server_port}"
+            connector.definition = replace(connector.definition, request_timeout_seconds=0.15)
+            for operation, expected in (
+                    (connector.definition.operations[0], "unknown_outcome"),
+                    (connector.definition.operations[1], "timeout")):
+                with self.subTest(mutating=operation.mutating), patch(
+                        "resident.external_app.current_invocation_id",
+                        return_value="managed-call-42"):
+                    started = time.monotonic()
+                    result = await connector.invoke(operation, {})
+                    self.assertLess(time.monotonic() - started, 0.5)
+                    self.assertEqual(expected, result["error_code"])
+                    self.assertEqual("managed-call-42", result["request_id"])
+                    self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    async def test_protocol_failures_are_sanitized_with_stable_request_id(self):
+        connector = self.connector()
+        for exception in (BadStatusLine("secret upstream status"),
+                          IncompleteRead(b"secret upstream body", 10)):
+            for operation, expected in (
+                    (connector.definition.operations[0], "unknown_outcome"),
+                    (connector.definition.operations[1], "invalid_response")):
+                with self.subTest(exception=type(exception).__name__,
+                                  mutating=operation.mutating), patch(
+                        "resident.external_app.current_invocation_id",
+                        return_value="managed-call-42"):
+                    def fail(payload):
+                        self.assertEqual("managed-call-42", json.loads(payload)["request_id"])
+                        raise exception
+
+                    connector._post = fail
+                    result = await connector.invoke(operation, {})
+                    self.assertEqual(expected, result["error_code"])
+                    self.assertEqual("managed-call-42", result["request_id"])
+                    self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
+                    self.assertNotIn("secret upstream", json.dumps(result))
 
     async def test_nested_and_array_arguments_are_validated_locally(self):
         connector = self.connector()
