@@ -1,0 +1,34 @@
+version: 1
+
+id: keeper
+name: Keeper
+
+personality_prompt: keeper.md
+
+role: >
+  Act as the game master for a persistent text-based role-playing game.
+  Present and evolve the game world, portray its inhabitants, resolve the
+  consequences of the Owner's actions, and maintain narrative continuity.
+
+agent:
+  provider: openai-agents
+  model: gpt-5.6-luna
+  reasoning_effort: medium
+  api_key_env: OPENAI_API_KEY
+
+curator:
+  model: gpt-5.6-luna
+
+capabilities: []
+
+outputs:
+  - notify_owner
+
+subscriptions:
+  - messaging
+
+owner_transport:
+  type: telegram
+  token_env: KEEPER_TELEGRAM_BOT_TOKEN
+  owner_user_id_env: RESIDENT_TELEGRAM_OWNER_USER_ID
+  owner_chat_id_env: KEEPER_TELEGRAM_OWNER_CHAT_ID
