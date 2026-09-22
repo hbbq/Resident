@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
@@ -9,6 +10,12 @@ from .domain import ToolOutput, ToolSpec
 
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | ToolOutput]]
+_INVOCATION_ID: ContextVar[str | None] = ContextVar("capability_invocation_id", default=None)
+
+
+def current_invocation_id() -> str | None:
+    """Return the durable provider call id while a capability handler is running."""
+    return _INVOCATION_ID.get()
 
 
 @dataclass(frozen=True)

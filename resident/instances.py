@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
 import shutil
@@ -14,6 +16,7 @@ from .config import SUPPORTED_REASONING_EFFORTS
 
 _ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _ENV = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
+_EXTERNAL_OPERATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _SUBSCRIPTION = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?\Z")
 _SUBSCRIPTION_EVENTS = frozenset({
     "agentcontroller.workflow_changed",
@@ -28,7 +31,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
     "role", "role_prompt", "agent", "curator", "capabilities", "outputs",
-    "subscriptions", "owner_transport", "body",
+    "subscriptions", "owner_transport", "external_applications", "body",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
 
@@ -62,6 +65,26 @@ class OwnerTransportDefinition:
 
 
 @dataclass(frozen=True)
+class ExternalOperationDefinition:
+    name: str
+    operation: str
+    description: str
+    input_schema: dict[str, Any]
+    mutating: bool = False
+
+
+@dataclass(frozen=True)
+class ExternalApplicationDefinition:
+    id: str
+    description: str
+    base_url: str
+    bearer_token_env: str | None = None
+    request_timeout_seconds: float = 10.0
+    bindings: dict[str, Any] = field(default_factory=dict)
+    operations: tuple[ExternalOperationDefinition, ...] = ()
+
+
+@dataclass(frozen=True)
 class ResidentDefinition:
     id: str
     name: str
@@ -74,6 +97,7 @@ class ResidentDefinition:
     outputs: tuple[str, ...] = ()
     subscriptions: tuple[str, ...] = ()
     owner_transport: OwnerTransportDefinition | None = None
+    external_applications: tuple[ExternalApplicationDefinition, ...] = ()
     body: dict[str, Any] | None = None
 
 
@@ -122,6 +146,180 @@ def _positive_integer(value: Any, label: str, *, maximum: int | None = None) -> 
     if maximum is not None and value > maximum:
         raise ValueError(f"{label} must be at most {maximum}")
     return value
+
+
+def _positive_number(value: Any, label: str, *, maximum: float | None = None) -> float:
+    if (not isinstance(value, (int, float)) or isinstance(value, bool) or
+            (isinstance(value, float) and not math.isfinite(value)) or value <= 0):
+        raise ValueError(f"{label} must be a positive number")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{label} must be at most {maximum:g}")
+    return float(value)
+
+
+def _external_schema(value: Any, label: str, *, root: bool = True) -> dict[str, Any]:
+    schema = _mapping(value, label)
+    allowed = {
+        "type", "description", "enum", "properties", "required", "additionalProperties",
+        "items", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems",
+    }
+    unknown = set(schema) - allowed
+    if unknown:
+        raise ValueError(f"Unsupported JSON Schema fields in {label}: {', '.join(sorted(unknown))}")
+    raw_types = schema.get("type")
+    types = [raw_types] if isinstance(raw_types, str) else raw_types
+    supported = {"object", "array", "string", "integer", "number", "boolean", "null"}
+    if (not isinstance(types, list) or not types or
+            not all(isinstance(item, str) and item in supported for item in types) or
+            len(types) != len(set(types))):
+        raise ValueError(f"{label}.type must contain supported unique JSON types")
+    if root and types != ["object"]:
+        raise ValueError(f"{label} must describe an object")
+    if "description" in schema:
+        _string(schema["description"], f"{label}.description")
+    if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
+        raise ValueError(f"{label}.enum must be a nonempty list")
+    if "object" in types:
+        properties = _mapping(schema.get("properties", {}), f"{label}.properties")
+        if schema.get("additionalProperties") is not False:
+            raise ValueError(f"{label}.additionalProperties must be false")
+        for name, child in properties.items():
+            if not name:
+                raise ValueError(f"{label}.properties keys must be nonempty")
+            _external_schema(child, f"{label}.properties.{name}", root=False)
+        required = schema.get("required", [])
+        if (not isinstance(required, list) or
+                not all(isinstance(item, str) for item in required) or
+                len(required) != len(set(required)) or not set(required) <= set(properties)):
+            raise ValueError(f"{label}.required must contain unique property names")
+    if "array" in types:
+        if "items" not in schema:
+            raise ValueError(f"{label}.items is required for arrays")
+        _external_schema(schema["items"], f"{label}.items", root=False)
+    if ({"properties", "required", "additionalProperties"} & set(schema) and
+            "object" not in types):
+        raise ValueError(f"{label} uses object constraints without object type")
+    if "items" in schema and "array" not in types:
+        raise ValueError(f"{label} uses items without array type")
+    if ({"minimum", "maximum"} & set(schema) and
+            not ({"integer", "number"} & set(types))):
+        raise ValueError(f"{label} uses numeric constraints without a numeric type")
+    if ({"minLength", "maxLength"} & set(schema) and "string" not in types):
+        raise ValueError(f"{label} uses string constraints without string type")
+    if ({"minItems", "maxItems"} & set(schema) and "array" not in types):
+        raise ValueError(f"{label} uses array constraints without array type")
+    for key in ("minimum", "maximum"):
+        if key in schema and (not isinstance(schema[key], (int, float)) or
+                              isinstance(schema[key], bool)):
+            raise ValueError(f"{label}.{key} must be a number")
+    for key in ("minLength", "maxLength", "minItems", "maxItems"):
+        if key in schema and (not isinstance(schema[key], (int, float)) or
+                              isinstance(schema[key], bool) or schema[key] < 0 or
+                              int(schema[key]) != schema[key]):
+            raise ValueError(f"{label}.{key} must be a nonnegative integer")
+    try:
+        encoded = json.dumps(
+            schema, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain JSON values") from exc
+    if root and len(encoded.encode("utf-8")) > 65_536:
+        raise ValueError(f"{label} is too large")
+    return schema
+
+
+def _external_applications(value: Any, label: str) -> tuple[ExternalApplicationDefinition, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    if len(value) > 16:
+        raise ValueError(f"{label} must contain at most 16 providers")
+    applications: list[ExternalApplicationDefinition] = []
+    for index, raw in enumerate(value):
+        item_label = f"{label}[{index}]"
+        item = _mapping(raw, item_label)
+        allowed = {"id", "description", "base_url", "bearer_token_env",
+                   "request_timeout_seconds", "bindings", "operations"}
+        if set(item) - allowed:
+            raise ValueError(f"Unknown fields in {item_label}: {', '.join(sorted(set(item) - allowed))}")
+        application_id = _string(item.get("id"), f"{item_label}.id")
+        if not _ID.fullmatch(application_id):
+            raise ValueError(f"{item_label}.id must be a lowercase safe identifier")
+        if application_id == "messaging":
+            raise ValueError(f"{item_label}.id is reserved for built-in messaging")
+        bindings = _mapping(item.get("bindings", {}), f"{item_label}.bindings")
+        try:
+            encoded_bindings = json.dumps(
+                bindings, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{item_label}.bindings must contain JSON values") from exc
+        if len(encoded_bindings.encode("utf-8")) > 16_384:
+            raise ValueError(f"{item_label}.bindings is too large")
+        operations_raw = item.get("operations")
+        if not isinstance(operations_raw, list) or not operations_raw:
+            raise ValueError(f"{item_label}.operations must be a nonempty list")
+        if len(operations_raw) > 64:
+            raise ValueError(f"{item_label}.operations must contain at most 64 operations")
+        operations: list[ExternalOperationDefinition] = []
+        for operation_index, raw_operation in enumerate(operations_raw):
+            operation_label = f"{item_label}.operations[{operation_index}]"
+            operation = _mapping(raw_operation, operation_label)
+            operation_allowed = {"name", "operation", "description", "input_schema", "mutating"}
+            if set(operation) - operation_allowed:
+                raise ValueError(
+                    f"Unknown fields in {operation_label}: "
+                    f"{', '.join(sorted(set(operation) - operation_allowed))}")
+            name = _string(operation.get("name"), f"{operation_label}.name")
+            if (not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) or
+                    not name.startswith(f"{application_id}_")):
+                raise ValueError(
+                    f"{operation_label}.name must be a namespaced tool name beginning "
+                    f"with {application_id}_")
+            mutating = operation.get("mutating", False)
+            if not isinstance(mutating, bool):
+                raise ValueError(f"{operation_label}.mutating must be boolean")
+            remote_operation = _string(
+                operation.get("operation", name), f"{operation_label}.operation")
+            if not _EXTERNAL_OPERATION.fullmatch(remote_operation):
+                raise ValueError(f"{operation_label}.operation must be a safe operation identifier")
+            description = _string(
+                operation.get("description"), f"{operation_label}.description")
+            if len(description) > 1024:
+                raise ValueError(f"{operation_label}.description must be at most 1024 characters")
+            operations.append(ExternalOperationDefinition(
+                name=name,
+                operation=remote_operation,
+                description=description,
+                input_schema=_external_schema(
+                    operation.get("input_schema"), f"{operation_label}.input_schema"),
+                mutating=mutating,
+            ))
+        names = [operation.name for operation in operations]
+        if len(names) != len(set(names)):
+            raise ValueError(f"{item_label}.operations contains duplicate tool names")
+        application_description = _string(
+            item.get("description"), f"{item_label}.description")
+        if len(application_description) > 1024:
+            raise ValueError(f"{item_label}.description must be at most 1024 characters")
+        base_url = _string(item.get("base_url"), f"{item_label}.base_url")
+        if len(base_url) > 2048:
+            raise ValueError(f"{item_label}.base_url must be at most 2048 characters")
+        applications.append(ExternalApplicationDefinition(
+            id=application_id,
+            description=application_description,
+            base_url=base_url,
+            bearer_token_env=_env_name(
+                item.get("bearer_token_env"), f"{item_label}.bearer_token_env", required=False),
+            request_timeout_seconds=_positive_number(
+                item.get("request_timeout_seconds", 10),
+                f"{item_label}.request_timeout_seconds", maximum=120),
+            bindings=bindings,
+            operations=tuple(operations),
+        ))
+    ids = [application.id for application in applications]
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"{label} contains duplicate provider ids")
+    return tuple(applications)
 
 
 def _subscriptions(value: Any, label: str) -> tuple[str, ...]:
@@ -269,7 +467,10 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
         capabilities=_string_list(data.get("capabilities"), "capabilities"),
         outputs=_string_list(data.get("outputs"), "outputs"),
         subscriptions=_subscriptions(data.get("subscriptions"), "subscriptions"),
-        owner_transport=transport, body=body,
+        owner_transport=transport,
+        external_applications=_external_applications(
+            data.get("external_applications"), "external_applications"),
+        body=body,
     )
 
 
