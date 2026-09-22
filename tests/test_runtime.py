@@ -300,6 +300,105 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await runtime.stop_background_services()
             runtime.close()
 
+    async def test_startup_upgrades_legacy_curator_checkpoint_at_bound_turn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            before_restart = Store(path)
+            before_restart.save_agent_session_binding(
+                "openai_agents", "session-restarted", None, "turn-target")
+            before_restart.apply_curator_batch(
+                "openai_agents", "session-restarted", "item-1", "item-1",
+                "legacy-batch", [])
+            self.assertIsNone(before_restart.curator_checkpoint(
+                "openai_agents", "session-restarted")["last_turn_id"])
+            before_restart.close()
+
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            class Source:
+                session_id = "session-restarted"
+
+                def __init__(self):
+                    self.cursors = []
+
+                async def session_items(self, cursor, limit):
+                    self.cursors.append(cursor)
+                    if cursor is None:
+                        return SessionItemPage(({
+                            "id": "item-1", "type": "message", "role": "assistant",
+                            "turn_id": "turn-target", "content": [],
+                        },), "item-1", False)
+                    if cursor != "item-1":
+                        raise AssertionError(f"Unexpected cursor: {cursor}")
+                    return SessionItemPage((), cursor, False)
+
+            class Model:
+                async def curate(self, *args):
+                    raise AssertionError("Already-curated history was replayed")
+
+            source = Source()
+            runtime.bind_curator(MemoryCurator(runtime.store, source, Model()))
+            await runtime.enqueue_startup_wakeups(asyncio.Queue())
+
+            self.assertLessEqual(source.cursors.count("item-1"), 1)
+            checkpoint = runtime.store.curator_checkpoint(
+                "openai_agents", source.session_id)
+            self.assertEqual(("item-1", "turn-target"), (
+                checkpoint["cursor"], checkpoint["last_turn_id"]))
+            self.assertIsNone(runtime.store.curator_request(
+                "openai_agents", source.session_id))
+            await runtime.stop_background_services()
+            runtime.close()
+
+            restarted = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            source.cursors.clear()
+            restarted.bind_curator(MemoryCurator(restarted.store, source, Model()))
+            await restarted.enqueue_startup_wakeups(asyncio.Queue())
+            self.assertEqual(["item-1"], source.cursors)
+            await restarted.stop_background_services()
+            restarted.close()
+
+    async def test_legacy_curator_checkpoint_does_not_prove_future_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime.store.save_agent_session_binding(
+                "openai_agents", "session-restarted", None, "turn-future")
+            runtime.store.apply_curator_batch(
+                "openai_agents", "session-restarted", "item-1", "item-1",
+                "legacy-batch", [])
+
+            class Source:
+                session_id = "session-restarted"
+
+                async def session_items(self, cursor, limit):
+                    if cursor is None:
+                        return SessionItemPage(({
+                            "id": "item-1", "type": "message", "role": "assistant",
+                            "turn_id": "turn-old", "content": [],
+                        },), "item-1", False)
+                    return SessionItemPage((), cursor, False)
+
+            class Model:
+                async def curate(self, *args):
+                    raise AssertionError("Already-curated history was replayed")
+
+            runtime.bind_curator(MemoryCurator(runtime.store, Source(), Model()))
+            runtime._STARTUP_CURATOR_MAX_STALLED_ATTEMPTS = 1
+            try:
+                with self.assertRaisesRegex(
+                        RuntimeError, "Startup Curator reconciliation failed"):
+                    await runtime.enqueue_startup_wakeups(asyncio.Queue())
+                self.assertIsNone(runtime.store.curator_checkpoint(
+                    "openai_agents", "session-restarted")["last_turn_id"])
+            finally:
+                runtime.close()
+
     async def test_startup_curator_advances_existing_request_to_bound_turn(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "resident.sqlite3"

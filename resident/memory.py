@@ -291,6 +291,41 @@ class MemoryCurator:
         self.batch_size, self.max_batches = max(1, min(batch_size, 100)), max(1, max_batches)
         self._lock = asyncio.Lock()
 
+    async def upgrade_legacy_checkpoint(self, session_id: str, target_turn_id: str) -> bool:
+        """Verify the last curated item before assigning an old checkpoint its turn."""
+        async with self._lock:
+            if self.source.session_id != session_id:
+                raise SessionHistoryUnavailable("Requested Curator session is no longer bound")
+            checkpoint = self.store.curator_checkpoint("openai_agents", session_id)
+            if (checkpoint is None or checkpoint["last_turn_id"] is not None
+                    or not checkpoint["cursor"] or not checkpoint["last_item_id"]):
+                return False
+            cursor = None
+            seen_cursors = {cursor}
+            while True:
+                page = await self.source.session_items(cursor, self.batch_size)
+                if not page.items:
+                    return False
+                checkpoint_item = next((item for item in page.items
+                                        if item.get("id") == checkpoint["last_item_id"]), None)
+                if checkpoint_item is not None:
+                    if checkpoint_item.get("turn_id") != target_turn_id:
+                        return False
+                    tail = await self.source.session_items(checkpoint["cursor"], self.batch_size)
+                    if tail.items or tail.has_more:
+                        return False
+                    return self.store.upgrade_legacy_curator_checkpoint(
+                        "openai_agents", session_id, checkpoint["cursor"],
+                        checkpoint["last_item_id"], target_turn_id)
+                last_item = page.items[-1]
+                next_cursor = page.cursor or last_item.get("id")
+                if not next_cursor or next_cursor in seen_cursors:
+                    return False
+                if not page.has_more:
+                    return False
+                cursor = next_cursor
+                seen_cursors.add(cursor)
+
     async def catch_up(self, *, final: bool = False,
                        through_turn_id: str | None = None,
                        session_id: str | None = None) -> str | None:

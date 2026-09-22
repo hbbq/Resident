@@ -899,6 +899,18 @@ class Store:
         """, (provider, session_id)).fetchone()
         return None if row is None else dict(row)
 
+    def upgrade_legacy_curator_checkpoint(self, provider: str, session_id: str,
+                                          cursor: str, last_item_id: str,
+                                          last_turn_id: str) -> bool:
+        """Record a verified turn only if the legacy checkpoint is unchanged."""
+        with self.connection:
+            result = self.connection.execute("""
+                UPDATE curator_checkpoints SET last_turn_id=?,updated_at=?
+                WHERE provider=? AND session_id=? AND cursor=? AND last_item_id=?
+                  AND last_turn_id IS NULL
+            """, (last_turn_id, utc_now(), provider, session_id, cursor, last_item_id))
+        return result.rowcount == 1
+
     def apply_curator_batch(self, provider: str, session_id: str, cursor: str | None,
                             last_item_id: str | None, operation_key: str,
                             mutations: list[dict[str, Any]],

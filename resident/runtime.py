@@ -342,6 +342,7 @@ class ResidentRuntime:
         target = request["target_turn_id"]
         startup_attempts = 0
         stalled_attempts = 0
+        legacy_upgrade_attempted = False
         while True:
             checkpoint = self.store.curator_checkpoint(provider, session_id)
             before = None if checkpoint is None else (
@@ -351,8 +352,13 @@ class ResidentRuntime:
                 raise RuntimeError("Startup Curator request changed during reconciliation")
             startup_attempts += 1
             try:
-                await curator.catch_up(
-                    through_turn_id=target, session_id=session_id)
+                upgraded = False
+                if not legacy_upgrade_attempted and isinstance(curator, MemoryCurator):
+                    legacy_upgrade_attempted = True
+                    upgraded = await curator.upgrade_legacy_checkpoint(session_id, target)
+                if not upgraded:
+                    await curator.catch_up(
+                        through_turn_id=target, session_id=session_id)
                 checkpoint = self.store.curator_checkpoint(provider, session_id)
                 if checkpoint is None or checkpoint.get("last_turn_id") != target:
                     raise FinalCatchUpIncomplete(
