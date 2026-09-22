@@ -9,6 +9,7 @@ from .camera import CameraConnector
 from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
 from .display import DisplayConnector
+from .external_app import ExternalApplicationConnector
 from .homeops import HomeOpsConnector
 from .host import InstancePolicy, RuntimeHost, messaging_capability
 from .instances import (ResidentDefinition, load_resident_catalog, migrate_legacy_state,
@@ -212,7 +213,25 @@ def build_host(config: Config) -> RuntimeHost:
                     request_timeout_seconds=config.telegram_request_timeout_seconds,
                     diagnostic_output=diagnostics.telegram)
                 private_producers[definition.id] = [transport]
-            grants = _select_capabilities(definition.capabilities, available)
+            instance_available = list(available)
+            shared_connector_ids = {capability.connector_id for capability in available}
+            for external_definition in definition.external_applications:
+                if external_definition.id in shared_connector_ids:
+                    raise ValueError(
+                        f"External application id conflicts with an existing connector: "
+                        f"{external_definition.id}")
+                token = (resolve_environment(external_definition.bearer_token_env)
+                         if external_definition.bearer_token_env else None)
+                external = ExternalApplicationConnector(external_definition, token)
+                instance_available.extend(external.capabilities)
+            inventory_names = [capability.name for capability in instance_available]
+            duplicate_names = sorted({name for name in inventory_names
+                                      if inventory_names.count(name) > 1})
+            if duplicate_names:
+                raise ValueError(
+                    f"Duplicate available capability names for {definition.id}: "
+                    f"{', '.join(duplicate_names)}")
+            grants = _select_capabilities(definition.capabilities, instance_available)
             output_grants, owner_output_enabled = _select_outputs(
                 definition.id, definition.outputs, available_outputs,
                 owner_available=(
@@ -220,7 +239,7 @@ def build_host(config: Config) -> RuntimeHost:
                     or definition.id == catalog.default_id))
             granted_names = {capability.name for capability in grants}
             grants.extend(capability for capability in _legacy_output_capabilities(
-                output_grants, available) if capability.name not in granted_names)
+                output_grants, instance_available) if capability.name not in granted_names)
             if "messaging" in definition.capabilities:
                 grants.append(messaging_capability(mailbox, definition.id, recipients))
             runtime = ResidentRuntime(

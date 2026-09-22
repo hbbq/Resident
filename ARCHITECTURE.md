@@ -265,6 +265,8 @@ Resident-specific endpoints should generally not be added to external systems me
 
 A future generic connector may allow Resident to use sufficiently self-describing APIs without requiring a custom adapter for every service. This is an extension point rather than a v0 requirement.
 
+The first generic external-application connector keeps its operation catalog locally pinned in each Resident definition. It adapts a narrow HTTP invocation endpoint into ordinary `Capability` objects, supplies immutable instance bindings outside model-controlled arguments, and leaves validation and domain authority with the external application. Existing capability grants and managed-session descriptor snapshots remain the authorization and protocol boundaries. Remote metadata cannot expand the catalog in v0.
+
 Physical co-location does not require logical integration. For example, a camera and microphone mounted on a robot may remain separate connector/device identities. Relationships such as `mounted_on`, `powered_by`, or correlated availability may later be declared or inferred by Resident.
 
 ## Long-term memory
