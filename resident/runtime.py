@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -1086,6 +1087,10 @@ class ResidentRuntime:
                     raise RuntimeError("Model exceeded the configured tool-round limit")
                 results = []
                 for call in turn.tool_calls:
+                    invocation_id = hashlib.sha256(
+                        (f"{type(self.provider).__name__}\0"
+                         f"{getattr(self.provider, 'session_id', None) or ''}\0{call.id}")
+                        .encode("utf-8")).hexdigest()
                     self._emit("tool.called", {"call_id": call.id, "name": call.name, "arguments": call.arguments})
                     tool_started = time.monotonic()
                     emit_timeline("tool.execute", "started", call_id=call.id,
@@ -1102,7 +1107,8 @@ class ResidentRuntime:
                                 # Attachment payloads (for example camera frames) are
                                 # intentionally not persisted. Reacquire them after a
                                 # restart instead of submitting an incomplete replay.
-                                execution = await registry.execute(call.name, call.arguments)
+                                execution = await registry.execute(
+                                    call.name, call.arguments, invocation_id=invocation_id)
                                 result = ToolResult(call.id, execution.output, execution.attachments)
                                 record = getattr(self.provider, "record_tool_result", None)
                                 if record is not None:
@@ -1111,10 +1117,14 @@ class ResidentRuntime:
                                 output = action["output"] or {
                                     "ok": False,
                                     "error": "Previous local action outcome is unknown; action was not repeated",
+                                    "error_code": "unknown_outcome",
+                                    "outcome": "unknown",
+                                    "request_id": invocation_id,
                                 }
                                 result = ToolResult(call.id, output)
                         else:
-                            execution = await registry.execute(call.name, call.arguments)
+                            execution = await registry.execute(
+                                call.name, call.arguments, invocation_id=invocation_id)
                             result = ToolResult(call.id, execution.output, execution.attachments)
                             record = getattr(self.provider, "record_tool_result", None)
                             if record is not None:

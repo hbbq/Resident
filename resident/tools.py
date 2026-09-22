@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable, Sequence
 
-from .capabilities import Capability
+from .capabilities import Capability, _INVOCATION_ID
 from .domain import ToolOutput, ToolSpec
 from .store import Store
 
@@ -104,13 +105,15 @@ class ToolRegistry:
     def specs(self) -> list[ToolSpec]:
         return [tool.spec for tool in self.tools.values()]
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> ToolOutput:
+    async def execute(self, name: str, arguments: dict[str, Any], *,
+                      invocation_id: str | None = None) -> ToolOutput:
         tool = self.tools.get(name)
         if tool is None:
             return ToolOutput({"ok": False, "error": f"Unknown or unavailable tool: {name}"})
         error = self._validate(tool.spec.input_schema, arguments)
         if error:
             return ToolOutput({"ok": False, "error": error})
+        token = _INVOCATION_ID.set(invocation_id)
         try:
             result = tool.handler(arguments)
             if inspect.isawaitable(result):
@@ -120,33 +123,75 @@ class ToolRegistry:
             return ToolOutput({"ok": True, **result})
         except Exception as exc:
             return ToolOutput({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            _INVOCATION_ID.reset(token)
 
     @staticmethod
     def _validate(schema: dict[str, Any], arguments: Any) -> str | None:
         if not isinstance(arguments, dict):
             return "Arguments must be an object"
+        return ToolRegistry._validate_object(schema, arguments, root=True, path="")
+
+    @staticmethod
+    def _validate_object(schema: dict[str, Any], value: dict[str, Any], *,
+                         root: bool, path: str) -> str | None:
         properties = schema.get("properties", {})
-        unknown = set(arguments) - set(properties)
-        missing = set(schema.get("required", [])) - set(arguments)
-        if unknown:
-            return f"Unknown arguments: {', '.join(sorted(unknown))}"
+        unknown = set(value) - set(properties)
+        if unknown and (root or schema.get("additionalProperties") is False):
+            label = "arguments" if root else f"properties in {path}"
+            return f"Unknown {label}: {', '.join(sorted(unknown))}"
+        missing = set(schema.get("required", [])) - set(value)
         if missing:
-            return f"Missing arguments: {', '.join(sorted(missing))}"
-        if len(arguments) < schema.get("minProperties", 0):
-            return f"At least {schema['minProperties']} arguments are required"
-        for key, value in arguments.items():
-            allowed = properties[key].get("type")
-            allowed = [allowed] if isinstance(allowed, str) else allowed
-            matches = (value is None and "null" in allowed) or ("string" in allowed and isinstance(value, str)) or \
-                ("integer" in allowed and isinstance(value, int) and not isinstance(value, bool)) or \
-                ("boolean" in allowed and isinstance(value, bool)) or \
-                ("object" in allowed and isinstance(value, dict))
-            if not matches:
-                return f"Argument {key!r} has the wrong type"
-            if isinstance(value, int) and (value < properties[key].get("minimum", value) or value > properties[key].get("maximum", value)):
-                return f"Argument {key!r} is outside the allowed range"
-            if "enum" in properties[key] and value not in properties[key]["enum"]:
-                return f"Argument {key!r} is not an allowed value"
+            label = "arguments" if root else f"properties in {path}"
+            return f"Missing {label}: {', '.join(sorted(missing))}"
+        if len(value) < schema.get("minProperties", 0):
+            return (f"At least {schema['minProperties']} arguments are required" if root else
+                    f"{path} has too few properties")
+        for key, child in value.items():
+            child_schema = properties.get(key)
+            if child_schema is None:
+                continue
+            child_path = key if root else f"{path}.{key}"
+            error = ToolRegistry._validate_value(child_schema, child, child_path)
+            if error:
+                return error
+        return None
+
+    @staticmethod
+    def _validate_value(schema: dict[str, Any], value: Any, path: str) -> str | None:
+        allowed = schema.get("type")
+        allowed = [allowed] if isinstance(allowed, str) else allowed
+        allowed = allowed or []
+        matches = (
+            (value is None and "null" in allowed) or
+            ("string" in allowed and isinstance(value, str)) or
+            ("integer" in allowed and isinstance(value, int) and not isinstance(value, bool)) or
+            ("number" in allowed and isinstance(value, (int, float)) and not isinstance(value, bool)) or
+            ("boolean" in allowed and isinstance(value, bool)) or
+            ("object" in allowed and isinstance(value, dict)) or
+            ("array" in allowed and isinstance(value, list))
+        )
+        if not matches:
+            return f"Argument {path!r} has the wrong type"
+        if "enum" in schema and value not in schema["enum"]:
+            return f"Argument {path!r} is not an allowed value"
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if isinstance(value, float) and not math.isfinite(value):
+                return f"Argument {path!r} must be finite"
+            if value < schema.get("minimum", value) or value > schema.get("maximum", value):
+                return f"Argument {path!r} is outside the allowed range"
+        if isinstance(value, str):
+            if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", len(value)):
+                return f"Argument {path!r} has an invalid length"
+        if isinstance(value, dict) and "object" in allowed:
+            return ToolRegistry._validate_object(schema, value, root=False, path=path)
+        if isinstance(value, list) and "array" in allowed:
+            if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", len(value)):
+                return f"Argument {path!r} has an invalid item count"
+            for index, item in enumerate(value):
+                error = ToolRegistry._validate_value(schema["items"], item, f"{path}[{index}]")
+                if error:
+                    return error
         return None
 
     def _create_intention(self, a: dict[str, Any]) -> dict[str, Any]:

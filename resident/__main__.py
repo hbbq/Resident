@@ -9,6 +9,7 @@ from .camera import CameraConnector
 from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
 from .display import DisplayConnector
+from .external_app import ExternalApplicationConnector
 from .homeops import HomeOpsConnector
 from .host import InstancePolicy, RuntimeHost, messaging_capability
 from .instances import (ResidentDefinition, load_resident_catalog, migrate_legacy_state,
@@ -123,6 +124,30 @@ def _select_capabilities(grants: tuple[str, ...], available: list[Capability]) -
     return selected
 
 
+def _validate_external_grant_namespace(
+        definition: ResidentDefinition, shared: list[Capability]) -> None:
+    """Keep provider and tool grants distinct in the simple grant namespace."""
+    providers = {application.id for application in definition.external_applications}
+    shared_providers = {capability.connector_id for capability in shared} | {"messaging"}
+    shared_names = {capability.name for capability in shared} | {"messaging_send"}
+    for application in definition.external_applications:
+        if application.id in shared_names:
+            raise ValueError(
+                f"External application id {application.id!r} for {definition.id} "
+                "conflicts with a built-in capability name; rename the provider")
+        for operation in application.operations:
+            if operation.name in providers:
+                raise ValueError(
+                    f"External tool {operation.name!r} from {application.id} for "
+                    f"{definition.id} conflicts with an external provider id; "
+                    "rename the provider or tool")
+            if operation.name in shared_providers:
+                raise ValueError(
+                    f"External tool {operation.name!r} from {application.id} for "
+                    f"{definition.id} conflicts with a built-in provider id; "
+                    "rename the tool")
+
+
 def _select_outputs(resident_id: str, grants: tuple[str, ...],
                     available: list[OutputCapability], *,
                     owner_available: bool) -> tuple[list[OutputCapability], bool]:
@@ -153,6 +178,8 @@ def build_host(config: Config) -> RuntimeHost:
         config.residents_dir, prompt_root=config.prompt_root, default_id=config.default_resident)
     diagnostics = TerminalDiagnostics(config.verbose)
     producers, available, available_outputs = _shared_resources(config, diagnostics)
+    for definition in catalog.residents:
+        _validate_external_grant_namespace(definition, available)
     mailbox = Mailbox(config.data_dir / "runtime" / "mailbox.sqlite3")
     for producer in producers:
         bind = getattr(producer, "bind_checkpoint", None)
@@ -212,7 +239,27 @@ def build_host(config: Config) -> RuntimeHost:
                     request_timeout_seconds=config.telegram_request_timeout_seconds,
                     diagnostic_output=diagnostics.telegram)
                 private_producers[definition.id] = [transport]
-            grants = _select_capabilities(definition.capabilities, available)
+            instance_available = list(available)
+            shared_connector_ids = {capability.connector_id for capability in available} | {"messaging"}
+            for external_definition in definition.external_applications:
+                if external_definition.id in shared_connector_ids:
+                    raise ValueError(
+                        f"External application id conflicts with an existing connector: "
+                        f"{external_definition.id}")
+                token = (resolve_environment(external_definition.bearer_token_env)
+                         if external_definition.bearer_token_env else None)
+                external = ExternalApplicationConnector(external_definition, token)
+                instance_available.extend(external.capabilities)
+            special_messaging = messaging_capability(mailbox, definition.id, recipients)
+            inventory_names = [capability.name for capability in instance_available]
+            inventory_names.append(special_messaging.name)
+            duplicate_names = sorted({name for name in inventory_names
+                                      if inventory_names.count(name) > 1})
+            if duplicate_names:
+                raise ValueError(
+                    f"Duplicate available capability names for {definition.id}: "
+                    f"{', '.join(duplicate_names)}")
+            grants = _select_capabilities(definition.capabilities, instance_available)
             output_grants, owner_output_enabled = _select_outputs(
                 definition.id, definition.outputs, available_outputs,
                 owner_available=(
@@ -220,9 +267,9 @@ def build_host(config: Config) -> RuntimeHost:
                     or definition.id == catalog.default_id))
             granted_names = {capability.name for capability in grants}
             grants.extend(capability for capability in _legacy_output_capabilities(
-                output_grants, available) if capability.name not in granted_names)
+                output_grants, instance_available) if capability.name not in granted_names)
             if "messaging" in definition.capabilities:
-                grants.append(messaging_capability(mailbox, definition.id, recipients))
+                grants.append(special_messaging)
             runtime = ResidentRuntime(
                 instance_config, _provider(definition), capabilities=grants,
                 output_capabilities=output_grants,
