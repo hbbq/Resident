@@ -1,3 +1,4 @@
+import asyncio
 import json
 import socket
 import tempfile
@@ -8,7 +9,6 @@ from dataclasses import replace
 from http.client import BadStatusLine, IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import HTTPError
 from unittest.mock import patch
 
 from resident.__main__ import build_host
@@ -151,7 +151,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
             definition = load_resident_catalog(definitions).residents[0].external_applications[0]
         return ExternalApplicationConnector(definition, "private-token")
 
-    def test_optional_bearer_token_is_transport_only(self):
+    async def test_optional_bearer_token_is_transport_only(self):
         connector = self.connector()
         captured = {}
         class Handler(BaseHTTPRequestHandler):
@@ -171,7 +171,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
         thread.start()
         try:
             connector.base_url = f"http://127.0.0.1:{server.server_port}"
-            result = connector._post(b"{}")
+            result = await connector._post(b"{}")
         finally:
             server.shutdown()
             server.server_close()
@@ -213,9 +213,8 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
         try:
             connector = self.connector()
             connector.base_url = f"http://127.0.0.1:{redirect.server_port}"
-            with self.assertRaises(HTTPError) as error:
-                connector._post(b"{}")
-            self.assertEqual(307, error.exception.code)
+            result = await connector.invoke(connector.definition.operations[1], {})
+            self.assertEqual("invalid_response", result["error_code"])
             result = await connector.invoke(connector.definition.operations[0], {})
             self.assertEqual("unknown_outcome", result["error_code"])
             self.assertEqual([], received)
@@ -229,7 +228,10 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_responses_preserve_mutating_request_id(self):
         connector = self.connector()
 
-        for raw in (b"not json", b"true", b" " * (1024 * 1024 + 1)):
+        for raw in (b"not json", b"true", b" " * (1024 * 1024 + 1),
+                    b'{"value":NaN}', b'{"value":Infinity}', b'{"value":-Infinity}',
+                    b'[1, {"value": NaN}]', b'{"value":1e400}',
+                    b'{"value":-1e400}'):
             captured = {}
             class Handler(BaseHTTPRequestHandler):
                 def do_POST(self):
@@ -265,7 +267,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
         connector = self.connector()
         captured = {}
 
-        def post(payload):
+        async def post(payload):
             captured.update(json.loads(payload))
             return {"character_id": "c1", "hp": 4}
 
@@ -291,7 +293,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
         connector = self.connector()
         calls = 0
 
-        def timeout(_):
+        async def timeout(_):
             nonlocal calls
             calls += 1
             raise socket.timeout()
@@ -335,10 +337,10 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
             original_post = connector._post
             worker_done = threading.Event()
 
-            def tracked_post(payload):
+            async def tracked_post(payload):
                 worker_done.clear()
                 try:
-                    return original_post(payload)
+                    return await original_post(payload)
                 finally:
                     worker_done.set()
 
@@ -361,6 +363,36 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
             server.server_close()
             thread.join()
 
+    async def test_stalled_dns_resolution_is_cancelled_at_deadline(self):
+        connector = self.connector()
+        connector.definition = replace(connector.definition, request_timeout_seconds=0.15)
+        active = 0
+        cancelled = asyncio.Event()
+
+        async def stalled_resolution(resolver, host, port=0, family=socket.AF_INET):
+            nonlocal active
+            active += 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active -= 1
+                cancelled.set()
+
+        with patch("resident.external_app.AsyncResolver.resolve", stalled_resolution), patch(
+                "resident.external_app.current_invocation_id",
+                return_value="managed-call-42"):
+            for operation, expected in (
+                    (connector.definition.operations[0], "unknown_outcome"),
+                    (connector.definition.operations[1], "timeout")):
+                cancelled.clear()
+                started = time.monotonic()
+                result = await connector.invoke(operation, {})
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertEqual(expected, result["error_code"])
+                self.assertEqual("managed-call-42", result["request_id"])
+                self.assertTrue(cancelled.is_set(), "DNS resolution remained active")
+                self.assertEqual(0, active)
+
     async def test_protocol_failures_are_sanitized_with_stable_request_id(self):
         connector = self.connector()
         for exception in (BadStatusLine("secret upstream status"),
@@ -372,7 +404,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
                                   mutating=operation.mutating), patch(
                         "resident.external_app.current_invocation_id",
                         return_value="managed-call-42"):
-                    def fail(payload):
+                    async def fail(payload):
                         self.assertEqual("managed-call-42", json.loads(payload)["request_id"])
                         raise exception
 
