@@ -73,6 +73,29 @@ class ExternalApplicationDefinitionTests(unittest.TestCase):
         (definitions / "resident.yaml").write_text(text, encoding="utf-8")
         return load_resident_catalog(definitions).residents[0]
 
+    def build(self, text=DEFINITION, *, shared=None):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        definitions = root / "residents"
+        definitions.mkdir()
+        (definitions / "resident.yaml").write_text(text, encoding="utf-8")
+        config = Config(root / "data", residents_dir=definitions)
+        if shared is not None:
+            with patch("resident.__main__._shared_resources", return_value=([], shared, [])):
+                return build_host(config)
+        return build_host(config)
+
+    @staticmethod
+    def second_provider(provider_id, tool_name):
+        return (f"  - id: {provider_id}\n"
+                "    description: Second provider\n"
+                "    base_url: http://second.local\n"
+                "    operations:\n"
+                f"      - name: {tool_name}\n"
+                "        description: Second operation\n"
+                "        input_schema: {type: object, additionalProperties: false}\n")
+
     def test_loads_locally_pinned_provider_catalog_and_bindings(self):
         resident = self.load()
         provider = resident.external_applications[0]
@@ -120,6 +143,43 @@ class ExternalApplicationDefinitionTests(unittest.TestCase):
             with patch("resident.__main__._shared_resources", return_value=([], [impostor], [])):
                 with self.assertRaisesRegex(ValueError, "Duplicate available capability names.*messaging_send"):
                     build_host(Config(root / "data", residents_dir=definitions))
+
+    def test_rejects_provider_id_matching_another_providers_tool(self):
+        text = DEFINITION + self.second_provider("realm_apply_damage", "realm_apply_damage_ping")
+        with self.assertRaisesRegex(ValueError, "realm_apply_damage.*external provider id.*rename"):
+            self.build(text)
+
+    def test_rejects_tool_matching_another_provider_id_in_reverse_order(self):
+        text = DEFINITION.replace("realm_apply_damage", "realm_other", 1)
+        text = text.replace("external_applications:\n", "external_applications:\n" +
+                            self.second_provider("realm_other", "realm_other_ping"), 1)
+        with self.assertRaisesRegex(ValueError, "realm_other.*external provider id.*rename"):
+            self.build(text)
+
+    def test_rejects_provider_id_matching_builtin_capability_name(self):
+        text = DEFINITION.replace("realm", "diagnostics_current_time")
+        with self.assertRaisesRegex(ValueError, "diagnostics_current_time.*built-in capability name.*rename"):
+            self.build(text)
+
+    def test_rejects_external_tool_matching_shared_provider_id(self):
+        shared = [Capability("realm_apply_damage", "Shared provider", "shared_ping",
+                             "Shared tool", {"type": "object"}, lambda _: None)]
+        with self.assertRaisesRegex(ValueError, "realm_apply_damage.*built-in provider id.*rename"):
+            self.build(shared=shared)
+
+    def test_multiple_providers_keep_provider_and_individual_tool_grants(self):
+        text = DEFINITION + self.second_provider("other", "other_ping")
+        for grants, expected in (
+                ("[realm, other_ping]",
+                 {"realm_apply_damage", "realm_get_operation", "other_ping"}),
+                ("[other, realm_apply_damage]", {"other_ping", "realm_apply_damage"})):
+            with self.subTest(grants=grants), patch.dict("os.environ", {"REALM_TOKEN": "token"}), patch(
+                    "resident.__main__._provider", side_effect=lambda _: IdleProvider()):
+                host = self.build(text.replace("capabilities: [realm]", f"capabilities: {grants}"))
+                try:
+                    self.assertEqual(expected, {item.name for item in host.runtimes["resident"].capabilities})
+                finally:
+                    host.close()
 
     def test_external_inventory_is_private_to_its_resident(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -124,6 +124,30 @@ def _select_capabilities(grants: tuple[str, ...], available: list[Capability]) -
     return selected
 
 
+def _validate_external_grant_namespace(
+        definition: ResidentDefinition, shared: list[Capability]) -> None:
+    """Keep provider and tool grants distinct in the simple grant namespace."""
+    providers = {application.id for application in definition.external_applications}
+    shared_providers = {capability.connector_id for capability in shared} | {"messaging"}
+    shared_names = {capability.name for capability in shared} | {"messaging_send"}
+    for application in definition.external_applications:
+        if application.id in shared_names:
+            raise ValueError(
+                f"External application id {application.id!r} for {definition.id} "
+                "conflicts with a built-in capability name; rename the provider")
+        for operation in application.operations:
+            if operation.name in providers:
+                raise ValueError(
+                    f"External tool {operation.name!r} from {application.id} for "
+                    f"{definition.id} conflicts with an external provider id; "
+                    "rename the provider or tool")
+            if operation.name in shared_providers:
+                raise ValueError(
+                    f"External tool {operation.name!r} from {application.id} for "
+                    f"{definition.id} conflicts with a built-in provider id; "
+                    "rename the tool")
+
+
 def _select_outputs(resident_id: str, grants: tuple[str, ...],
                     available: list[OutputCapability], *,
                     owner_available: bool) -> tuple[list[OutputCapability], bool]:
@@ -154,6 +178,8 @@ def build_host(config: Config) -> RuntimeHost:
         config.residents_dir, prompt_root=config.prompt_root, default_id=config.default_resident)
     diagnostics = TerminalDiagnostics(config.verbose)
     producers, available, available_outputs = _shared_resources(config, diagnostics)
+    for definition in catalog.residents:
+        _validate_external_grant_namespace(definition, available)
     mailbox = Mailbox(config.data_dir / "runtime" / "mailbox.sqlite3")
     for producer in producers:
         bind = getattr(producer, "bind_checkpoint", None)
