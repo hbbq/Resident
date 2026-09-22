@@ -243,6 +243,8 @@ def _external_applications(value: Any, label: str) -> tuple[ExternalApplicationD
         application_id = _string(item.get("id"), f"{item_label}.id")
         if not _ID.fullmatch(application_id):
             raise ValueError(f"{item_label}.id must be a lowercase safe identifier")
+        if application_id == "messaging":
+            raise ValueError(f"{item_label}.id is reserved for built-in messaging")
         bindings = _mapping(item.get("bindings", {}), f"{item_label}.bindings")
         try:
             encoded_bindings = json.dumps(

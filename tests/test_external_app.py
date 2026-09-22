@@ -1,11 +1,15 @@
 import json
 import socket
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from resident.__main__ import build_host
+from resident.capabilities import Capability
 from resident.config import Config
 from resident.domain import ModelTurn
 from resident.external_app import ExternalApplicationConnector
@@ -83,6 +87,30 @@ class ExternalApplicationDefinitionTests(unittest.TestCase):
                 "additionalProperties: false\n      - name: realm_get_operation",
                 "additionalProperties: false\n          oneOf: []\n      - name: realm_get_operation"))
 
+    def test_rejects_external_messaging_provider_even_without_a_messaging_grant(self):
+        for grants in ("[]", "[messaging]"):
+            with self.subTest(grants=grants), self.assertRaisesRegex(
+                    ValueError, "reserved for built-in messaging"):
+                self.load(DEFINITION.replace("capabilities: [realm]", f"capabilities: {grants}")
+                          .replace("id: realm\n", "id: messaging\n")
+                          .replace("realm_apply_damage", "messaging_send")
+                          .replace("realm_get_operation", "messaging_get_operation"))
+
+    def test_special_messaging_capability_participates_in_collision_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definitions = root / "residents"
+            definitions.mkdir()
+            (definitions / "resident.yaml").write_text(
+                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+                "capabilities: [messaging]\n", encoding="utf-8")
+            impostor = Capability(
+                "other", "Other", "messaging_send", "Other send", {"type": "object"},
+                lambda _: None)
+            with patch("resident.__main__._shared_resources", return_value=([], [impostor], [])):
+                with self.assertRaisesRegex(ValueError, "Duplicate available capability names.*messaging_send"):
+                    build_host(Config(root / "data", residents_dir=definitions))
+
     def test_external_inventory_is_private_to_its_resident(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -132,11 +160,97 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
             captured["timeout"] = timeout
             return Response()
 
-        with patch("resident.external_app.urlopen", side_effect=open_request):
+        class Opener:
+            open = staticmethod(open_request)
+
+        with patch("resident.external_app.build_opener", return_value=Opener()):
             result = connector._post(b"{}")
         self.assertEqual({"ready": True}, result)
         self.assertEqual("Bearer private-token", captured["authorization"])
         self.assertEqual(3, captured["timeout"])
+
+    async def test_redirect_does_not_forward_bearer_token_to_another_origin(self):
+        received = []
+
+        class Destination(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(307)
+                self.send_header(
+                    "Location", f"http://127.0.0.1:{destination.server_port}/stolen")
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True)
+                   for server in (destination, redirect)]
+        for thread in threads:
+            thread.start()
+        try:
+            connector = self.connector()
+            connector.base_url = f"http://127.0.0.1:{redirect.server_port}"
+            with self.assertRaises(HTTPError) as error:
+                connector._post(b"{}")
+            self.assertEqual(307, error.exception.code)
+            result = await connector.invoke(connector.definition.operations[0], {})
+            self.assertEqual("unknown_outcome", result["error_code"])
+            self.assertEqual([], received)
+        finally:
+            for server in (redirect, destination):
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join()
+
+    async def test_invalid_responses_preserve_mutating_request_id(self):
+        connector = self.connector()
+
+        class Response:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            def read(self, _):
+                return self.raw
+
+        class Opener:
+            def __init__(self, raw):
+                self.raw = raw
+                self.request_id = None
+
+            def open(self, request, timeout):
+                self.request_id = json.loads(request.data)["request_id"]
+                return Response(self.raw)
+
+        for raw in (b"not json", b"true", b" " * (1024 * 1024 + 1)):
+            for operation, expected in ((connector.definition.operations[0], "unknown_outcome"),
+                                        (connector.definition.operations[1], "invalid_response")):
+                with self.subTest(raw=raw[:16], mutating=operation.mutating):
+                    opener = Opener(raw)
+                    with patch("resident.external_app.build_opener", return_value=opener), patch(
+                            "resident.external_app.current_invocation_id", return_value="managed-call-42"):
+                        result = await connector.invoke(operation, {})
+                    self.assertEqual(expected, result["error_code"])
+                    self.assertEqual("managed-call-42", opener.request_id)
+                    self.assertEqual(opener.request_id, result["request_id"])
+                    self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
 
     async def test_invocation_uses_stable_call_id_and_server_side_bindings(self):
         connector = self.connector()

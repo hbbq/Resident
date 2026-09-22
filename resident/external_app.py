@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .capabilities import Capability, current_invocation_id
 from .instances import ExternalApplicationDefinition, ExternalOperationDefinition
@@ -16,6 +16,11 @@ from .observability import to_thread_timed
 
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 1024 * 1024
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
 
 
 class ExternalApplicationConnector:
@@ -52,7 +57,8 @@ class ExternalApplicationConnector:
         request = Request(
             f"{self.base_url}/api/capabilities/invoke", data=payload,
             headers=headers, method="POST")
-        with urlopen(request, timeout=self.definition.request_timeout_seconds) as response:
+        with build_opener(_NoRedirects()).open(
+                request, timeout=self.definition.request_timeout_seconds) as response:
             raw = response.read(_MAX_RESPONSE_BYTES + 1)
         if len(raw) > _MAX_RESPONSE_BYTES:
             raise ValueError("response_too_large")
@@ -95,6 +101,16 @@ class ExternalApplicationConnector:
         except asyncio.CancelledError:
             raise
         except HTTPError as exc:
+            if 300 <= exc.code < 400:
+                if operation.mutating:
+                    return self._failure(
+                        "unknown_outcome",
+                        "External operation outcome is unknown after an unexpected redirect; "
+                        "reconcile by request_id",
+                        request_id, unknown=True)
+                return self._failure(
+                    "invalid_response", "External application returned an unexpected redirect",
+                    request_id)
             if exc.code in (401, 403):
                 code, message = "authentication_failed", "External application rejected authentication"
             elif exc.code == 409:
@@ -133,6 +149,12 @@ class ExternalApplicationConnector:
                 "External operation timed out" if is_timeout else "External application is unavailable",
                 request_id)
         except ValueError:
+            if operation.mutating:
+                return self._failure(
+                    "unknown_outcome",
+                    "External operation outcome is unknown after an invalid response; "
+                    "reconcile by request_id",
+                    request_id, unknown=True)
             return self._failure(
                 "invalid_response", "External application returned an invalid response", request_id)
         except OSError:

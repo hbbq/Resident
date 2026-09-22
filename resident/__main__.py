@@ -214,7 +214,7 @@ def build_host(config: Config) -> RuntimeHost:
                     diagnostic_output=diagnostics.telegram)
                 private_producers[definition.id] = [transport]
             instance_available = list(available)
-            shared_connector_ids = {capability.connector_id for capability in available}
+            shared_connector_ids = {capability.connector_id for capability in available} | {"messaging"}
             for external_definition in definition.external_applications:
                 if external_definition.id in shared_connector_ids:
                     raise ValueError(
@@ -224,7 +224,9 @@ def build_host(config: Config) -> RuntimeHost:
                          if external_definition.bearer_token_env else None)
                 external = ExternalApplicationConnector(external_definition, token)
                 instance_available.extend(external.capabilities)
+            special_messaging = messaging_capability(mailbox, definition.id, recipients)
             inventory_names = [capability.name for capability in instance_available]
+            inventory_names.append(special_messaging.name)
             duplicate_names = sorted({name for name in inventory_names
                                       if inventory_names.count(name) > 1})
             if duplicate_names:
@@ -241,7 +243,7 @@ def build_host(config: Config) -> RuntimeHost:
             grants.extend(capability for capability in _legacy_output_capabilities(
                 output_grants, instance_available) if capability.name not in granted_names)
             if "messaging" in definition.capabilities:
-                grants.append(messaging_capability(mailbox, definition.id, recipients))
+                grants.append(special_messaging)
             runtime = ResidentRuntime(
                 instance_config, _provider(definition), capabilities=grants,
                 output_capabilities=output_grants,
