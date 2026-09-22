@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from resident.context import ContextBuilder
 from resident.domain import Identity, WakeEvent
-from resident.memory import MemoryCurator, OpenAICuratorModel, SessionItemPage
+from resident.memory import (FinalCatchUpIncomplete, MemoryCurator,
+                             OpenAICuratorModel, SessionItemPage)
 from resident.observability import timeline_reporter
 from resident.store import (MAX_ACTIVE_OWNER_GUIDANCE_BYTES,
                             MAX_ACTIVE_OWNER_GUIDANCE_COUNT,
@@ -80,7 +81,138 @@ class PageSource:
         return self.pages.pop(0)
 
 
+class CursorSource:
+    session_id = "session-cursor"
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.cursors = []
+
+    async def session_items(self, cursor, limit):
+        self.cursors.append(cursor)
+        return self.pages[cursor]
+
+
 class MemoryStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_target_cannot_replace_forward_request_and_new_target_resets_attempts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            store.apply_curator_batch(
+                "openai_agents", "session-cursor", "a", "a", "batch-a", [],
+                last_turn_id="opaque-A", consumed_turns=(("opaque-A", "a"),))
+            self.assertTrue(store.request_curator_catch_up(
+                "openai_agents", "session-cursor", "opaque-B"))
+            self.assertEqual(1, store.start_curator_request(
+                "openai_agents", "session-cursor", "opaque-B"))
+            self.assertTrue(store.retry_curator_request(
+                "openai_agents", "session-cursor", "opaque-B", "Temporary", 30))
+            self.assertFalse(store.request_curator_catch_up(
+                "openai_agents", "session-cursor", "opaque-A"))
+            request = store.curator_request("openai_agents", "session-cursor")
+            self.assertEqual("opaque-B", request["target_turn_id"])
+            self.assertEqual("retrying", request["status"])
+            self.assertEqual(1, request["attempts"])
+            self.assertTrue(store.request_curator_catch_up(
+                "openai_agents", "session-cursor", "opaque-C"))
+            request = store.curator_request("openai_agents", "session-cursor")
+            self.assertEqual("opaque-C", request["target_turn_id"])
+            self.assertEqual(0, request["attempts"])
+            self.assertIsNone(request["next_retry_at"])
+            self.assertEqual(1, store.start_curator_request(
+                "openai_agents", "session-cursor", "opaque-C"))
+            store.close()
+
+    async def test_reused_older_turn_is_satisfied_without_replaying_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source = CursorSource({
+                None: SessionItemPage((
+                    {"id": "a", "type": "message", "turn_id": "opaque-A"},
+                    {"id": "b", "type": "message", "turn_id": "opaque-B"},
+                ), "b", False),
+            })
+            model = RecordingModel()
+            curator = MemoryCurator(store, source, model)
+            await curator.catch_up(through_turn_id="opaque-B")
+            checkpoint = store.curator_checkpoint("openai_agents", source.session_id)
+            self.assertTrue(store.curator_turn_consumed(
+                "openai_agents", source.session_id, "opaque-A"))
+            calls = model.calls
+            source.cursors.clear()
+            await curator.catch_up(through_turn_id="opaque-A")
+            self.assertEqual([], source.cursors)
+            self.assertEqual(calls, model.calls)
+            self.assertEqual(checkpoint, store.curator_checkpoint(
+                "openai_agents", source.session_id))
+            store.close()
+
+    async def test_pre_migration_older_turn_is_verified_from_source_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            store.apply_curator_batch("openai_agents", "session-cursor", "b", "b",
+                                      "legacy-b", [], last_turn_id="opaque-B")
+            source = CursorSource({
+                "b": SessionItemPage((), "b", False),
+                None: SessionItemPage((
+                    {"id": "a", "type": "message", "turn_id": "opaque-A"},
+                    {"id": "b", "type": "message", "turn_id": "opaque-B"},
+                ), "b", False),
+            })
+            model = RecordingModel()
+            curator = MemoryCurator(store, source, model)
+            await curator.catch_up(through_turn_id="opaque-A")
+            self.assertEqual(["b", None], source.cursors)
+            self.assertEqual(0, model.calls)
+            self.assertTrue(store.curator_turn_consumed(
+                "openai_agents", source.session_id, "opaque-A"))
+            self.assertEqual("b", store.curator_checkpoint(
+                "openai_agents", source.session_id)["cursor"])
+            source.cursors.clear()
+            await curator.catch_up(through_turn_id="opaque-A")
+            self.assertEqual([], source.cursors)
+            store.close()
+
+    async def test_split_target_is_only_consumed_after_its_last_page(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            source = CursorSource({
+                None: SessionItemPage((
+                    {"id": "a1", "type": "message", "turn_id": "target"},
+                ), "a1", True),
+                "a1": SessionItemPage((
+                    {"id": "a2", "type": "message", "turn_id": "target"},
+                ), "a2", False),
+            })
+            model = RecordingModel()
+            curator = MemoryCurator(store, source, model, max_batches=1)
+            with self.assertRaises(FinalCatchUpIncomplete):
+                await curator.catch_up(through_turn_id="target")
+            self.assertEqual("target", store.curator_checkpoint(
+                "openai_agents", source.session_id)["last_turn_id"])
+            self.assertFalse(store.curator_turn_consumed(
+                "openai_agents", source.session_id, "target"))
+            await curator.catch_up(through_turn_id="target")
+            self.assertTrue(store.curator_turn_consumed(
+                "openai_agents", source.session_id, "target"))
+            self.assertEqual(["a1", "a2"], [item["id"] for page in model.pages
+                                           for item in page])
+            store.close()
+
+    async def test_partial_checkpoint_with_matching_turn_does_not_satisfy_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "resident.sqlite3")
+            store.apply_curator_batch("openai_agents", "session-cursor", "a1", "a1",
+                                      "prior", [], last_turn_id="target")
+            source = CursorSource({"a1": SessionItemPage((
+                {"id": "a2", "type": "message", "turn_id": "target"},
+            ), "a2", False)})
+            model = RecordingModel()
+            await MemoryCurator(store, source, model).catch_up(through_turn_id="target")
+            self.assertEqual(["a2"], [item["id"] for page in model.pages for item in page])
+            self.assertTrue(store.curator_turn_consumed(
+                "openai_agents", source.session_id, "target"))
+            store.close()
+
     async def test_completed_turn_boundary_excludes_items_from_later_turn(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")

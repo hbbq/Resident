@@ -291,6 +291,42 @@ class MemoryCurator:
         self.batch_size, self.max_batches = max(1, min(batch_size, 100)), max(1, max_batches)
         self._lock = asyncio.Lock()
 
+    async def _verify_historical_target(self, session_id: str,
+                                        target_turn_id: str) -> bool:
+        """Recover a pre-migration boundary from source order, without replaying it."""
+        checkpoint = self.store.curator_checkpoint("openai_agents", session_id)
+        if checkpoint is None or not checkpoint["last_item_id"] or not checkpoint["cursor"]:
+            return False
+        cursor = None
+        seen_cursors = {cursor}
+        target_last_item = None
+        target_finished = False
+        while True:
+            page = await self.source.session_items(cursor, self.batch_size)
+            if not page.items:
+                return False
+            for item in page.items:
+                turn_id = item.get("turn_id")
+                if turn_id == target_turn_id:
+                    if target_finished:
+                        return False
+                    target_last_item = item.get("id")
+                elif target_last_item is not None:
+                    target_finished = True
+                if item.get("id") == checkpoint["last_item_id"]:
+                    if not target_finished or not isinstance(target_last_item, str):
+                        return False
+                    self.store.record_verified_historical_turn(
+                        "openai_agents", session_id, target_turn_id,
+                        target_last_item, checkpoint["cursor"])
+                    return self.store.curator_turn_consumed(
+                        "openai_agents", session_id, target_turn_id)
+            next_cursor = page.cursor or page.items[-1].get("id")
+            if not page.has_more or not next_cursor or next_cursor in seen_cursors:
+                return False
+            cursor = next_cursor
+            seen_cursors.add(cursor)
+
     async def upgrade_legacy_checkpoint(self, session_id: str, target_turn_id: str) -> bool:
         """Verify the last curated item before assigning an old checkpoint its turn."""
         async with self._lock:
@@ -341,6 +377,9 @@ class MemoryCurator:
             cursor = checkpoint["cursor"] if checkpoint else None
             saved_handover = checkpoint.get("handover_draft") if checkpoint else None
             handover = _redact_text(saved_handover) if isinstance(saved_handover, str) else None
+            if (through_turn_id is not None and self.store.curator_turn_consumed(
+                    "openai_agents", session_id, through_turn_id)):
+                return handover
             pages = 0
             seen_cursors = {cursor}
             seen_pages: set[tuple[str, tuple[str, ...] | str]] = set()
@@ -357,6 +396,18 @@ class MemoryCurator:
                 try:
                     page = await self.source.session_items(cursor, self.batch_size)
                     page_items = page.items
+                    previous_turn = checkpoint.get("last_turn_id") if checkpoint else None
+                    first_turn = page_items[0].get("turn_id") if page_items else None
+                    if (previous_turn and cursor == checkpoint["cursor"]
+                            and (not page_items or (isinstance(first_turn, str)
+                                                    and first_turn != previous_turn))
+                            and (page_items or not page.has_more)):
+                        self.store.mark_curator_turn_consumed(
+                            "openai_agents", session_id, previous_turn, cursor)
+                        if through_turn_id == previous_turn:
+                            batch_outcome = "ok"
+                            more_pages = False
+                            break
                     if through_turn_id is not None:
                         boundary_indexes = [
                             index for index, item in enumerate(page_items)
@@ -369,7 +420,9 @@ class MemoryCurator:
                             reached_boundary = True
                             boundary_end = len(page_items)
                             for index in range(boundary_indexes[0] + 1, len(page_items)):
-                                if page_items[index].get("turn_id") != through_turn_id:
+                                next_turn = page_items[index].get("turn_id")
+                                if (isinstance(next_turn, str)
+                                        and next_turn != through_turn_id):
                                     boundary_end = index
                                     break
                             if boundary_end < len(page_items):
@@ -387,7 +440,10 @@ class MemoryCurator:
                         if page.has_more:
                             raise RuntimeError("Curator pagination stalled on an empty page")
                         if through_turn_id is not None and not reached_boundary:
-                            raise RuntimeError("Completed-turn Curator boundary was not found")
+                            if not await self._verify_historical_target(
+                                    session_id, through_turn_id):
+                                raise RuntimeError("Completed-turn Curator boundary was not found")
+                            reached_boundary = True
                         batch_outcome = "ok"
                         break
                     last_item_id = page_items[-1].get("id")
@@ -402,6 +458,19 @@ class MemoryCurator:
                     seen_cursors.add(next_cursor)
                     seen_pages.add(page_identity)
                     pages += 1
+                    consumed_turns = []
+                    for index, item in enumerate(page_items):
+                        turn_id = item.get("turn_id")
+                        if not isinstance(turn_id, str) or not turn_id:
+                            continue
+                        next_turn = (page_items[index + 1].get("turn_id")
+                                     if index + 1 < len(page_items) else None)
+                        if isinstance(next_turn, str) and next_turn != turn_id:
+                            consumed_turns.append((turn_id, item["id"]))
+                    if not more_pages:
+                        last_turn = page_items[-1].get("turn_id")
+                        if isinstance(last_turn, str) and last_turn:
+                            consumed_turns.append((last_turn, next_cursor))
                     key_material = f"{session_id}:{cursor or ''}:{next_cursor or ''}"
                     operation_key = hashlib.sha256(key_material.encode()).hexdigest()
                     job_id = hashlib.sha256(f"job:{session_id}:{cursor or ''}".encode()).hexdigest()
@@ -431,12 +500,13 @@ class MemoryCurator:
                         self.store.apply_curator_batch(
                             "openai_agents", session_id, next_cursor, last_item_id,
                             operation_key, mutations, handover_operation, proposed_handover,
-                            page_items[-1].get("turn_id"))
+                            page_items[-1].get("turn_id"), tuple(consumed_turns))
                         self.store.finish_curator_job(job_id)
                     except BaseException as exc:
                         self.store.fail_curator_job(job_id, type(exc).__name__)
                         raise
                     cursor = next_cursor
+                    checkpoint = {"cursor": cursor, "last_turn_id": page_items[-1].get("turn_id")}
                     batch_outcome = "ok"
                 finally:
                     emit_timeline(
@@ -446,7 +516,9 @@ class MemoryCurator:
                         duration_seconds=time.monotonic() - batch_started)
                 if not more_pages:
                     break
-            if through_turn_id is not None and (not reached_boundary or more_pages):
+            if through_turn_id is not None and (
+                    not reached_boundary or more_pages or not self.store.curator_turn_consumed(
+                        "openai_agents", session_id, through_turn_id)):
                 raise FinalCatchUpIncomplete("Completed-turn Curator boundary was not reached")
             if final and more_pages:
                 raise FinalCatchUpIncomplete(

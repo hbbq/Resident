@@ -202,6 +202,9 @@ class Store:
           provider TEXT NOT NULL, session_id TEXT NOT NULL, cursor TEXT,
           last_item_id TEXT, last_turn_id TEXT, handover_draft TEXT, updated_at TEXT NOT NULL,
           PRIMARY KEY(provider,session_id));
+        CREATE TABLE IF NOT EXISTS curator_consumed_turns(
+          provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+          cursor TEXT NOT NULL, PRIMARY KEY(provider,session_id,turn_id));
         CREATE TABLE IF NOT EXISTS curator_operations(
           operation_key TEXT PRIMARY KEY, session_id TEXT NOT NULL,
           cursor TEXT, applied_at TEXT NOT NULL);
@@ -899,6 +902,38 @@ class Store:
         """, (provider, session_id)).fetchone()
         return None if row is None else dict(row)
 
+    def curator_turn_consumed(self, provider: str, session_id: str,
+                              turn_id: str) -> bool:
+        return self.connection.execute("""
+            SELECT 1 FROM curator_consumed_turns
+            WHERE provider=? AND session_id=? AND turn_id=?
+        """, (provider, session_id, turn_id)).fetchone() is not None
+
+    def mark_curator_turn_consumed(self, provider: str, session_id: str,
+                                   turn_id: str, cursor: str) -> bool:
+        """Verify the checkpoint still sits at a source-proven turn boundary."""
+        with self.connection:
+            result = self.connection.execute("""
+                INSERT INTO curator_consumed_turns(provider,session_id,turn_id,cursor)
+                SELECT provider,session_id,?,cursor FROM curator_checkpoints
+                WHERE provider=? AND session_id=? AND cursor=? AND last_turn_id=?
+                ON CONFLICT DO NOTHING
+            """, (turn_id, provider, session_id, cursor, turn_id))
+        return result.rowcount == 1
+
+    def record_verified_historical_turn(self, provider: str, session_id: str,
+                                        turn_id: str, boundary_cursor: str,
+                                        checkpoint_cursor: str) -> bool:
+        """Backfill a source-verified boundary under the checkpoint that was scanned."""
+        with self.connection:
+            result = self.connection.execute("""
+                INSERT INTO curator_consumed_turns(provider,session_id,turn_id,cursor)
+                SELECT provider,session_id,?,? FROM curator_checkpoints
+                WHERE provider=? AND session_id=? AND cursor=?
+                ON CONFLICT DO NOTHING
+            """, (turn_id, boundary_cursor, provider, session_id, checkpoint_cursor))
+        return result.rowcount == 1
+
     def upgrade_legacy_curator_checkpoint(self, provider: str, session_id: str,
                                           cursor: str, last_item_id: str,
                                           last_turn_id: str) -> bool:
@@ -909,6 +944,11 @@ class Store:
                 WHERE provider=? AND session_id=? AND cursor=? AND last_item_id=?
                   AND last_turn_id IS NULL
             """, (last_turn_id, utc_now(), provider, session_id, cursor, last_item_id))
+            if result.rowcount:
+                self.connection.execute("""
+                    INSERT OR IGNORE INTO curator_consumed_turns
+                    (provider,session_id,turn_id,cursor) VALUES(?,?,?,?)
+                """, (provider, session_id, last_turn_id, cursor))
         return result.rowcount == 1
 
     def apply_curator_batch(self, provider: str, session_id: str, cursor: str | None,
@@ -916,7 +956,8 @@ class Store:
                             mutations: list[dict[str, Any]],
                             handover_operation: str = "keep",
                             handover_draft: str | None = None,
-                            last_turn_id: str | None = None) -> bool:
+                            last_turn_id: str | None = None,
+                            consumed_turns: tuple[tuple[str, str], ...] = ()) -> bool:
         """Atomically apply validated curator decisions and advance its source checkpoint."""
         if any(not mutation.get("provenance") for mutation in mutations):
             raise ValueError("Durable Curator memory requires verified provenance")
@@ -986,22 +1027,36 @@ class Store:
             """, (provider, session_id, cursor, last_item_id, last_turn_id,
                   handover_draft, now,
                   handover_operation))
+            for turn_id, boundary_cursor in consumed_turns:
+                self.connection.execute("""
+                    INSERT OR IGNORE INTO curator_consumed_turns
+                    (provider,session_id,turn_id,cursor) VALUES(?,?,?,?)
+                """, (provider, session_id, turn_id, boundary_cursor))
         return True
 
     def request_curator_catch_up(self, provider: str, session_id: str,
-                                 target_turn_id: str) -> None:
+                                 target_turn_id: str) -> bool:
         """Durably coalesce routine work to the newest completed turn."""
         now = utc_now()
         with self.connection:
+            if self.curator_turn_consumed(provider, session_id, target_turn_id):
+                return False
+            current = self.connection.execute("""
+                SELECT target_turn_id FROM curator_requests
+                WHERE provider=? AND session_id=?
+            """, (provider, session_id)).fetchone()
+            if current is not None and current["target_turn_id"] == target_turn_id:
+                return False
             self.connection.execute("""
                 INSERT INTO curator_requests(
                   provider,session_id,target_turn_id,status,attempts,requested_at,updated_at)
                 VALUES(?,?,?,'pending',0,?,?)
                 ON CONFLICT(provider,session_id) DO UPDATE SET
-                  target_turn_id=excluded.target_turn_id,status='pending',next_retry_at=NULL,
-                  last_error_type=NULL,requested_at=excluded.requested_at,
+                  target_turn_id=excluded.target_turn_id,status='pending',attempts=0,
+                  next_retry_at=NULL,last_error_type=NULL,requested_at=excluded.requested_at,
                   updated_at=excluded.updated_at
             """, (provider, session_id, target_turn_id, now, now))
+        return True
 
     def curator_request(self, provider: str, session_id: str) -> dict[str, Any] | None:
         row = self.connection.execute("""

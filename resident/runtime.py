@@ -335,7 +335,8 @@ class ResidentRuntime:
                     provider, session_id, binding_target)
                 request = self.store.curator_request(provider, session_id)
         if request is None:
-            if binding_target is None:
+            if (binding_target is None or self.store.curator_turn_consumed(
+                    provider, session_id, binding_target)):
                 return
             raise RuntimeError("Startup Curator request could not be persisted")
 
@@ -360,7 +361,7 @@ class ResidentRuntime:
                     await curator.catch_up(
                         through_turn_id=target, session_id=session_id)
                 checkpoint = self.store.curator_checkpoint(provider, session_id)
-                if checkpoint is None or checkpoint.get("last_turn_id") != target:
+                if not self.store.curator_turn_consumed(provider, session_id, target):
                     raise FinalCatchUpIncomplete(
                         "Completed-turn Curator boundary was not reached")
             except asyncio.CancelledError:
@@ -1154,10 +1155,10 @@ class ResidentRuntime:
                 session_id = getattr(self.provider, "session_id", None)
                 completed_turn_id = turn.response_id
                 if session_id and completed_turn_id:
-                    self.store.request_curator_catch_up(
-                        "openai_agents", session_id, completed_turn_id)
-                    self._emit("curator.requested", {"status": "pending"})
-                    self._curator_coordinator.signal()
+                    if self.store.request_curator_catch_up(
+                            "openai_agents", session_id, completed_turn_id):
+                        self._emit("curator.requested", {"status": "pending"})
+                        self._curator_coordinator.signal()
             return run_id
         except asyncio.CancelledError as exc:
             self._discard_continuation(continuation_id)

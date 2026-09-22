@@ -134,6 +134,135 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             "test", "Test connector", name, description,
             {"type": "object", "properties": {}, "additionalProperties": False}, handler)
 
+    async def test_startup_satisfies_reused_older_target_without_history_search(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            store.apply_curator_batch(
+                "openai_agents", "session-existing", "b", "b", "curated-b", [],
+                last_turn_id="opaque-B", consumed_turns=(
+                    ("opaque-A", "a"), ("opaque-B", "b")))
+            store.request_curator_catch_up(
+                "openai_agents", "session-existing", "opaque-C")
+            store.save_agent_session_binding(
+                "openai_agents", "session-existing", None, "opaque-A")
+            store.close()
+
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            class Source:
+                session_id = "session-existing"
+
+                def __init__(self):
+                    self.cursors = []
+
+                async def session_items(self, cursor, limit):
+                    self.cursors.append(cursor)
+                    return SessionItemPage((
+                        {"id": "c", "type": "message", "turn_id": "opaque-C"},
+                    ), "c", False)
+
+            class Model:
+                def __init__(self):
+                    self.calls = 0
+
+                async def curate(self, *args):
+                    self.calls += 1
+                    return {"mutations": [], "handover": {"operation": "keep"}}
+
+            source, model = Source(), Model()
+            runtime.bind_curator(MemoryCurator(runtime.store, source, model))
+            await runtime._reconcile_startup_curator()
+            self.assertEqual(["b"], source.cursors)
+            self.assertEqual(1, model.calls)
+            self.assertEqual("opaque-C", runtime.store.curator_checkpoint(
+                "openai_agents", source.session_id)["last_turn_id"])
+            self.assertIsNone(runtime.store.curator_request(
+                "openai_agents", source.session_id))
+            runtime.close()
+
+    async def test_startup_clears_reused_consumed_target_without_model_call(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "resident.sqlite3"
+            store = Store(path)
+            store.apply_curator_batch(
+                "openai_agents", "session-existing", "b", "b", "curated-b", [],
+                last_turn_id="opaque-B", consumed_turns=(
+                    ("opaque-A", "a"), ("opaque-B", "b")))
+            store.request_curator_catch_up(
+                "openai_agents", "session-existing", "opaque-C")
+            store.connection.execute("""
+                UPDATE curator_requests SET target_turn_id='opaque-A'
+                WHERE provider='openai_agents' AND session_id='session-existing'
+            """)
+            store.save_agent_session_binding(
+                "openai_agents", "session-existing", None, "opaque-A")
+            store.close()
+
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            class Source:
+                session_id = "session-existing"
+
+                async def session_items(self, cursor, limit):
+                    raise AssertionError("Consumed turn must not search session history")
+
+            class Model:
+                async def curate(self, *args):
+                    raise AssertionError("Consumed turn must not invoke model")
+
+            runtime.bind_curator(MemoryCurator(runtime.store, Source(), Model()))
+            await runtime._reconcile_startup_curator()
+            self.assertIsNone(runtime.store.curator_request(
+                "openai_agents", "session-existing"))
+            self.assertEqual("b", runtime.store.curator_checkpoint(
+                "openai_agents", "session-existing")["cursor"])
+            runtime.close()
+
+    async def test_routine_reused_consumed_target_finishes_without_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), MessageOnlyProvider(), capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+            runtime.store.apply_curator_batch(
+                "openai_agents", "session-existing", "b", "b", "curated-b", [],
+                last_turn_id="opaque-B", consumed_turns=(
+                    ("opaque-A", "a"), ("opaque-B", "b")))
+            runtime.store.request_curator_catch_up(
+                "openai_agents", "session-existing", "opaque-C")
+            runtime.store.connection.execute("""
+                UPDATE curator_requests SET target_turn_id='opaque-A'
+                WHERE provider='openai_agents' AND session_id='session-existing'
+            """)
+
+            class Source:
+                session_id = "session-existing"
+
+                async def session_items(self, cursor, limit):
+                    raise AssertionError("Already consumed history was requested")
+
+            class Model:
+                async def curate(self, *args):
+                    raise AssertionError("Already consumed history was replayed")
+
+            runtime.bind_curator(MemoryCurator(runtime.store, Source(), Model()))
+            runtime._curator_coordinator.start()
+            runtime._curator_coordinator.signal()
+            for _ in range(100):
+                if runtime.store.curator_request("openai_agents", "session-existing") is None:
+                    break
+                await asyncio.sleep(.01)
+            self.assertIsNone(runtime.store.curator_request(
+                "openai_agents", "session-existing"))
+            self.assertEqual("b", runtime.store.curator_checkpoint(
+                "openai_agents", "session-existing")["cursor"])
+            await runtime.stop_background_services()
+            runtime.close()
+
     async def test_routine_curator_does_not_block_later_managed_wake(self):
         with tempfile.TemporaryDirectory() as temporary:
             provider = ManagedRecordingProvider()
@@ -358,7 +487,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             source.cursors.clear()
             restarted.bind_curator(MemoryCurator(restarted.store, source, Model()))
             await restarted.enqueue_startup_wakeups(asyncio.Queue())
-            self.assertEqual(["item-1"], source.cursors)
+            self.assertEqual([], source.cursors)
             await restarted.stop_background_services()
             restarted.close()
 
