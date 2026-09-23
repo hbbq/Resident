@@ -4714,6 +4714,43 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("before\nafter", completed.message)
 
+    def test_agents_stream_combines_dispositions_across_tool_rounds(self):
+        provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
+        provider.configure_output_protocol({"type": "object"}, [], "fingerprint")
+
+        def item_events(index, item_id, item_type, text=None):
+            item = {"id": item_id, "type": item_type, "turn_id": "turn-1"}
+            if item_type == "message":
+                item["role"] = "assistant"
+            done = {**item, "status": "completed"}
+            if text is not None:
+                done["content"] = [{"type": "output_text", "text": text}]
+            return [{
+                "type": "agent.session.turn.item.added", "session_id": "session-1",
+                "turn_id": "turn-1", "output_index": index, "item": item,
+            }, {
+                "type": "agent.session.turn.item.done", "session_id": "session-1",
+                "turn_id": "turn-1", "output_index": index, "item": done,
+            }]
+
+        provider._consume_event_stream("session-1", iter([
+            *item_events(0, "first", "message", '{"outputs":[{"type":"notify_owner","content":"first"}]}'),
+            *item_events(1, "tool", "function_call"),
+            {"type": "agent.session.requires_action", "session": {
+                "id": "session-1", "required_actions": [{
+                    "type": "function_call", "turn_id": "turn-1", "call_id": "call-1",
+                    "name": "clock", "arguments": {},
+                }]}}
+        ]), expected_turn_id="turn-1", correlation=None, wake_key=None)
+        completed = provider._consume_event_stream("session-1", iter([
+            *item_events(2, "second", "message", '{"outputs":[{"type":"notify_owner","content":"second"}]}'),
+            {"type": "agent.session.turn.completed", "session_id": "session-1",
+             "turn_id": "turn-1", "turn": {"id": "turn-1", "status": "completed"}},
+        ]), expected_turn_id="turn-1", correlation=None, wake_key=None)
+
+        self.assertEqual(["first", "second"], [
+            output["content"] for output in json.loads(completed.message)["outputs"]])
+
     def test_agents_lost_reducer_state_forces_exact_continuation_recovery(self):
         provider = OpenAIAgentsProvider("test-key", "gpt-5.6-luna")
         provider._ensure_session = lambda *_args, **_kwargs: (

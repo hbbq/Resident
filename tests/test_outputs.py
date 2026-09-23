@@ -9,6 +9,7 @@ from resident.config import Config
 from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.outputs import (DeliveryPolicy, OutputCapability, output_schema,
                               schema_fingerprint, validate_disposition)
+from resident.provider import OpenAIAgentsProvider
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
 
@@ -198,6 +199,70 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([("display1", "one"), ("display2", "two")], delivered)
             self.assertEqual(0, runtime.store.connection.execute(
                 "SELECT count(*) FROM scheduled_wakeups").fetchone()[0])
+            runtime.close()
+
+    async def test_paginated_agents_dispositions_are_delivered_in_item_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            delivered = []
+            capability = display_capability("display1", delivered)
+            runtime = self.runtime(
+                temporary, StructuredProvider(), outputs=(capability,),
+                owner_communication_enabled=False)
+            adapter = OpenAIAgentsProvider("test-key", "model")
+            adapter.configure_output_protocol(
+                runtime._output_schema, [], schema_fingerprint(runtime._output_schema))
+            pages = iter(({
+                "data": [{"id": "new", "turn_id": "turn", "type": "message",
+                          "role": "assistant", "status": "completed", "content": [{
+                              "type": "output_text", "text": json.dumps({"outputs": [{
+                                  "type": "display", "target": "display1", "content": "second"}]})}] }],
+                "has_more": True, "last_id": "new",
+            }, {
+                "data": [{"id": "old", "turn_id": "turn", "type": "message",
+                          "role": "assistant", "status": "completed", "content": [{
+                              "type": "output_text", "text": json.dumps({"outputs": [{
+                                  "type": "display", "target": "display1", "content": "first"}]})}]},
+                         {"id": "prior", "turn_id": "prior", "type": "reasoning"}],
+                "has_more": True, "last_id": "prior",
+            }))
+            adapter._request = lambda *_args, **_kwargs: next(pages)
+            raw = adapter._turn_message("session", "turn")
+            runtime._persist_disposition(raw, "session", "turn", run_id=None, wake=None)
+            self.assertTrue(await runtime.dispatch_outputs_once())
+            self.assertTrue(await runtime.dispatch_outputs_once())
+            self.assertEqual([("display1", "first"), ("display1", "second")], delivered)
+            runtime.close()
+
+    async def test_invalid_agents_item_or_combined_limit_rejects_whole_disposition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self.runtime(
+                temporary, StructuredProvider(),
+                outputs=(display_capability("display1", []),),
+                owner_communication_enabled=False)
+            adapter = OpenAIAgentsProvider("test-key", "model")
+            adapter.configure_output_protocol(
+                runtime._output_schema, [], schema_fingerprint(runtime._output_schema))
+            valid = json.dumps({"outputs": [{
+                "type": "display", "target": "display1", "content": "ok"}]})
+            cases = (([valid, "not-json"], "invalid_json"),
+                     ([valid, " "], "invalid_json"),
+                     ([valid, '{"outputs":[],"extra":true}'], "invalid_json"),
+                     ([valid, '{"outputs":[{"type":"unknown"}]}'], "schema_invalid"),
+                     ([valid, json.dumps({"outputs": [{
+                         "type": "display", "target": "display1", "content": "x"
+                     }] * 8})], "schema_invalid"))
+            for ordinal, (items, expected) in enumerate(cases):
+                with self.subTest(expected=expected):
+                    raw = adapter._join_turn_messages([[item] for item in items], descending=False)
+                    with self.assertRaises(RuntimeError):
+                        runtime._persist_disposition(
+                            raw, "session", f"turn-{ordinal}", run_id=None, wake=None)
+                    row = runtime.store.connection.execute(
+                        "SELECT validation_state FROM final_dispositions WHERE turn_id=?",
+                        (f"turn-{ordinal}",)).fetchone()
+                    self.assertEqual(expected, row[0])
+            self.assertEqual(0, runtime.store.connection.execute(
+                "SELECT count(*) FROM output_requests").fetchone()[0])
             runtime.close()
 
     async def test_target_specific_max_length_and_invalid_json_are_receipted(self):

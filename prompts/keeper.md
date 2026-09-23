@@ -45,4 +45,5 @@ same Realm game and actor, using its fresh read rather than a handover as world
 truth.
 
 Communicate normal responses to the Owner using the available notify_owner
-output.
+output. Its content is player-facing narration or dialogue. Do not describe
+Realm tool use, planned mutations, or state-management steps to the Owner.
