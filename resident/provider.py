@@ -1041,9 +1041,9 @@ class OpenAIAgentsProvider:
                     raise _AgentsStreamSemanticError("assistant_content_unusable")
                 if (state.saw_complete_message and state.output_items
                         and state.completed_output_indexes == set(state.output_items)):
-                    message = "\n".join(
-                        text for index in sorted(state.messages)
-                        for text in state.messages[index]) or None
+                    message = self._join_turn_messages(
+                        [state.messages[index] for index in sorted(state.messages)],
+                        descending=False)
                 elif state.output_items:
                     raise _AgentsStreamSemanticError("assistant_content_unusable")
                 self._stream_states.pop(turn_id, None)
@@ -1710,8 +1710,18 @@ class OpenAIAgentsProvider:
                 found_turn = True
                 if item.get("type") != "message" or item.get("role") != "assistant":
                     continue
+                content = item.get("content")
+                if self._output_schema is not None and (
+                        item.get("status", "completed") != "completed"
+                        or not isinstance(content, list)
+                        or any(not isinstance(part, dict)
+                               or part.get("type") != "output_text"
+                               or not isinstance(part.get("text"), str)
+                               for part in content)):
+                    messages.append([])
+                    continue
                 messages.append([
-                    part["text"] for part in item.get("content") or []
+                    part["text"] for part in content or []
                     if part.get("type") == "output_text" and part.get("text")
                 ])
             if not page.get("has_more") or not data:
@@ -1720,10 +1730,29 @@ class OpenAIAgentsProvider:
             if not after:
                 raise RuntimeError("Agents item page has_more without a pagination cursor")
 
-    @staticmethod
-    def _join_turn_messages(messages_descending: list[list[str]]) -> str | None:
-        texts = [text for message in reversed(messages_descending) for text in message]
-        return "\n".join(texts) or None
+    def _join_turn_messages(self, messages: list[list[str]], *,
+                            descending: bool = True) -> str | None:
+        ordered = list(reversed(messages)) if descending else messages
+        texts = ["\n".join(parts) for parts in ordered]
+        raw = "\n".join(texts) or None
+        if self._output_schema is None or len(texts) < 2:
+            return raw
+
+        # Each assistant message is a separate Agents item. Normalize only
+        # complete disposition objects; leave malformed content for Runtime's
+        # existing invalid-json/schema handling instead of dropping an item.
+        outputs: list[Any] = []
+        for item_text in texts:
+            if not item_text:
+                return f"{raw}\n!"
+            try:
+                item = json.loads(item_text)
+            except json.JSONDecodeError:
+                return f"{raw}\n!"
+            if not isinstance(item, dict) or set(item) != {"outputs"} or not isinstance(item["outputs"], list):
+                return f"{raw}\n!"
+            outputs.extend(item["outputs"])
+        return json.dumps({"outputs": outputs}, ensure_ascii=False, separators=(",", ":"))
 
     def _submit_events(self, session_id: str, events: list[dict], idempotency_key: str) -> None:
         self._request(
