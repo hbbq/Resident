@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
@@ -13,13 +14,62 @@ from .capabilities import Capability, current_invocation_id
 
 
 _LIMIT = 1024 * 1024
+_ERROR_LIMIT = 4096
 _ID = {"type": "string", "minLength": 1, "maxLength": 200}
 _OBJECT = {"type": "object", "additionalProperties": True}
+_NAME = {"type": "string", "minLength": 1, "maxLength": 500}
+_TEXT = {"type": "string", "minLength": 1}
+_STRING = {"type": "string"}
+_BOOLEAN = {"type": "boolean"}
 
 
 def _schema(required: tuple[str, ...] = (), **properties: Any) -> dict[str, Any]:
     return {"type": "object", "properties": properties, "required": list(required),
             "additionalProperties": False}
+
+
+_PLAYER = _schema(name=_STRING, description=_STRING, properties=_OBJECT)
+_WORLD_PATCH = _schema(
+    entities={"type": "array", "items": _schema(
+        ("kind", "name"), id=_ID, ref=_ID,
+        kind={"type": "string", "enum": ["place", "creature", "item"]},
+        name=_NAME, description=_STRING, properties=_OBJECT,
+        player=_PLAYER, player_visible=_BOOLEAN)},
+    entity_updates={"type": "array", "items": _schema(
+        ("entity_id",), entity_id=_ID, name=_TEXT, description=_STRING,
+        properties=_OBJECT, player=_PLAYER, player_visible=_BOOLEAN)},
+    containment={"type": "array", "items": _schema(
+        ("child_id", "parent_id"), child_id=_ID, parent_id=_ID)},
+    connections={"type": "array", "items": _schema(
+        ("from_place_id", "to_place_id"), id=_ID, ref=_ID,
+        from_place_id=_ID, to_place_id=_ID, bidirectional=_BOOLEAN,
+        typical_travel_minutes={"type": "integer", "minimum": 0},
+        player_visible=_BOOLEAN)},
+    facts={"type": "array", "items": _schema(
+        ("text",), id=_ID, ref=_ID, text=_TEXT,
+        subject_entity_id=_ID, metadata=_OBJECT)},
+    knowledge={"type": "array", "items": _schema(
+        ("actor_id", "fact_id"), actor_id=_ID, fact_id=_ID)},
+    observations={"type": "array", "items": _schema(
+        ("actor_id", "entity_id"), actor_id=_ID, entity_id=_ID)},
+)
+
+
+def _realm_error_detail(raw: bytes) -> str | None:
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code, message = payload.get("error"), payload.get("message")
+    if not isinstance(code, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code):
+        return None
+    if not isinstance(message, str) or not message or len(message) > 300:
+        return None
+    if not message.isprintable():
+        return None
+    return f"{code}: {message}"
 
 
 class RealmClient:
@@ -63,7 +113,15 @@ class RealmClient:
                                        headers={"Accept": "application/json", "Content-Type": "application/json"},
                                        allow_redirects=False) as response:
                 if response.status >= 300:
-                    raise RealmHTTPError(response.status)
+                    detail = None
+                    if 400 <= response.status < 500:
+                        try:
+                            raw_error = await response.content.read(_ERROR_LIMIT + 1)
+                            if len(raw_error) <= _ERROR_LIMIT:
+                                detail = _realm_error_detail(raw_error)
+                        except (aiohttp.ClientError, TimeoutError, OSError):
+                            pass
+                    raise RealmHTTPError(response.status, detail)
                 raw = await response.content.read(_LIMIT + 1)
                 if len(raw) > _LIMIT:
                     raise ValueError("Realm response is too large")
@@ -103,6 +161,10 @@ class RealmClient:
             code = "unavailable"
         result: dict[str, Any] = {"ok": False, "error_code": code,
                                   "error": f"Realm {code.replace('_', ' ')}; reread Realm before continuing"}
+        if isinstance(exc, RealmHTTPError):
+            result["http_status"] = exc.status
+            if exc.detail:
+                result["error"] += f" (HTTP {exc.status}, {exc.detail})"
         if code == "unknown_outcome":
             result["outcome"] = "unknown"
         return result
@@ -146,13 +208,7 @@ class RealmClient:
             ("realm_read", "Read the current actor projection and trusted canonical game state.",
              _schema(), None),
             ("realm_world_patch", "Atomically materialize missing canonical world details. Realm validates the patch.",
-             _schema(entities={"type": "array", "items": _OBJECT},
-                     entity_updates={"type": "array", "items": _OBJECT},
-                     containment={"type": "array", "items": _OBJECT},
-                     connections={"type": "array", "items": _OBJECT},
-                     facts={"type": "array", "items": _OBJECT},
-                     knowledge={"type": "array", "items": _OBJECT},
-                     observations={"type": "array", "items": _OBJECT}), "world-patch"),
+             _WORLD_PATCH, "world-patch"),
             ("realm_reveal_fact", "Reveal an existing fact to the configured player actor.",
              _schema(("fact_id",), fact_id=_ID), "reveal-fact"),
             ("realm_observe_entity", "Make an existing entity visible to the configured player actor.",
@@ -172,5 +228,6 @@ class RealmClient:
 
 
 class RealmHTTPError(Exception):
-    def __init__(self, status: int):
+    def __init__(self, status: int, detail: str | None = None):
         self.status = status
+        self.detail = detail
