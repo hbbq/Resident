@@ -250,6 +250,9 @@ class Store:
           output_json TEXT, attachments_ephemeral INTEGER NOT NULL DEFAULT 0
             CHECK(attachments_ephemeral IN (0,1)), created_at TEXT NOT NULL, completed_at TEXT,
           PRIMARY KEY(provider,session_id,call_id));
+        CREATE TABLE IF NOT EXISTS realm_mutation_requests(
+          idempotency_key TEXT PRIMARY KEY, path TEXT NOT NULL,
+          body_json TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS agent_wake_submissions(
           provider TEXT NOT NULL, session_id TEXT NOT NULL, wake_key TEXT NOT NULL,
           correlation TEXT NOT NULL,
@@ -424,7 +427,7 @@ class Store:
                     json.dumps(mutable, sort_keys=True, separators=(",", ":")),
                     row["id"],
                 ))
-        self.connection.execute("UPDATE schema_version SET version=20")
+        self.connection.execute("UPDATE schema_version SET version=21")
         # A process may stop after transport acceptance but before recording it.
         # Retry uncertain attempts only while the persisted delivery policy allows it.
         now = utc_now()
@@ -1304,6 +1307,22 @@ class Store:
                 UPDATE session_handovers SET new_session_id=?,consumed_at=? WHERE id=?
             """, (new_session_id, now, handover_id))
         return row["content"]
+
+    def realm_mutation_request(self, key: str, path: str | None = None,
+                               body: dict[str, Any] | None = None
+                               ) -> tuple[str, dict[str, Any]] | None:
+        """Persist the exact Realm request before its first remote POST."""
+        with self.connection:
+            if path is not None and body is not None:
+                self.connection.execute("""
+                    INSERT OR IGNORE INTO realm_mutation_requests
+                    (idempotency_key,path,body_json,created_at) VALUES(?,?,?,?)
+                """, (key, path, json.dumps(body, allow_nan=False, separators=(",", ":")),
+                      utc_now()))
+            row = self.connection.execute("""
+                SELECT path,body_json FROM realm_mutation_requests WHERE idempotency_key=?
+            """, (key,)).fetchone()
+        return (row["path"], json.loads(row["body_json"])) if row else None
 
     def begin_agent_tool_action(self, provider: str, session_id: str, turn_id: str,
                                 call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
