@@ -50,6 +50,11 @@ return the mutation result and fresh views. A conflict requires reassessment;
 an uncertain result must not be repeated with a new key. Realm v1 has no
 authentication or operation lookup, so keep it inside a trusted network boundary
 and resolve uncertain outcomes from Realm state before continuing play.
+`realm_world_patch` accepts Realm's seven patch sections with its native field
+names, including `containment[].child_id` and `parent_id`, and
+`observations[].actor_id`. A single patch can create an entity and refer to it
+from containment and observations. Rejected requests include bounded Realm
+validation details when available, together with the reread guidance.
 
 
 A Resident definition can pin a small capability catalog for an external application. Providers are instance scoped: their URL, optional bearer-token environment reference, immutable bindings, and operation catalog are available only to that Resident. Grant the provider ID to authorize every configured operation, or grant individual tool names. Tool names must begin with `<provider-id>_`.

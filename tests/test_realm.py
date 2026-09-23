@@ -1,14 +1,18 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from resident.realm import RealmClient, RealmHTTPError
 from resident.config import Config
-from resident.domain import ModelTurn
+from resident.domain import ModelTurn, ToolResult
 from resident.instances import load_resident_definition
+from resident.provider import OpenAIAgentsProvider
 from resident.runtime import ResidentRuntime
 from resident.store import Store
+from resident.tools import ToolRegistry
 
 
 class RecordingProvider:
@@ -98,6 +102,106 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                           "idempotency_key": "durable-call"}, post[2])
         self.assertEqual(2, result["mutation"]["revision"])
         self.assertEqual(2, result["trusted_state"]["game"]["current_revision"])
+
+    async def test_world_patch_schema_and_combined_creation(self):
+        schema = next(cap.spec.input_schema for cap in self.client.capabilities
+                      if cap.name == "realm_world_patch")
+        patch_body = {
+            "entities": [{"id": "case", "kind": "item", "name": "Leather case",
+                          "description": "A small case", "properties": {"closed": True},
+                          "player": {"name": "Case", "properties": {"hint": [1]}}}],
+            "entity_updates": [{"entity_id": "hero", "player_visible": True,
+                                "player": {"description": "Visible"}}],
+            "containment": [{"child_id": "case", "parent_id": "hero"}],
+            "connections": [{"ref": "exit", "from_place_id": "here",
+                             "to_place_id": "there", "typical_travel_minutes": 0}],
+            "facts": [{"ref": "fact", "text": "The case is closed",
+                       "subject_entity_id": "case", "metadata": {"source": ["hero"]}}],
+            "knowledge": [{"actor_id": "hero", "fact_id": "fact"}],
+            "observations": [{"actor_id": "hero", "entity_id": "case"}],
+        }
+        self.assertIsNone(ToolRegistry._validate(schema, patch_body))
+        result = await self.client.mutate("world-patch", patch_body)
+        post = next(call for call in self.calls if call[0] == "POST")
+        self.assertEqual("/games/game/world-patches", post[1])
+        self.assertEqual({**patch_body, "expected_revision": 1,
+                          "idempotency_key": result["idempotency_key"]}, post[2])
+        self.assertEqual(2, result["mutation"]["revision"])
+
+        invalid = {
+            "entities": {"kind": "tool", "name": "Case"},
+            "entity_updates": {"entity_id": "hero", "name": ""},
+            "containment": {"child_entity_id": "case", "parent_entity_id": "hero"},
+            "connections": {"from_place_id": "here", "to_place_id": "there",
+                            "typical_travel_minutes": -1},
+            "facts": {"text": "", "metadata": {}},
+            "knowledge": {"actor_entity_id": "hero", "fact_id": "fact"},
+            "observations": {"actor_entity_id": "hero", "entity_id": "case"},
+        }
+        for section, item in invalid.items():
+            with self.subTest(section=section):
+                self.assertIsNotNone(ToolRegistry._validate(schema, {section: [item]}))
+        for item in ({"child_entity_id": "case", "parent_id": "hero"},
+                     {"child_id": "case", "parent_entity_id": "hero"}):
+            with self.subTest(containment=item):
+                self.assertIsNotNone(ToolRegistry._validate(schema, {"containment": [item]}))
+
+    async def test_realm_validation_detail_is_available_to_managed_tool_error(self):
+        schema = next(cap.spec.input_schema for cap in self.client.capabilities
+                      if cap.name == "realm_world_patch")
+        self.assertIn("child_entity_id", ToolRegistry._validate(
+            schema, {"containment": [{"child_entity_id": "case", "parent_id": "hero"}]}))
+        original = self.client._request
+
+        async def reject(method, path, body=None):
+            if method == "POST":
+                raise RealmHTTPError(400, "INVALID_REQUEST: body/containment/0 must have required property 'child_id'")
+            return await original(method, path, body)
+
+        self.client._request = reject
+        result = await self.client.mutate("world-patch", {"containment": [
+            {"child_id": "case", "parent_id": "hero"}]})
+        self.assertEqual("rejected", result["error_code"])
+        self.assertEqual(400, result["http_status"])
+        self.assertIn("body/containment/0", result["error"])
+        self.assertIn("reread Realm before continuing", result["error"])
+        event = OpenAIAgentsProvider._tool_result_event(ToolResult("call", result), "turn")
+        self.assertFalse(event["success"])
+        self.assertIn("body/containment/0", event["error"])
+        self.assertEqual(1, self.revision)
+
+    async def test_http_error_parsing_is_bounded_and_structured(self):
+        response = MagicMock()
+        response.status = 400
+        response.content.read = AsyncMock()
+        session = MagicMock()
+        session.request.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.request.return_value.__aexit__ = AsyncMock(return_value=None)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        with patch("resident.realm.aiohttp.ClientSession", return_value=session):
+            response.content.read.return_value = json.dumps({
+                "error": "INVALID_REQUEST", "message": "body/containment/0 requires child_id"
+            }).encode()
+            with self.assertRaises(RealmHTTPError) as caught:
+                await self.client_request("POST")
+            self.assertEqual("INVALID_REQUEST: body/containment/0 requires child_id",
+                             caught.exception.detail)
+            for raw in (b"<html>bad</html>", b"x" * 4097,
+                        json.dumps({"error": "INVALID_REQUEST", "message": "bad\ninput"}).encode()):
+                response.content.read.return_value = raw
+                with self.assertRaises(RealmHTTPError) as caught:
+                    await self.client_request("POST")
+                self.assertIsNone(caught.exception.detail)
+            response.content.read.side_effect = OSError("connection closed")
+            with self.assertRaises(RealmHTTPError) as caught:
+                await self.client_request("POST")
+            self.assertEqual(400, caught.exception.status)
+            self.assertIsNone(caught.exception.detail)
+            response.content.read.assert_awaited()
+
+    async def client_request(self, method):
+        return await RealmClient._request(self.client, method, "/games/game/world-patches", {})
 
     async def test_lost_response_retry_reuses_durable_request_after_restart(self):
         from resident.capabilities import _INVOCATION_ID
