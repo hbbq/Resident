@@ -10,6 +10,7 @@ from .capabilities import Capability, diagnostic_capabilities
 from .config import Config
 from .display import DisplayConnector
 from .external_app import ExternalApplicationConnector
+from .realm import RealmClient
 from .homeops import HomeOpsConnector
 from .host import InstancePolicy, RuntimeHost, messaging_capability
 from .instances import (ResidentDefinition, load_resident_catalog, migrate_legacy_state,
@@ -240,8 +241,17 @@ def build_host(config: Config) -> RuntimeHost:
                     diagnostic_output=diagnostics.telegram)
                 private_producers[definition.id] = [transport]
             instance_available = list(available)
+            realm_client = None
+            if definition.realm is not None:
+                item = definition.realm
+                realm_client = RealmClient(
+                    item.base_url, resolve_environment(item.game_id_env),
+                    resolve_environment(item.actor_id_env), item.request_timeout_seconds)
+                instance_available.extend(realm_client.capabilities)
             shared_connector_ids = {capability.connector_id for capability in available} | {"messaging"}
             for external_definition in definition.external_applications:
+                if realm_client is not None and external_definition.id == "realm":
+                    raise ValueError("Native Realm integration conflicts with external provider realm")
                 if external_definition.id in shared_connector_ids:
                     raise ValueError(
                         f"External application id conflicts with an existing connector: "
@@ -272,6 +282,7 @@ def build_host(config: Config) -> RuntimeHost:
                 grants.append(special_messaging)
             runtime = ResidentRuntime(
                 instance_config, _provider(definition), capabilities=grants,
+                realm_client=realm_client,
                 output_capabilities=output_grants,
                 owner_transport=transport,
                 owner_output_enabled=owner_output_enabled,

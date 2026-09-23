@@ -39,6 +39,19 @@ Definitions accept inline `personality`/`role` or `personality_prompt`/`role_pro
 
 ### External application capabilities
 
+Keeper's Realm v1 integration uses the service's native routes. Set
+`KEEPER_REALM_GAME_ID` to an existing game ID and `KEEPER_REALM_ACTOR_ID` to an
+existing creature ID in that game, then configure `realm.base_url` in
+`residents/keeper.yaml` for the trusted Realm service. The game and actor must
+be seeded before play. Keeper reads both the actor projection and trusted state
+on every wake, including a replacement session. Mutations use the latest Realm
+revision and the durable tool-call ID as the idempotency key. Successful calls
+return the mutation result and fresh views. A conflict requires reassessment;
+an uncertain result must not be repeated with a new key. Realm v1 has no
+authentication or operation lookup, so keep it inside a trusted network boundary
+and resolve uncertain outcomes from Realm state before continuing play.
+
+
 A Resident definition can pin a small capability catalog for an external application. Providers are instance scoped: their URL, optional bearer-token environment reference, immutable bindings, and operation catalog are available only to that Resident. Grant the provider ID to authorize every configured operation, or grant individual tool names. Tool names must begin with `<provider-id>_`.
 
 ```yaml

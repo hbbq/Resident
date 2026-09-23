@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from .capabilities import Capability, diagnostic_capabilities
+from .realm import RealmClient
 from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
@@ -152,6 +153,7 @@ class ResidentRuntime:
 
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: Sequence[Capability] | None = None,
+                 realm_client: RealmClient | None = None,
                  output_capabilities: Sequence[OutputCapability] | None = None,
                  event_producers: list[EventProducer] | None = None,
                  owner_transport: OwnerTransport | None = None,
@@ -159,6 +161,7 @@ class ResidentRuntime:
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
         self.config, self.provider = config, provider
+        self.realm_client = realm_client
         initial_capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
         self._capabilities = self._validated_capabilities(initial_capabilities)
         self.store = store or Store(config.data_dir / "resident.sqlite3")
@@ -901,6 +904,7 @@ class ResidentRuntime:
                                       if output.legacy_tool_name}))
             authoritative_state = self.context_builder.authoritative_state(
                 self.resident, self.owner, capabilities)
+            realm_state = await self.realm_client.read({}) if self.realm_client else None
             existing_session_id = getattr(self.provider, "session_id", None)
             if managed_session:
                 authoritative_update = (
@@ -911,6 +915,10 @@ class ResidentRuntime:
             else:
                 context = self.context_builder.build(
                     self.resident, self.owner, event, capabilities)
+            if realm_state is not None:
+                context_document = json.loads(context)
+                context_document["realm_state"] = realm_state
+                context = json.dumps(context_document, ensure_ascii=False, indent=2)
             self._emit("context.assembled", {
                 "characters": len(context),
                 "pending_intentions": (
@@ -998,6 +1006,10 @@ class ResidentRuntime:
                         "note": "Long-term memory is selectively available through memory tools.",
                     }
                     context = json.dumps(context_document, ensure_ascii=False, indent=2)
+            if realm_state is not None:
+                context_document = json.loads(context)
+                context_document["realm_state"] = realm_state
+                context = json.dumps(context_document, ensure_ascii=False, indent=2)
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
@@ -1042,6 +1054,10 @@ class ResidentRuntime:
                             (datetime.now(UTC) + timedelta(hours=24)).isoformat())
                     context = self.context_builder.build_managed_bootstrap(
                         self.resident, self.owner, event, capabilities, handover=handover)
+                    if realm_state is not None:
+                        context_document = json.loads(context)
+                        context_document["realm_state"] = realm_state
+                        context = json.dumps(context_document, ensure_ascii=False, indent=2)
                     turn = await self.provider.respond(
                         context, registry.specs, results, continuation_id)
                 finally:

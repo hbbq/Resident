@@ -31,7 +31,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
     "role", "role_prompt", "agent", "curator", "capabilities", "outputs",
-    "subscriptions", "owner_transport", "external_applications", "body",
+    "subscriptions", "owner_transport", "external_applications", "realm", "body",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
 
@@ -85,6 +85,14 @@ class ExternalApplicationDefinition:
 
 
 @dataclass(frozen=True)
+class RealmDefinition:
+    base_url: str
+    game_id_env: str
+    actor_id_env: str
+    request_timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
 class ResidentDefinition:
     id: str
     name: str
@@ -98,6 +106,7 @@ class ResidentDefinition:
     subscriptions: tuple[str, ...] = ()
     owner_transport: OwnerTransportDefinition | None = None
     external_applications: tuple[ExternalApplicationDefinition, ...] = ()
+    realm: RealmDefinition | None = None
     body: dict[str, Any] | None = None
 
 
@@ -461,6 +470,18 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
     body = data.get("body")
     if body is not None:
         body = _mapping(body, "body")
+    realm = None
+    if data.get("realm") is not None:
+        item = _mapping(data["realm"], "realm")
+        if set(item) - {"base_url", "game_id_env", "actor_id_env", "request_timeout_seconds"}:
+            raise ValueError("Unknown realm configuration fields")
+        realm = RealmDefinition(
+            _string(item.get("base_url"), "realm.base_url"),
+            _env_name(item.get("game_id_env"), "realm.game_id_env"),
+            _env_name(item.get("actor_id_env"), "realm.actor_id_env"),
+            _positive_number(item.get("request_timeout_seconds", 10),
+                             "realm.request_timeout_seconds", maximum=120),
+        )
     return ResidentDefinition(
         id=resident_id, name=name, personality=personality, role=role, enabled=enabled,
         agent=agent, curator=curator,
@@ -470,6 +491,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
         owner_transport=transport,
         external_applications=_external_applications(
             data.get("external_applications"), "external_applications"),
+        realm=realm,
         body=body,
     )
 

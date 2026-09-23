@@ -19,7 +19,12 @@ agent:
 curator:
   model: gpt-6-luna
 
-capabilities: []
+realm:
+  base_url: http://127.0.0.1:3000
+  game_id_env: KEEPER_REALM_GAME_ID
+  actor_id_env: KEEPER_REALM_ACTOR_ID
+
+capabilities: [realm]
 
 outputs:
   - notify_owner
