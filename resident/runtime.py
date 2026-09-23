@@ -165,6 +165,8 @@ class ResidentRuntime:
         initial_capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
         self._capabilities = self._validated_capabilities(initial_capabilities)
         self.store = store or Store(config.data_dir / "resident.sqlite3")
+        if self.realm_client is not None:
+            self.realm_client.bind_mutation_store(self.store.realm_mutation_request)
         self.resident, self.owner = self.store.provision(
             config.resident_name, config.owner_name, config.personality)
         bind_session_store = getattr(provider, "bind_session_store", None)
@@ -509,6 +511,8 @@ class ResidentRuntime:
 
     def close(self) -> None:
         self._curator_coordinator.cancel()
+        if self.realm_client is not None:
+            self.realm_client.bind_mutation_store(None)
         self.store.close()
 
     async def stop_background_services(self) -> None:

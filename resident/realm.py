@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 import aiohttp
@@ -36,6 +36,22 @@ class RealmClient:
         self.actor_id = actor_id
         self.timeout_seconds = timeout_seconds
         self.path = f"/games/{quote(game_id, safe='')}"
+        self._mutation_requests: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._mutation_store: Callable[[str, str | None, dict[str, Any] | None],
+                                       tuple[str, dict[str, Any]] | None] | None = None
+
+    def bind_mutation_store(self, store: Callable[
+            [str, str | None, dict[str, Any] | None],
+            tuple[str, dict[str, Any]] | None] | None) -> None:
+        self._mutation_store = store
+
+    def _mutation_request(self, key: str, path: str | None = None,
+                          body: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]] | None:
+        if self._mutation_store is not None:
+            return self._mutation_store(key, path, body)
+        if key not in self._mutation_requests and path is not None and body is not None:
+            self._mutation_requests[key] = (path, json.loads(json.dumps(body, allow_nan=False)))
+        return self._mutation_requests.get(key)
 
     async def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = None if body is None else json.dumps(body, allow_nan=False, separators=(",", ":")).encode()
@@ -57,8 +73,17 @@ class RealmClient:
                 return result
 
     async def snapshot(self) -> dict[str, Any]:
-        player = await self._request("GET", f"{self.path}/state?actor_id={quote(self.actor_id, safe='')}")
-        trusted = await self._request("GET", f"{self.path}/authoritative-state")
+        for _ in range(3):
+            before = await self._request("GET", f"{self.path}/authoritative-state")
+            player = await self._request("GET", f"{self.path}/state?actor_id={quote(self.actor_id, safe='')}")
+            trusted = await self._request("GET", f"{self.path}/authoritative-state")
+            before_game = before.get("game")
+            trusted_game = trusted.get("game")
+            if (isinstance(before_game, dict) and isinstance(trusted_game, dict)
+                    and before_game.get("current_revision") == trusted_game.get("current_revision")):
+                break
+        else:
+            raise ValueError("Realm changed during snapshot acquisition")
         game = trusted.get("game")
         entities = trusted.get("entities")
         if (not isinstance(game, dict) or not isinstance(game.get("current_revision"), int)
@@ -91,15 +116,21 @@ class RealmClient:
     async def mutate(self, route: str, arguments: dict[str, Any]) -> dict[str, Any]:
         key = current_invocation_id() or str(uuid.uuid4())
         try:
-            before = await self.snapshot()
-            revision = before["trusted_state"]["game"]["current_revision"]
-            body = {**arguments, "expected_revision": revision, "idempotency_key": key}
-            if route in ("reveal-fact", "observe-entity"):
-                body["actor_id"] = self.actor_id
-            path = f"{self.path}/world-patches" if route == "world-patch" else f"{self.path}/operations/{route}"
+            request = self._mutation_request(key)
+            if request is None:
+                before = await self.snapshot()
+                revision = before["trusted_state"]["game"]["current_revision"]
+                body = {**arguments, "expected_revision": revision, "idempotency_key": key}
+                if route in ("reveal-fact", "observe-entity"):
+                    body["actor_id"] = self.actor_id
+                path = f"{self.path}/world-patches" if route == "world-patch" else f"{self.path}/operations/{route}"
+                request = self._mutation_request(key, path, body)
+            if request is None:
+                raise ValueError("Realm mutation request could not be recorded")
+            path, body = request
             result = await self._request("POST", path, body)
         except (aiohttp.ClientError, TimeoutError, OSError, ValueError, RealmHTTPError) as exc:
-            failure = self._error(exc, mutating="body" in locals())
+            failure = self._error(exc, mutating="request" in locals() and request is not None)
             failure["idempotency_key"] = key
             return failure
         try:

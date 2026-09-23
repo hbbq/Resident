@@ -8,6 +8,7 @@ from resident.config import Config
 from resident.domain import ModelTurn
 from resident.instances import load_resident_definition
 from resident.runtime import ResidentRuntime
+from resident.store import Store
 
 
 class RecordingProvider:
@@ -97,6 +98,74 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                           "idempotency_key": "durable-call"}, post[2])
         self.assertEqual(2, result["mutation"]["revision"])
         self.assertEqual(2, result["trusted_state"]["game"]["current_revision"])
+
+    async def test_lost_response_retry_reuses_durable_request_after_restart(self):
+        from resident.capabilities import _INVOCATION_ID
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            self.client.bind_mutation_store(store.realm_mutation_request)
+            original = self.client._request
+            posts = []
+
+            async def lost_response(method, path, body=None):
+                if method == "POST":
+                    posts.append((path, dict(body)))
+                    self.revision += 1
+                    self.world_time += body["minutes"]
+                    raise asyncio.TimeoutError
+                return await original(method, path, body)
+
+            self.client._request = lost_response
+            token = _INVOCATION_ID.set("durable-call")
+            try:
+                first = await self.client.mutate("advance-time", {"minutes": 15})
+            finally:
+                _INVOCATION_ID.reset(token)
+            self.assertEqual("unknown_outcome", first["error_code"])
+            store.close()
+
+            reopened = Store(Path(directory) / "resident.sqlite3")
+            replacement = RealmClient("http://127.0.0.1:3000", "game", "hero")
+            replacement.bind_mutation_store(reopened.realm_mutation_request)
+
+            async def idempotent_replay(method, path, body=None):
+                if method == "POST":
+                    posts.append((path, dict(body)))
+                    self.assertEqual(1, body["expected_revision"])
+                    return {"revision": self.revision, "events": [], "idempotent": True}
+                return await original(method, path, body)
+
+            replacement._request = idempotent_replay
+            token = _INVOCATION_ID.set("durable-call")
+            try:
+                second = await replacement.mutate("advance-time", {"minutes": 99})
+            finally:
+                _INVOCATION_ID.reset(token)
+                reopened.close()
+            self.assertEqual(posts[0], posts[1])
+            self.assertEqual(15, second["player_state"]["game"]["world_time_minutes"])
+            self.assertTrue(second["mutation"]["idempotent"])
+
+    async def test_snapshot_retries_mutation_between_player_and_trusted_reads(self):
+        original = self.client._request
+        player_reads = 0
+
+        async def concurrent_mutation(method, path, body=None):
+            nonlocal player_reads
+            result = await original(method, path, body)
+            if method == "GET" and path.endswith("/state?actor_id=hero"):
+                player_reads += 1
+                if player_reads == 1:
+                    self.revision += 1
+                    self.world_time += 15
+            return result
+
+        self.client._request = concurrent_mutation
+        snapshot = await self.client.snapshot()
+        self.assertEqual(2, player_reads)
+        self.assertEqual(2, snapshot["trusted_state"]["game"]["current_revision"])
+        self.assertEqual(15, snapshot["player_state"]["game"]["world_time_minutes"])
 
     async def test_conflict_does_not_auto_retry(self):
         async def reject(method, path, body=None):
