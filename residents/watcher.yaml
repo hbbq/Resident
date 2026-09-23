@@ -12,12 +12,12 @@ role: >
 
 agent:
   provider: openai-agents
-  model: gpt-5.6-luna
+  model: gpt-6-luna
   reasoning_effort: medium
   api_key_env: OPENAI_API_KEY
   
 curator:
-  model: gpt-5.6-luna
+  model: gpt-6-luna
 
 capabilities:
   - diagnostics
