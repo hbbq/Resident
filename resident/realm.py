@@ -33,10 +33,11 @@ _WORLD_PATCH = _schema(
     entities={"type": "array", "items": _schema(
         ("kind", "name"), id=_ID, ref=_ID,
         kind={"type": "string", "enum": ["place", "creature", "item"]},
-        name=_NAME, description=_STRING, properties=_OBJECT,
+        name=_NAME, description=_STRING, appearance=_STRING, properties=_OBJECT,
         player=_PLAYER, player_visible=_BOOLEAN)},
     entity_updates={"type": "array", "items": _schema(
         ("entity_id",), entity_id=_ID, name=_TEXT, description=_STRING,
+        appearance=_STRING,
         properties=_OBJECT, player=_PLAYER, player_visible=_BOOLEAN)},
     containment={"type": "array", "items": _schema(
         ("child_id", "parent_id"), child_id=_ID, parent_id=_ID)},
