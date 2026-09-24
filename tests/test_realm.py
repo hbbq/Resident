@@ -108,9 +108,11 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                       if cap.name == "realm_world_patch")
         patch_body = {
             "entities": [{"id": "case", "kind": "item", "name": "Leather case",
-                          "description": "A small case", "properties": {"closed": True},
+                          "description": "A small case", "appearance": "Scuffed brown leather",
+                          "properties": {"closed": True},
                           "player": {"name": "Case", "properties": {"hint": [1]}}}],
             "entity_updates": [{"entity_id": "hero", "player_visible": True,
+                                "appearance": "A red cloak",
                                 "player": {"description": "Visible"}}],
             "containment": [{"child_id": "case", "parent_id": "hero"}],
             "connections": [{"ref": "exit", "from_place_id": "here",
@@ -127,6 +129,18 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({**patch_body, "expected_revision": 1,
                           "idempotency_key": result["idempotency_key"]}, post[2])
         self.assertEqual(2, result["mutation"]["revision"])
+
+        for section, item in (
+                ("entities", {"kind": "item", "name": "Unadorned case"}),
+                ("entity_updates", {"entity_id": "hero", "description": "A traveler"})):
+            with self.subTest(section=section):
+                item_schema = schema["properties"][section]["items"]
+                self.assertIn("appearance", item_schema["properties"])
+                self.assertEqual({"type": "string"}, item_schema["properties"]["appearance"])
+                self.assertNotIn("appearance", item_schema["required"])
+                self.assertIsNone(ToolRegistry._validate(schema, {section: [item]}))
+                self.assertIsNone(ToolRegistry._validate(
+                    schema, {section: [{**item, "appearance": "A plain outline"}]}))
 
         invalid = {
             "entities": {"kind": "tool", "name": "Case"},
@@ -300,6 +314,19 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(("realm",), definition.capabilities)
         self.assertEqual("KEEPER_REALM_GAME_ID", definition.realm.game_id_env)
         self.assertEqual("KEEPER_REALM_ACTOR_ID", definition.realm.actor_id_env)
+
+    async def test_keeper_guidance_explains_appearance(self):
+        root = Path(__file__).resolve().parents[1]
+        guidance = load_resident_definition(root / "residents" / "keeper.yaml",
+                                            root / "prompts").personality
+        guidance = " ".join(guidance.split())
+        for phrase in ("optional `appearance`", "observable visual characteristics",
+                       "secrets, hidden motives", "Do not invent filler appearance",
+                       "separate from player-facing projections", "ordinary world",
+                       "Do not generate or manage illustrations", "Realm's independent",
+                       "does not necessarily regenerate"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, guidance)
 
 
 if __name__ == "__main__":
