@@ -309,6 +309,34 @@ class Store:
         CREATE INDEX IF NOT EXISTS idx_output_dispatch
           ON output_requests(delivery_state,next_attempt_at,created_at);
         """)
+        # SQLite's table UNIQUE constraint considers NULL values distinct. Keep
+        # the first persisted event (and its sequence) when upgrading databases
+        # that may already contain retried model turns.
+        activity_identity_index = self.connection.execute("""
+            SELECT 1 FROM sqlite_master WHERE type='index'
+              AND name='idx_keeper_activity_identity'
+        """).fetchone()
+        if activity_identity_index is None:
+            with self.connection:
+                self.connection.execute("""
+                DELETE FROM keeper_activity
+                WHERE EXISTS (
+                  SELECT 1 FROM keeper_activity AS earlier
+                  WHERE earlier.sequence < keeper_activity.sequence
+                    AND earlier.run_id = keeper_activity.run_id
+                    AND earlier.kind = keeper_activity.kind
+                    AND earlier.session_id IS keeper_activity.session_id
+                    AND earlier.turn_id IS keeper_activity.turn_id
+                    AND earlier.call_id IS keeper_activity.call_id)
+                """)
+                self.connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_keeper_activity_identity
+                ON keeper_activity(
+                  run_id, kind,
+                  COALESCE(session_id, ''), session_id IS NULL,
+                  COALESCE(turn_id, ''), turn_id IS NULL,
+                  COALESCE(call_id, ''), call_id IS NULL)
+                """)
         # An already-provisioned Resident predates capability snapshots. Seed an
         # empty baseline so its first run with this feature sees the currently
         # available capabilities as additions. A genuinely new database has no

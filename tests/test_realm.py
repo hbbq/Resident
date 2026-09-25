@@ -367,6 +367,61 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                 1, 10, game_id="game", actor_id="hero"))
             runtime.close()
 
+    async def test_retrying_model_turn_activity_keeps_one_ordered_history_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            first = {"message": "First turn", "tool_calls": []}
+            second = {"message": "Second turn", "tool_calls": []}
+            store.add_keeper_activity(run_id, "model_turn", first,
+                                      session_id="session", turn_id="turn-1")
+            store.add_keeper_activity(run_id, "tool_result", {"name": "check", "result": {"ok": True}},
+                                      session_id="session", turn_id="turn-1", call_id="call-1")
+            store.add_keeper_activity(run_id, "model_turn", first,
+                                      session_id="session", turn_id="turn-1")
+            store.add_keeper_activity(run_id, "model_turn", second,
+                                      session_id="session", turn_id="turn-2")
+            store.add_keeper_activity(run_id, "model_turn", second,
+                                      session_id="session", turn_id="turn-2")
+            store.finish_keeper_interaction(run_id, "completed")
+
+            rows = store.connection.execute(
+                "SELECT kind,turn_id FROM keeper_activity WHERE run_id=? ORDER BY sequence",
+                (run_id,)).fetchall()
+            self.assertEqual([("model_turn", "turn-1"), ("tool_result", "turn-1"),
+                              ("model_turn", "turn-2")], [tuple(row) for row in rows])
+            history = store.keeper_recent_context(1, 16384, game_id="game", actor_id="hero")
+            self.assertEqual(["First turn", "Second turn"],
+                             [entry["text"] for entry in history[0]["activity"]
+                              if entry["kind"] == "keeper_output"])
+            store.close()
+
+    async def test_existing_duplicate_model_turns_keep_first_sequence_on_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resident.sqlite3"
+            store = Store(path)
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            with store.connection:
+                store.connection.execute("DROP INDEX idx_keeper_activity_identity")
+            store.add_keeper_activity(run_id, "model_turn", {"message": "Original"},
+                                      session_id="session", turn_id="turn")
+            store.add_keeper_activity(run_id, "model_turn", {"message": "Retry"},
+                                      session_id="session", turn_id="turn")
+            store.close()
+
+            reopened = Store(path)
+            rows = reopened.connection.execute(
+                "SELECT sequence,content_json FROM keeper_activity WHERE run_id=?", (run_id,)
+            ).fetchall()
+            self.assertEqual(1, len(rows))
+            self.assertEqual(1, rows[0]["sequence"])
+            self.assertEqual("Original", json.loads(rows[0]["content_json"])["message"])
+            reopened.close()
+
     async def test_mutations_bind_actor_revision_and_call_identity(self):
         from resident.capabilities import _INVOCATION_ID
         token = _INVOCATION_ID.set("durable-call")
