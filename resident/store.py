@@ -154,6 +154,21 @@ class Store:
           id TEXT PRIMARY KEY, event_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
           wake_reason TEXT NOT NULL, wake_source TEXT NOT NULL, status TEXT NOT NULL,
           duration_seconds REAL, model_calls INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS keeper_interactions(
+          run_id TEXT PRIMARY KEY REFERENCES wake_runs(id), format_version INTEGER NOT NULL DEFAULT 1,
+          event_id TEXT NOT NULL, occurred_at TEXT NOT NULL, wake_source TEXT NOT NULL,
+          wake_reason TEXT NOT NULL, wake_payload_json TEXT NOT NULL,
+          status TEXT NOT NULL, session_id TEXT, input_text TEXT,
+          realm_snapshot_json TEXT, realm_game_id TEXT, realm_actor_id TEXT,
+          realm_revision INTEGER, input_bytes INTEGER, snapshot_bytes INTEGER,
+          input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+          completed_at TEXT);
+        CREATE TABLE IF NOT EXISTS keeper_activity(
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL REFERENCES keeper_interactions(run_id),
+          occurred_at TEXT NOT NULL, kind TEXT NOT NULL, session_id TEXT,
+          turn_id TEXT, call_id TEXT, content_json TEXT NOT NULL,
+          UNIQUE(run_id,kind,session_id,turn_id,call_id));
         CREATE TABLE IF NOT EXISTS journal(
           sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, run_id TEXT,
           event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, data_json TEXT NOT NULL);
@@ -283,6 +298,9 @@ class Store:
           PRIMARY KEY(output_request_id,attempt_number));
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_wake_runs_started ON wake_runs(started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_keeper_interactions_completed
+          ON keeper_interactions(status,completed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_keeper_activity_run ON keeper_activity(run_id,sequence);
         CREATE INDEX IF NOT EXISTS idx_journal_run_sequence ON journal(run_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
         CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory_records(status,updated_at DESC);
@@ -291,6 +309,34 @@ class Store:
         CREATE INDEX IF NOT EXISTS idx_output_dispatch
           ON output_requests(delivery_state,next_attempt_at,created_at);
         """)
+        # SQLite's table UNIQUE constraint considers NULL values distinct. Keep
+        # the first persisted event (and its sequence) when upgrading databases
+        # that may already contain retried model turns.
+        activity_identity_index = self.connection.execute("""
+            SELECT 1 FROM sqlite_master WHERE type='index'
+              AND name='idx_keeper_activity_identity'
+        """).fetchone()
+        if activity_identity_index is None:
+            with self.connection:
+                self.connection.execute("""
+                DELETE FROM keeper_activity
+                WHERE EXISTS (
+                  SELECT 1 FROM keeper_activity AS earlier
+                  WHERE earlier.sequence < keeper_activity.sequence
+                    AND earlier.run_id = keeper_activity.run_id
+                    AND earlier.kind = keeper_activity.kind
+                    AND earlier.session_id IS keeper_activity.session_id
+                    AND earlier.turn_id IS keeper_activity.turn_id
+                    AND earlier.call_id IS keeper_activity.call_id)
+                """)
+                self.connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_keeper_activity_identity
+                ON keeper_activity(
+                  run_id, kind,
+                  COALESCE(session_id, ''), session_id IS NULL,
+                  COALESCE(turn_id, ''), turn_id IS NULL,
+                  COALESCE(call_id, ''), call_id IS NULL)
+                """)
         # An already-provisioned Resident predates capability snapshots. Seed an
         # empty baseline so its first run with this feature sees the currently
         # available capabilities as additions. A genuinely new database has no
@@ -427,7 +473,7 @@ class Store:
                     json.dumps(mutable, sort_keys=True, separators=(",", ":")),
                     row["id"],
                 ))
-        self.connection.execute("UPDATE schema_version SET version=21")
+        self.connection.execute("UPDATE schema_version SET version=22")
         # A process may stop after transport acceptance but before recording it.
         # Retry uncertain attempts only while the persisted delivery policy allows it.
         now = utc_now()
@@ -1681,6 +1727,132 @@ class Store:
                 "INSERT INTO wake_runs(id,event_id,started_at,wake_reason,wake_source,status) VALUES(?,?,?,?,?,'running')",
                 (run_id, event.id, utc_now(), event.reason, event.source))
         return run_id
+
+    def start_keeper_interaction(self, run_id: str, event: WakeEvent,
+                                 game_id: str, actor_id: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO keeper_interactions(
+                  run_id,event_id,occurred_at,wake_source,wake_reason,wake_payload_json,
+                  status,realm_game_id,realm_actor_id)
+                VALUES(?,?,?,?,?,?,'running',?,?)
+            """, (run_id, event.id, event.occurred_at, event.source, event.reason,
+                  json.dumps(event.payload, ensure_ascii=False), game_id, actor_id))
+
+    def set_keeper_input(self, run_id: str, session_id: str | None,
+                         input_text: str, realm_snapshot: dict[str, Any] | None) -> None:
+        snapshot = (json.dumps(realm_snapshot, ensure_ascii=False)
+                    if realm_snapshot is not None else None)
+        revision = ((realm_snapshot.get("trusted_state") or {}).get("game") or {}).get(
+            "current_revision") if realm_snapshot and "trusted_state" in realm_snapshot else None
+        with self.connection:
+            self.connection.execute("""
+                UPDATE keeper_interactions SET session_id=?,input_text=?,realm_snapshot_json=?,
+                  realm_revision=?,input_bytes=?,snapshot_bytes=? WHERE run_id=?
+            """, (session_id, input_text, snapshot, revision,
+                  len(input_text.encode("utf-8")),
+                  len(snapshot.encode("utf-8")) if snapshot is not None else 0, run_id))
+
+    def add_keeper_activity(self, run_id: str, kind: str, content: Any, *,
+                            session_id: str | None = None, turn_id: str | None = None,
+                            call_id: str | None = None) -> None:
+        with self.connection:
+            self.connection.execute("""
+                INSERT OR IGNORE INTO keeper_activity(
+                  run_id,occurred_at,kind,session_id,turn_id,call_id,content_json)
+                VALUES(?,?,?,?,?,?,?)
+            """, (run_id, utc_now(), kind, session_id, turn_id, call_id,
+                  json.dumps(content, ensure_ascii=False)))
+
+    def finish_keeper_interaction(self, run_id: str, status: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE keeper_interactions SET status=?,completed_at=? WHERE run_id=?
+            """, (status, utc_now(), run_id))
+
+    def keeper_recent_context(self, count: int, byte_limit: int, *,
+                              game_id: str, actor_id: str) -> list[dict[str, Any]]:
+        """Newest completed wakes for this Realm game and actor that fit."""
+        if count <= 0 or byte_limit <= 0:
+            return []
+        rows = self.connection.execute("""
+            SELECT run_id,occurred_at,wake_source,wake_reason,wake_payload_json
+            FROM keeper_interactions
+            WHERE status='completed' AND realm_game_id=? AND realm_actor_id=?
+            ORDER BY completed_at DESC, rowid DESC LIMIT ?
+        """, (game_id, actor_id, count)).fetchall()
+        selected: list[dict[str, Any]] = []
+        def bootstrap_bytes(entries: list[dict[str, Any]]) -> int:
+            # Match the field's nesting and indentation in build_managed_bootstrap.
+            wrapper = {"new_session_bootstrap": {
+                "preceding_field": None, "keeper_recent_interactions": entries}}
+            empty = {"new_session_bootstrap": {"preceding_field": None}}
+            return len(json.dumps(wrapper, ensure_ascii=False, indent=2).encode("utf-8")) - len(
+                json.dumps(empty, ensure_ascii=False, indent=2).encode("utf-8"))
+
+        for row in rows:
+            activities = self.connection.execute("""
+                SELECT kind,turn_id,call_id,content_json FROM keeper_activity
+                WHERE run_id=? ORDER BY sequence
+            """, (row["run_id"],)).fetchall()
+            narrative = []
+            results = {}
+            for item in activities:
+                if item["kind"] == "tool_result" and item["turn_id"] and item["call_id"]:
+                    data = json.loads(item["content_json"])
+                    if isinstance(data, dict):
+                        results[(item["turn_id"], item["call_id"])] = data
+            for item in activities:
+                data = json.loads(item["content_json"])
+                if item["kind"] == "model_turn":
+                    if data.get("message"):
+                        narrative.append({"kind": "keeper_output", "text": data["message"]})
+                    for call in data.get("tool_calls") or []:
+                        name, arguments = call.get("name"), call.get("arguments")
+                        if not isinstance(arguments, dict):
+                            continue
+                        completion = results.get((item["turn_id"], call.get("id")))
+                        if not completion or completion.get("name") != name:
+                            continue
+                        result = completion.get("result")
+                        if not isinstance(result, dict) or result.get("ok") is not True:
+                            continue
+                        if name == "send_owner_message" and result.get("delivered") is True and isinstance(
+                                arguments.get("content"), str):
+                            narrative.append({"kind": "player_facing_call", "name": name,
+                                              "content": arguments["content"]})
+                        elif name == "realm_world_patch":
+                            # Only explicit player projections may cross from a
+                            # trusted world patch into the rollover narrative.
+                            player_views = []
+                            for section in ("entities", "entity_updates"):
+                                items = arguments.get(section)
+                                if not isinstance(items, list):
+                                    continue
+                                player_views.extend(
+                                    item["player"] for item in items
+                                    if isinstance(item, dict) and isinstance(
+                                        item.get("player"), dict))
+                            if player_views:
+                                narrative.append({"kind": "player_facing_call", "name": name,
+                                                  "player_views": player_views})
+                elif item["kind"] == "tool_result":
+                    result = data.get("result") or {}
+                    # Never replay tool-returned Realm views or mutation bodies as facts.
+                    ok = result.get("ok", "error" not in result)
+                    if data.get("name") == "send_owner_message":
+                        ok = ok and result.get("delivered") is True
+                    narrative.append({"kind": "action_outcome", "name": data.get("name"),
+                                      "ok": ok,
+                                      "error_code": result.get("error_code"),
+                                      "outcome": result.get("outcome")})
+            entry = {"at": row["occurred_at"], "trigger": {
+                "source": row["wake_source"], "reason": row["wake_reason"],
+                "payload": json.loads(row["wake_payload_json"])}, "activity": narrative}
+            if bootstrap_bytes([entry, *selected]) > byte_limit:
+                break
+            selected.append(entry)
+        return list(reversed(selected))
 
     def finish_run(self, run_id: str, status: str, duration: float, model_calls: int,
                    schedule_id: str | None = None,

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from resident.realm import RealmClient, RealmHTTPError
 from resident.config import Config
-from resident.domain import ModelTurn, ToolResult
+from resident.domain import ModelTurn, ToolCall, ToolResult, WakeEvent
 from resident.instances import load_resident_definition
 from resident.provider import OpenAIAgentsProvider
 from resident.runtime import ResidentRuntime
@@ -70,7 +70,7 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_replacement_managed_session_gets_fresh_realm_state(self):
         with tempfile.TemporaryDirectory() as directory:
             first_provider = RecordingProvider()
-            first = ResidentRuntime(Config(Path(directory)), first_provider,
+            first = ResidentRuntime(Config(Path(directory), keeper_history=True), first_provider,
                                     capabilities=self.client.capabilities,
                                     realm_client=self.client,
                                     diagnostic_output=lambda _: None)
@@ -80,7 +80,7 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
 
             await self.client.mutate("advance-time", {"minutes": 15})
             second_provider = RecordingProvider()
-            second = ResidentRuntime(Config(Path(directory)), second_provider,
+            second = ResidentRuntime(Config(Path(directory), keeper_history=True), second_provider,
                                      capabilities=self.client.capabilities,
                                      realm_client=self.client,
                                      diagnostic_output=lambda _: None)
@@ -88,7 +88,339 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             second_state = second_provider.contexts[0]["realm_state"]
             self.assertEqual(2, second_state["trusted_state"]["game"]["current_revision"])
             self.assertEqual(15, second_state["player_state"]["game"]["world_time_minutes"])
+            history = second_provider.contexts[0]["new_session_bootstrap"]["keeper_recent_interactions"]
+            self.assertEqual(1, len(history))
+            self.assertEqual("done", history[0]["activity"][0]["text"])
+            self.assertNotIn("realm_state", str(history))
+            self.assertNotIn("secret", str(history))
             second.close()
+
+    async def test_rollover_history_is_scoped_to_configured_game_and_actor(self):
+        for game_id, actor_id in (("new-game", "hero"), ("game", "new-actor")):
+            with self.subTest(game_id=game_id, actor_id=actor_id):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = Store(Path(directory) / "resident.sqlite3")
+                    event = WakeEvent("old-wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+                    run_id = store.start_run(event)
+                    store.start_keeper_interaction(run_id, event, "game", "hero")
+                    store.add_keeper_activity(run_id, "model_turn", {
+                        "message": "Old game and actor narrative", "tool_calls": []})
+                    store.finish_keeper_interaction(run_id, "completed")
+                    store.close()
+
+                    client = RealmClient("http://127.0.0.1:3000", game_id, actor_id)
+                    client.read = AsyncMock(return_value={"player_state": {}, "trusted_state": {}})
+                    provider = RecordingProvider()
+                    runtime = ResidentRuntime(Config(Path(directory), keeper_history=True),
+                                              provider, capabilities=client.capabilities,
+                                              realm_client=client,
+                                              diagnostic_output=lambda _: None)
+                    try:
+                        await runtime.process(runtime.owner_message_event("continue"))
+                        self.assertEqual([], provider.contexts[0]["new_session_bootstrap"][
+                            "keeper_recent_interactions"])
+                    finally:
+                        runtime.close()
+
+    async def test_rollover_history_filters_before_interaction_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            for index, (game_id, actor_id) in enumerate((
+                    ("game", "hero"), ("other-game", "hero"), ("game", "other-actor"))):
+                event = WakeEvent(f"wake-{index}", "owner", "play",
+                                  "2026-01-01T00:00:00Z", {})
+                run_id = store.start_run(event)
+                store.start_keeper_interaction(run_id, event, game_id, actor_id)
+                store.add_keeper_activity(run_id, "model_turn", {
+                    "message": f"narrative-{index}", "tool_calls": []})
+                store.finish_keeper_interaction(run_id, "completed")
+            for game_id, actor_id, expected in (("game", "hero", "narrative-0"),
+                                                ("other-game", "hero", "narrative-1"),
+                                                ("game", "other-actor", "narrative-2")):
+                with self.subTest(game_id=game_id, actor_id=actor_id):
+                    history = store.keeper_recent_context(
+                        1, 16384, game_id=game_id, actor_id=actor_id)
+                    self.assertEqual([expected], [entry["activity"][0]["text"]
+                                                  for entry in history])
+            store.close()
+
+    async def test_interaction_persists_exact_input_and_trusted_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = RecordingProvider()
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), provider,
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            run_id = await runtime.process(runtime.owner_message_event("open the door"))
+            row = runtime.store.connection.execute(
+                "SELECT * FROM keeper_interactions WHERE run_id=?", (run_id,)).fetchone()
+            self.assertEqual("completed", row["status"])
+            self.assertEqual("new-session", row["session_id"])
+            self.assertEqual(1, row["realm_revision"])
+            self.assertEqual(provider.contexts[0], json.loads(row["input_text"]))
+            self.assertIn("secret", row["realm_snapshot_json"])
+            self.assertEqual(["model_turn"], [item[0] for item in
+                runtime.store.connection.execute(
+                    "SELECT kind FROM keeper_activity WHERE run_id=? ORDER BY sequence", (run_id,))])
+            runtime.close()
+
+    async def test_realm_managed_resident_without_keeper_opt_in_has_no_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = RecordingProvider()
+            runtime = ResidentRuntime(Config(Path(directory)), provider,
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            await runtime.process(runtime.owner_message_event("look"))
+            self.assertNotIn("keeper_recent_interactions",
+                             provider.contexts[0]["new_session_bootstrap"])
+            self.assertEqual(0, runtime.store.connection.execute(
+                "SELECT COUNT(*) FROM keeper_interactions").fetchone()[0])
+            runtime.close()
+
+    async def test_rollover_projects_player_call_content_and_actual_encoding_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            store.add_keeper_activity(run_id, "model_turn", {
+                "message": None, "tool_calls": [
+                    {"id": "message", "name": "send_owner_message", "arguments": {"content": "The door opens."}},
+                    {"id": "patch", "name": "realm_world_patch", "arguments": {"entities": [
+                        {"name": "secret", "description": "trusted secret",
+                         "player": {"description": "A dark doorway."}}],
+                        "facts": [{"text": "hidden fact"}]}},
+                ]}, turn_id="turn")
+            for call_id, name, result in (
+                    ("message", "send_owner_message", {"ok": True, "delivered": True}),
+                    ("patch", "realm_world_patch", {"ok": True, "mutation": {"revision": 2}})):
+                store.add_keeper_activity(run_id, "tool_result", {
+                    "call_id": call_id, "name": name, "result": result,
+                }, turn_id="turn", call_id=call_id)
+            store.finish_keeper_interaction(run_id, "completed")
+            entry = store.keeper_recent_context(1, 16384, game_id="game", actor_id="hero")
+            self.assertEqual("The door opens.", entry[0]["activity"][0]["content"])
+            self.assertEqual([{"description": "A dark doorway."}],
+                             entry[0]["activity"][1]["player_views"])
+            self.assertNotIn("secret", str(entry))
+            self.assertNotIn("hidden fact", str(entry))
+            wrapper = {"new_session_bootstrap": {
+                "preceding_field": None, "keeper_recent_interactions": entry}}
+            baseline = {"new_session_bootstrap": {"preceding_field": None}}
+            size = len(json.dumps(wrapper, ensure_ascii=False, indent=2).encode()) - len(
+                json.dumps(baseline, ensure_ascii=False, indent=2).encode())
+            self.assertEqual(entry, store.keeper_recent_context(
+                1, size, game_id="game", actor_id="hero"))
+            self.assertEqual([], store.keeper_recent_context(
+                1, size - 1, game_id="game", actor_id="hero"))
+            store.close()
+
+    async def test_bootstrap_skips_non_list_historical_world_patch_sections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("prior-wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            store.add_keeper_activity(run_id, "model_turn", {
+                "message": None, "tool_calls": [
+                    {"id": "patch-1", "name": "realm_world_patch", "arguments": {
+                        "entities": None, "entity_updates": [
+                            {"player": {"description": "A doorway appears."}}]}},
+                    {"id": "patch-2", "name": "realm_world_patch", "arguments": {
+                        "entities": {"player": {"description": "not a list"}},
+                        "entity_updates": {"player": {"description": "also not a list"}}}},
+                    {"id": "patch-3", "name": "realm_world_patch", "arguments": {
+                        "entities": [None, {"player": {"name": "The doorway"}}],
+                        "entity_updates": None}},
+                ]}, turn_id="turn")
+            for call_id in ("patch-1", "patch-2", "patch-3"):
+                store.add_keeper_activity(run_id, "tool_result", {
+                    "call_id": call_id, "name": "realm_world_patch",
+                    "result": {"ok": True, "mutation": {"revision": 2}},
+                }, turn_id="turn", call_id=call_id)
+            store.finish_keeper_interaction(run_id, "completed")
+            store.close()
+
+            provider = RecordingProvider()
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), provider,
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            try:
+                await runtime.process(runtime.owner_message_event("continue"))
+                history = provider.contexts[0]["new_session_bootstrap"]["keeper_recent_interactions"]
+                self.assertEqual([
+                    {"kind": "player_facing_call", "name": "realm_world_patch",
+                     "player_views": [{"description": "A doorway appears."}]},
+                    {"kind": "player_facing_call", "name": "realm_world_patch",
+                     "player_views": [{"name": "The doorway"}]},
+                    {"kind": "action_outcome", "name": "realm_world_patch",
+                     "ok": True, "error_code": None, "outcome": None},
+                    {"kind": "action_outcome", "name": "realm_world_patch",
+                     "ok": True, "error_code": None, "outcome": None},
+                    {"kind": "action_outcome", "name": "realm_world_patch",
+                     "ok": True, "error_code": None, "outcome": None},
+                ], history[0]["activity"])
+                self.assertNotIn("not a list", str(history))
+            finally:
+                runtime.close()
+
+    async def test_rollover_only_projects_confirmed_player_facing_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            calls = [
+                {"id": "rejected-patch", "name": "realm_world_patch", "arguments": {
+                    "entities": [{"player": {"description": "A rejected doorway."}}]}},
+                {"id": "unknown-patch", "name": "realm_world_patch", "arguments": {
+                    "entities": [{"player": {"description": "An uncertain doorway."}}]}},
+                {"id": "undelivered", "name": "send_owner_message", "arguments": {
+                    "content": "An undelivered message."}},
+                {"id": "missing-result", "name": "send_owner_message", "arguments": {
+                    "content": "An unconfirmed message."}},
+                {"id": "accepted-patch", "name": "realm_world_patch", "arguments": {
+                    "entities": [{"player": {"description": "An accepted doorway."}}]}},
+                {"id": "delivered", "name": "send_owner_message", "arguments": {
+                    "content": "A delivered message."}},
+            ]
+            store.add_keeper_activity(run_id, "model_turn", {
+                "message": None, "tool_calls": calls,
+            }, turn_id="turn")
+            for call_id, name, result in (
+                    ("rejected-patch", "realm_world_patch",
+                     {"ok": False, "error_code": "rejected"}),
+                    ("unknown-patch", "realm_world_patch",
+                     {"ok": False, "error_code": "unknown_outcome", "outcome": "unknown"}),
+                    ("undelivered", "send_owner_message", {"ok": True, "delivered": False}),
+                    ("accepted-patch", "realm_world_patch", {"ok": True}),
+                    ("delivered", "send_owner_message", {"ok": True, "delivered": True})):
+                store.add_keeper_activity(run_id, "tool_result", {
+                    "call_id": call_id, "name": name, "result": result,
+                }, turn_id="turn", call_id=call_id)
+            store.finish_keeper_interaction(run_id, "completed")
+            activity = store.keeper_recent_context(
+                1, 16384, game_id="game", actor_id="hero")[0]["activity"]
+            self.assertEqual([
+                {"kind": "player_facing_call", "name": "realm_world_patch",
+                 "player_views": [{"description": "An accepted doorway."}]},
+                {"kind": "player_facing_call", "name": "send_owner_message",
+                 "content": "A delivered message."},
+            ], [item for item in activity if item["kind"] == "player_facing_call"])
+            self.assertEqual([False, False, False, True, True], [
+                item["ok"] for item in activity if item["kind"] == "action_outcome"])
+            self.assertNotIn("rejected doorway", str(activity))
+            self.assertNotIn("uncertain doorway", str(activity))
+            self.assertNotIn("undelivered message", str(activity))
+            self.assertNotIn("unconfirmed message", str(activity))
+            store.close()
+
+    async def test_failed_interaction_is_not_replayed(self):
+        class FailingProvider(RecordingProvider):
+            async def respond(self, context, tools, results, continuation_id=None):
+                raise RuntimeError("unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), FailingProvider(),
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                await runtime.process(runtime.owner_message_event("look"))
+            row = runtime.store.connection.execute(
+                "SELECT status,input_text FROM keeper_interactions").fetchone()
+            self.assertEqual("failed", row["status"])
+            self.assertIsNotNone(row["input_text"])
+            self.assertEqual([], runtime.store.keeper_recent_context(
+                8, 16384, game_id="game", actor_id="hero"))
+            runtime.close()
+
+    async def test_tool_activity_is_ordered_and_rollover_omits_realm_views(self):
+        class ToolProvider(RecordingProvider):
+            async def respond(self, context, tools, results, continuation_id=None):
+                self.contexts.append(json.loads(context))
+                self.session_id = "session-with-tool"
+                if not results:
+                    return ModelTurn("first", tool_calls=(
+                        ToolCall("read-1", "realm_read", {}),))
+                return ModelTurn("final", message="A door remains mysterious")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), ToolProvider(),
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            run_id = await runtime.process(runtime.owner_message_event("inspect"))
+            rows = runtime.store.connection.execute(
+                "SELECT kind,content_json FROM keeper_activity WHERE run_id=? ORDER BY sequence",
+                (run_id,)).fetchall()
+            self.assertEqual(["model_turn", "tool_result", "model_turn"],
+                             [row["kind"] for row in rows])
+            self.assertIn("secret", rows[1]["content_json"])
+            recent = runtime.store.keeper_recent_context(
+                1, 16384, game_id="game", actor_id="hero")
+            self.assertIn("A door remains mysterious", str(recent))
+            self.assertNotIn("secret", str(recent))
+            self.assertEqual([], runtime.store.keeper_recent_context(
+                1, 10, game_id="game", actor_id="hero"))
+            runtime.close()
+
+    async def test_retrying_model_turn_activity_keeps_one_ordered_history_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            first = {"message": "First turn", "tool_calls": []}
+            second = {"message": "Second turn", "tool_calls": []}
+            store.add_keeper_activity(run_id, "model_turn", first,
+                                      session_id="session", turn_id="turn-1")
+            store.add_keeper_activity(run_id, "tool_result", {"name": "check", "result": {"ok": True}},
+                                      session_id="session", turn_id="turn-1", call_id="call-1")
+            store.add_keeper_activity(run_id, "model_turn", first,
+                                      session_id="session", turn_id="turn-1")
+            store.add_keeper_activity(run_id, "model_turn", second,
+                                      session_id="session", turn_id="turn-2")
+            store.add_keeper_activity(run_id, "model_turn", second,
+                                      session_id="session", turn_id="turn-2")
+            store.finish_keeper_interaction(run_id, "completed")
+
+            rows = store.connection.execute(
+                "SELECT kind,turn_id FROM keeper_activity WHERE run_id=? ORDER BY sequence",
+                (run_id,)).fetchall()
+            self.assertEqual([("model_turn", "turn-1"), ("tool_result", "turn-1"),
+                              ("model_turn", "turn-2")], [tuple(row) for row in rows])
+            history = store.keeper_recent_context(1, 16384, game_id="game", actor_id="hero")
+            self.assertEqual(["First turn", "Second turn"],
+                             [entry["text"] for entry in history[0]["activity"]
+                              if entry["kind"] == "keeper_output"])
+            store.close()
+
+    async def test_existing_duplicate_model_turns_keep_first_sequence_on_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resident.sqlite3"
+            store = Store(path)
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            with store.connection:
+                store.connection.execute("DROP INDEX idx_keeper_activity_identity")
+            store.add_keeper_activity(run_id, "model_turn", {"message": "Original"},
+                                      session_id="session", turn_id="turn")
+            store.add_keeper_activity(run_id, "model_turn", {"message": "Retry"},
+                                      session_id="session", turn_id="turn")
+            store.close()
+
+            reopened = Store(path)
+            rows = reopened.connection.execute(
+                "SELECT sequence,content_json FROM keeper_activity WHERE run_id=?", (run_id,)
+            ).fetchall()
+            self.assertEqual(1, len(rows))
+            self.assertEqual(1, rows[0]["sequence"])
+            self.assertEqual("Original", json.loads(rows[0]["content_json"])["message"])
+            reopened.close()
 
     async def test_mutations_bind_actor_revision_and_call_identity(self):
         from resident.capabilities import _INVOCATION_ID

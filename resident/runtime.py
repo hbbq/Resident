@@ -160,6 +160,9 @@ class ResidentRuntime:
                  owner_output_enabled: bool | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
+        if config.keeper_history and (realm_client is None or not getattr(
+                provider, "uses_managed_session", False)):
+            raise ValueError("Keeper history requires Realm and a managed session")
         self.config, self.provider = config, provider
         self.realm_client = realm_client
         initial_capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
@@ -862,6 +865,10 @@ class ResidentRuntime:
     async def process(self, event: WakeEvent) -> str:
         started = time.monotonic()
         run_id = self.store.start_run(event)
+        keeper_history = self.config.keeper_history
+        if keeper_history:
+            self.store.start_keeper_interaction(
+                run_id, event, self.realm_client.game_id, self.realm_client.actor_id)
         self._active_run_id, self._active_event = run_id, event
         self._active_max_loop_lag = 0.0
         self._active_total_loop_lag = 0.0
@@ -1001,7 +1008,12 @@ class ResidentRuntime:
             if new_session:
                 if managed_session:
                     context = self.context_builder.build_managed_bootstrap(
-                        self.resident, self.owner, event, capabilities, handover=handover)
+                        self.resident, self.owner, event, capabilities, handover=handover,
+                        keeper_recent_context=(self.store.keeper_recent_context(
+                            self.config.keeper_rollover_interactions,
+                            self.config.keeper_rollover_bytes,
+                            game_id=self.realm_client.game_id,
+                            actor_id=self.realm_client.actor_id) if keeper_history else None))
                 else:
                     context_document = json.loads(context)
                     context_document["new_session_bootstrap"] = {
@@ -1014,6 +1026,9 @@ class ResidentRuntime:
                 context_document = json.loads(context)
                 context_document["realm_state"] = realm_state
                 context = json.dumps(context_document, ensure_ascii=False, indent=2)
+            if keeper_history:
+                self.store.set_keeper_input(
+                    run_id, getattr(self.provider, "session_id", None), context, realm_state)
             results: list[ToolResult] = []
             for round_number in range(self.config.max_tool_rounds + 1):
                 calls += 1
@@ -1029,6 +1044,10 @@ class ResidentRuntime:
                 except RemoteSessionUnavailable:
                     if results or continuation_id is not None:
                         raise
+                    if keeper_history:
+                        self.store.add_keeper_activity(
+                            run_id, "unavailable_session_input", {"input": context},
+                            session_id=getattr(self.provider, "session_id", None))
                     old_session_id = getattr(self.provider, "session_id", None)
                     unavailable_reason = getattr(
                         self.provider, "unavailable_session_reason", None)
@@ -1057,11 +1076,18 @@ class ResidentRuntime:
                             old_session_id, handover,
                             (datetime.now(UTC) + timedelta(hours=24)).isoformat())
                     context = self.context_builder.build_managed_bootstrap(
-                        self.resident, self.owner, event, capabilities, handover=handover)
+                        self.resident, self.owner, event, capabilities, handover=handover,
+                        keeper_recent_context=(self.store.keeper_recent_context(
+                            self.config.keeper_rollover_interactions,
+                            self.config.keeper_rollover_bytes,
+                            game_id=self.realm_client.game_id,
+                            actor_id=self.realm_client.actor_id) if keeper_history else None))
                     if realm_state is not None:
                         context_document = json.loads(context)
                         context_document["realm_state"] = realm_state
                         context = json.dumps(context_document, ensure_ascii=False, indent=2)
+                    if keeper_history:
+                        self.store.set_keeper_input(run_id, None, context, realm_state)
                     turn = await self.provider.respond(
                         context, registry.specs, results, continuation_id)
                 finally:
@@ -1084,6 +1110,19 @@ class ResidentRuntime:
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
                     "output_tokens": turn.output_tokens,
                 })
+                if keeper_history:
+                    session_id = getattr(self.provider, "session_id", None)
+                    self.store.set_keeper_input(run_id, session_id, context, realm_state)
+                    self.store.add_keeper_activity(run_id, "model_turn", {
+                        "message": turn.message, "input_tokens": turn.input_tokens,
+                        "output_tokens": turn.output_tokens,
+                        "tool_calls": [{"id": call.id, "name": call.name,
+                                        "arguments": call.arguments} for call in turn.tool_calls],
+                    }, session_id=session_id, turn_id=turn.response_id)
+                    self.store.connection.execute("""
+                        UPDATE keeper_interactions SET input_tokens=input_tokens+?,
+                          output_tokens=output_tokens+? WHERE run_id=?
+                    """, (turn.input_tokens or 0, turn.output_tokens or 0, run_id))
                 active_structured_outputs = bool(
                     getattr(self.provider, "session_uses_output_capabilities", False))
                 if turn.message and not active_structured_outputs:
@@ -1157,6 +1196,11 @@ class ResidentRuntime:
                                 "byte_count": len(attachment.data), "ephemeral": True,
                             } for attachment in result.attachments]
                         self._emit("tool.completed", completion)
+                        if keeper_history:
+                            self.store.add_keeper_activity(
+                                run_id, "tool_result", completion,
+                                session_id=getattr(self.provider, "session_id", None),
+                                turn_id=continuation_id, call_id=call.id)
                         tool_outcome = (
                             "ok" if result.output.get("ok") is not False else "error")
                     finally:
@@ -1181,6 +1225,8 @@ class ResidentRuntime:
                         "openai_agents", synchronized_session_id, synchronized_state)
             self._emit("wake.sleeping", {"status": "completed"})
             status = "completed"
+            if keeper_history:
+                self.store.finish_keeper_interaction(run_id, status)
             if self.curator is not None and managed_session:
                 session_id = getattr(self.provider, "session_id", None)
                 completed_turn_id = turn.response_id
@@ -1212,6 +1258,8 @@ class ResidentRuntime:
             )
             self.store.finish_run(
                 run_id, status, duration, calls, schedule_id, owner_message_id)
+            if keeper_history and status != "completed":
+                self.store.finish_keeper_interaction(run_id, status)
             # Finalization above is synchronous. Let the probe account for an
             # overdue sample before publishing and clearing this wake's summary.
             if self._event_loop_lag_checkpoint is not None:
