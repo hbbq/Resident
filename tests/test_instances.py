@@ -35,6 +35,35 @@ class OutputProvider(IdleProvider):
 
 
 class InstanceDefinitionTests(unittest.TestCase):
+    def test_keeper_history_requires_explicit_valid_opt_in(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            definitions = Path(temporary) / "residents"
+            definitions.mkdir()
+            path = definitions / "resident.yaml"
+            base = "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
+            realm = ("realm:\n  base_url: http://realm.test\n"
+                     "  game_id_env: GAME_ID\n  actor_id_env: ACTOR_ID\n")
+            path.write_text(base + realm, encoding="utf-8")
+            self.assertFalse(load_resident_catalog(definitions).residents[0].keeper_history)
+            path.write_text(base + realm + "keeper_history: true\n", encoding="utf-8")
+            self.assertTrue(load_resident_catalog(definitions).residents[0].keeper_history)
+            with patch.dict(os.environ, {
+                    "OPENAI_API_KEY": "test-key", "GAME_ID": "game", "ACTOR_ID": "hero"}):
+                host = build_host(Config(Path(temporary) / "data", residents_dir=definitions))
+            try:
+                self.assertTrue(host.runtimes["resident"].config.keeper_history)
+            finally:
+                host.close()
+            for content, error in (
+                    (base + realm + "keeper_history: yes-please\n", "must be boolean"),
+                    (base + "keeper_history: true\n", "requires realm and openai-agents"),
+                    (base + realm + "agent:\n  provider: openai-responses\n"
+                     "keeper_history: true\n", "requires realm and openai-agents")):
+                with self.subTest(error=error):
+                    path.write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, error):
+                        load_resident_catalog(definitions)
+
     def test_legacy_curator_environment_and_cli_configuration_is_preserved(self):
         with patch.dict(os.environ, {
                 "RESIDENT_CURATOR_API_KEY": "legacy-key",

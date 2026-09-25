@@ -164,6 +164,7 @@ class Config:
     curator_max_batches: int = 4
     max_tool_rounds: int = 8
     context_messages: int = 8
+    keeper_history: bool = False
     keeper_rollover_interactions: int = 8
     keeper_rollover_bytes: int = 16384
     spontaneous_message_limit: int = 3

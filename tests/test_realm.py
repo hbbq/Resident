@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from resident.realm import RealmClient, RealmHTTPError
 from resident.config import Config
-from resident.domain import ModelTurn, ToolCall, ToolResult
+from resident.domain import ModelTurn, ToolCall, ToolResult, WakeEvent
 from resident.instances import load_resident_definition
 from resident.provider import OpenAIAgentsProvider
 from resident.runtime import ResidentRuntime
@@ -70,7 +70,7 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_replacement_managed_session_gets_fresh_realm_state(self):
         with tempfile.TemporaryDirectory() as directory:
             first_provider = RecordingProvider()
-            first = ResidentRuntime(Config(Path(directory)), first_provider,
+            first = ResidentRuntime(Config(Path(directory), keeper_history=True), first_provider,
                                     capabilities=self.client.capabilities,
                                     realm_client=self.client,
                                     diagnostic_output=lambda _: None)
@@ -80,7 +80,7 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
 
             await self.client.mutate("advance-time", {"minutes": 15})
             second_provider = RecordingProvider()
-            second = ResidentRuntime(Config(Path(directory)), second_provider,
+            second = ResidentRuntime(Config(Path(directory), keeper_history=True), second_provider,
                                      capabilities=self.client.capabilities,
                                      realm_client=self.client,
                                      diagnostic_output=lambda _: None)
@@ -98,7 +98,7 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_interaction_persists_exact_input_and_trusted_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             provider = RecordingProvider()
-            runtime = ResidentRuntime(Config(Path(directory)), provider,
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), provider,
                                       capabilities=self.client.capabilities,
                                       realm_client=self.client,
                                       diagnostic_output=lambda _: None)
@@ -115,13 +115,57 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT kind FROM keeper_activity WHERE run_id=? ORDER BY sequence", (run_id,))])
             runtime.close()
 
+    async def test_realm_managed_resident_without_keeper_opt_in_has_no_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = RecordingProvider()
+            runtime = ResidentRuntime(Config(Path(directory)), provider,
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            await runtime.process(runtime.owner_message_event("look"))
+            self.assertNotIn("keeper_recent_interactions",
+                             provider.contexts[0]["new_session_bootstrap"])
+            self.assertEqual(0, runtime.store.connection.execute(
+                "SELECT COUNT(*) FROM keeper_interactions").fetchone()[0])
+            runtime.close()
+
+    async def test_rollover_projects_player_call_content_and_actual_encoding_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            store.add_keeper_activity(run_id, "model_turn", {
+                "message": None, "tool_calls": [
+                    {"name": "send_owner_message", "arguments": {"content": "The door opens."}},
+                    {"name": "realm_world_patch", "arguments": {"entities": [
+                        {"name": "secret", "description": "trusted secret",
+                         "player": {"description": "A dark doorway."}}],
+                        "facts": [{"text": "hidden fact"}]}},
+                ]})
+            store.finish_keeper_interaction(run_id, "completed")
+            entry = store.keeper_recent_context(1, 16384)
+            self.assertEqual("The door opens.", entry[0]["activity"][0]["content"])
+            self.assertEqual([{"description": "A dark doorway."}],
+                             entry[0]["activity"][1]["player_views"])
+            self.assertNotIn("secret", str(entry))
+            self.assertNotIn("hidden fact", str(entry))
+            wrapper = {"new_session_bootstrap": {
+                "preceding_field": None, "keeper_recent_interactions": entry}}
+            baseline = {"new_session_bootstrap": {"preceding_field": None}}
+            size = len(json.dumps(wrapper, ensure_ascii=False, indent=2).encode()) - len(
+                json.dumps(baseline, ensure_ascii=False, indent=2).encode())
+            self.assertEqual(entry, store.keeper_recent_context(1, size))
+            self.assertEqual([], store.keeper_recent_context(1, size - 1))
+            store.close()
+
     async def test_failed_interaction_is_not_replayed(self):
         class FailingProvider(RecordingProvider):
             async def respond(self, context, tools, results, continuation_id=None):
                 raise RuntimeError("unavailable")
 
         with tempfile.TemporaryDirectory() as directory:
-            runtime = ResidentRuntime(Config(Path(directory)), FailingProvider(),
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), FailingProvider(),
                                       capabilities=self.client.capabilities,
                                       realm_client=self.client,
                                       diagnostic_output=lambda _: None)
@@ -145,7 +189,7 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                 return ModelTurn("final", message="A door remains mysterious")
 
         with tempfile.TemporaryDirectory() as directory:
-            runtime = ResidentRuntime(Config(Path(directory)), ToolProvider(),
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), ToolProvider(),
                                       capabilities=self.client.capabilities,
                                       realm_client=self.client,
                                       diagnostic_output=lambda _: None)

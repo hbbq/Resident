@@ -1752,7 +1752,14 @@ class Store:
             ORDER BY completed_at DESC, rowid DESC LIMIT ?
         """, (count,)).fetchall()
         selected: list[dict[str, Any]] = []
-        used = 0
+        def bootstrap_bytes(entries: list[dict[str, Any]]) -> int:
+            # Match the field's nesting and indentation in build_managed_bootstrap.
+            wrapper = {"new_session_bootstrap": {
+                "preceding_field": None, "keeper_recent_interactions": entries}}
+            empty = {"new_session_bootstrap": {"preceding_field": None}}
+            return len(json.dumps(wrapper, ensure_ascii=False, indent=2).encode("utf-8")) - len(
+                json.dumps(empty, ensure_ascii=False, indent=2).encode("utf-8"))
+
         for row in rows:
             activities = self.connection.execute("""
                 SELECT kind,content_json FROM keeper_activity WHERE run_id=? ORDER BY sequence
@@ -1760,8 +1767,28 @@ class Store:
             narrative = []
             for item in activities:
                 data = json.loads(item["content_json"])
-                if item["kind"] == "model_turn" and data.get("message"):
-                    narrative.append({"kind": "keeper_output", "text": data["message"]})
+                if item["kind"] == "model_turn":
+                    if data.get("message"):
+                        narrative.append({"kind": "keeper_output", "text": data["message"]})
+                    for call in data.get("tool_calls") or []:
+                        name, arguments = call.get("name"), call.get("arguments")
+                        if not isinstance(arguments, dict):
+                            continue
+                        if name == "send_owner_message" and isinstance(
+                                arguments.get("content"), str):
+                            narrative.append({"kind": "player_facing_call", "name": name,
+                                              "content": arguments["content"]})
+                        elif name == "realm_world_patch":
+                            # Only explicit player projections may cross from a
+                            # trusted world patch into the rollover narrative.
+                            player_views = [item["player"] for section in (
+                                "entities", "entity_updates")
+                                for item in arguments.get(section, [])
+                                if isinstance(item, dict) and isinstance(
+                                    item.get("player"), dict)]
+                            if player_views:
+                                narrative.append({"kind": "player_facing_call", "name": name,
+                                                  "player_views": player_views})
                 elif item["kind"] == "tool_result":
                     result = data.get("result") or {}
                     # Never replay tool-returned Realm views or mutation bodies as facts.
@@ -1772,11 +1799,9 @@ class Store:
             entry = {"at": row["occurred_at"], "trigger": {
                 "source": row["wake_source"], "reason": row["wake_reason"],
                 "payload": json.loads(row["wake_payload_json"])}, "activity": narrative}
-            size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
-            if size > byte_limit - used:
+            if bootstrap_bytes([entry, *selected]) > byte_limit:
                 break
             selected.append(entry)
-            used += size
         return list(reversed(selected))
 
     def finish_run(self, run_id: str, status: str, duration: float, model_calls: int,

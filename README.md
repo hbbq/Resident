@@ -50,6 +50,12 @@ return the mutation result and fresh views. A conflict requires reassessment;
 an uncertain result must not be repeated with a new key. Realm v1 has no
 authentication or operation lookup, so keep it inside a trusted network boundary
 and resolve uncertain outcomes from Realm state before continuing play.
+`keeper_history: true` in `residents/keeper.yaml` enables Keeper's local
+interaction history and bounded replay on a new managed session. It requires
+both `realm` and `agent.provider: openai-agents`; other Resident definitions
+default to `false`, including Realm-backed managed Residents. The replay bounds
+remain `KEEPER_ROLLOVER_INTERACTIONS` (8) and `KEEPER_ROLLOVER_BYTES` (16384).
+The byte limit applies to the serialized history field in the bootstrap.
 `realm_world_patch` accepts Realm's seven patch sections with its native field
 names, including `containment[].child_id` and `parent_id`, and
 `observations[].actor_id`. A single patch can create an entity and refer to it

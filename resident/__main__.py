@@ -213,6 +213,7 @@ def build_host(config: Config) -> RuntimeHost:
                 provider=definition.agent.provider, model=definition.agent.model,
                 reasoning_effort=definition.agent.reasoning_effort,
                 service_tier=definition.agent.service_tier,
+                keeper_history=definition.keeper_history,
                 curator_model=curator_model,
                 curator_api_key=curator_api_key,
                 curator_base_url=curator_base_url,

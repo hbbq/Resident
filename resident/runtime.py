@@ -160,6 +160,9 @@ class ResidentRuntime:
                  owner_output_enabled: bool | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
+        if config.keeper_history and (realm_client is None or not getattr(
+                provider, "uses_managed_session", False)):
+            raise ValueError("Keeper history requires Realm and a managed session")
         self.config, self.provider = config, provider
         self.realm_client = realm_client
         initial_capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
@@ -862,8 +865,7 @@ class ResidentRuntime:
     async def process(self, event: WakeEvent) -> str:
         started = time.monotonic()
         run_id = self.store.start_run(event)
-        keeper_history = self.realm_client is not None and bool(
-            getattr(self.provider, "uses_managed_session", False))
+        keeper_history = self.config.keeper_history
         if keeper_history:
             self.store.start_keeper_interaction(
                 run_id, event, self.realm_client.game_id, self.realm_client.actor_id)

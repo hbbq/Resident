@@ -21,6 +21,8 @@ realm:
   game_id_env: KEEPER_REALM_GAME_ID
   actor_id_env: KEEPER_REALM_ACTOR_ID
 
+keeper_history: true
+
 capabilities: [realm]
 
 outputs:

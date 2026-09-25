@@ -31,7 +31,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
     "role", "role_prompt", "agent", "curator", "capabilities", "outputs",
-    "subscriptions", "owner_transport", "external_applications", "realm", "body",
+    "subscriptions", "owner_transport", "external_applications", "realm", "keeper_history", "body",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
 
@@ -107,6 +107,7 @@ class ResidentDefinition:
     owner_transport: OwnerTransportDefinition | None = None
     external_applications: tuple[ExternalApplicationDefinition, ...] = ()
     realm: RealmDefinition | None = None
+    keeper_history: bool = False
     body: dict[str, Any] | None = None
 
 
@@ -482,6 +483,12 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
             _positive_number(item.get("request_timeout_seconds", 10),
                              "realm.request_timeout_seconds", maximum=120),
         )
+    keeper_history = data.get("keeper_history", False)
+    if not isinstance(keeper_history, bool):
+        raise ValueError(f"{path.name}.keeper_history must be boolean")
+    if keeper_history and (realm is None or provider != "openai-agents"):
+        raise ValueError(
+            f"{path.name}.keeper_history requires realm and openai-agents")
     return ResidentDefinition(
         id=resident_id, name=name, personality=personality, role=role, enabled=enabled,
         agent=agent, curator=curator,
@@ -492,6 +499,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
         external_applications=_external_applications(
             data.get("external_applications"), "external_applications"),
         realm=realm,
+        keeper_history=keeper_history,
         body=body,
     )
 
