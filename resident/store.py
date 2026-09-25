@@ -1781,11 +1781,15 @@ class Store:
                         elif name == "realm_world_patch":
                             # Only explicit player projections may cross from a
                             # trusted world patch into the rollover narrative.
-                            player_views = [item["player"] for section in (
-                                "entities", "entity_updates")
-                                for item in arguments.get(section, [])
-                                if isinstance(item, dict) and isinstance(
-                                    item.get("player"), dict)]
+                            player_views = []
+                            for section in ("entities", "entity_updates"):
+                                items = arguments.get(section)
+                                if not isinstance(items, list):
+                                    continue
+                                player_views.extend(
+                                    item["player"] for item in items
+                                    if isinstance(item, dict) and isinstance(
+                                        item.get("player"), dict))
                             if player_views:
                                 narrative.append({"kind": "player_facing_call", "name": name,
                                                   "player_views": player_views})

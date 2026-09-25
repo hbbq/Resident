@@ -159,6 +159,45 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], store.keeper_recent_context(1, size - 1))
             store.close()
 
+    async def test_bootstrap_skips_non_list_historical_world_patch_sections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("prior-wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            store.add_keeper_activity(run_id, "model_turn", {
+                "message": None, "tool_calls": [
+                    {"name": "realm_world_patch", "arguments": {
+                        "entities": None, "entity_updates": [
+                            {"player": {"description": "A doorway appears."}}]}},
+                    {"name": "realm_world_patch", "arguments": {
+                        "entities": {"player": {"description": "not a list"}},
+                        "entity_updates": {"player": {"description": "also not a list"}}}},
+                    {"name": "realm_world_patch", "arguments": {
+                        "entities": [None, {"player": {"name": "The doorway"}}],
+                        "entity_updates": None}},
+                ]})
+            store.finish_keeper_interaction(run_id, "completed")
+            store.close()
+
+            provider = RecordingProvider()
+            runtime = ResidentRuntime(Config(Path(directory), keeper_history=True), provider,
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            try:
+                await runtime.process(runtime.owner_message_event("continue"))
+                history = provider.contexts[0]["new_session_bootstrap"]["keeper_recent_interactions"]
+                self.assertEqual([
+                    {"kind": "player_facing_call", "name": "realm_world_patch",
+                     "player_views": [{"description": "A doorway appears."}]},
+                    {"kind": "player_facing_call", "name": "realm_world_patch",
+                     "player_views": [{"name": "The doorway"}]},
+                ], history[0]["activity"])
+                self.assertNotIn("not a list", str(history))
+            finally:
+                runtime.close()
+
     async def test_failed_interaction_is_not_replayed(self):
         class FailingProvider(RecordingProvider):
             async def respond(self, context, tools, results, continuation_id=None):
