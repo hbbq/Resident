@@ -1742,15 +1742,17 @@ class Store:
                 UPDATE keeper_interactions SET status=?,completed_at=? WHERE run_id=?
             """, (status, utc_now(), run_id))
 
-    def keeper_recent_context(self, count: int, byte_limit: int) -> list[dict[str, Any]]:
-        """Newest completed wakes that fit, projected without old Realm truth."""
+    def keeper_recent_context(self, count: int, byte_limit: int, *,
+                              game_id: str, actor_id: str) -> list[dict[str, Any]]:
+        """Newest completed wakes for this Realm game and actor that fit."""
         if count <= 0 or byte_limit <= 0:
             return []
         rows = self.connection.execute("""
             SELECT run_id,occurred_at,wake_source,wake_reason,wake_payload_json
-            FROM keeper_interactions WHERE status='completed'
+            FROM keeper_interactions
+            WHERE status='completed' AND realm_game_id=? AND realm_actor_id=?
             ORDER BY completed_at DESC, rowid DESC LIMIT ?
-        """, (count,)).fetchall()
+        """, (game_id, actor_id, count)).fetchall()
         selected: list[dict[str, Any]] = []
         def bootstrap_bytes(entries: list[dict[str, Any]]) -> int:
             # Match the field's nesting and indentation in build_managed_bootstrap.

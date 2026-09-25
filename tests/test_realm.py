@@ -95,6 +95,55 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("secret", str(history))
             second.close()
 
+    async def test_rollover_history_is_scoped_to_configured_game_and_actor(self):
+        for game_id, actor_id in (("new-game", "hero"), ("game", "new-actor")):
+            with self.subTest(game_id=game_id, actor_id=actor_id):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = Store(Path(directory) / "resident.sqlite3")
+                    event = WakeEvent("old-wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+                    run_id = store.start_run(event)
+                    store.start_keeper_interaction(run_id, event, "game", "hero")
+                    store.add_keeper_activity(run_id, "model_turn", {
+                        "message": "Old game and actor narrative", "tool_calls": []})
+                    store.finish_keeper_interaction(run_id, "completed")
+                    store.close()
+
+                    client = RealmClient("http://127.0.0.1:3000", game_id, actor_id)
+                    client.read = AsyncMock(return_value={"player_state": {}, "trusted_state": {}})
+                    provider = RecordingProvider()
+                    runtime = ResidentRuntime(Config(Path(directory), keeper_history=True),
+                                              provider, capabilities=client.capabilities,
+                                              realm_client=client,
+                                              diagnostic_output=lambda _: None)
+                    try:
+                        await runtime.process(runtime.owner_message_event("continue"))
+                        self.assertEqual([], provider.contexts[0]["new_session_bootstrap"][
+                            "keeper_recent_interactions"])
+                    finally:
+                        runtime.close()
+
+    async def test_rollover_history_filters_before_interaction_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            for index, (game_id, actor_id) in enumerate((
+                    ("game", "hero"), ("other-game", "hero"), ("game", "other-actor"))):
+                event = WakeEvent(f"wake-{index}", "owner", "play",
+                                  "2026-01-01T00:00:00Z", {})
+                run_id = store.start_run(event)
+                store.start_keeper_interaction(run_id, event, game_id, actor_id)
+                store.add_keeper_activity(run_id, "model_turn", {
+                    "message": f"narrative-{index}", "tool_calls": []})
+                store.finish_keeper_interaction(run_id, "completed")
+            for game_id, actor_id, expected in (("game", "hero", "narrative-0"),
+                                                ("other-game", "hero", "narrative-1"),
+                                                ("game", "other-actor", "narrative-2")):
+                with self.subTest(game_id=game_id, actor_id=actor_id):
+                    history = store.keeper_recent_context(
+                        1, 16384, game_id=game_id, actor_id=actor_id)
+                    self.assertEqual([expected], [entry["activity"][0]["text"]
+                                                  for entry in history])
+            store.close()
+
     async def test_interaction_persists_exact_input_and_trusted_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             provider = RecordingProvider()
@@ -150,7 +199,7 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                     "call_id": call_id, "name": name, "result": result,
                 }, turn_id="turn", call_id=call_id)
             store.finish_keeper_interaction(run_id, "completed")
-            entry = store.keeper_recent_context(1, 16384)
+            entry = store.keeper_recent_context(1, 16384, game_id="game", actor_id="hero")
             self.assertEqual("The door opens.", entry[0]["activity"][0]["content"])
             self.assertEqual([{"description": "A dark doorway."}],
                              entry[0]["activity"][1]["player_views"])
@@ -161,8 +210,10 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             baseline = {"new_session_bootstrap": {"preceding_field": None}}
             size = len(json.dumps(wrapper, ensure_ascii=False, indent=2).encode()) - len(
                 json.dumps(baseline, ensure_ascii=False, indent=2).encode())
-            self.assertEqual(entry, store.keeper_recent_context(1, size))
-            self.assertEqual([], store.keeper_recent_context(1, size - 1))
+            self.assertEqual(entry, store.keeper_recent_context(
+                1, size, game_id="game", actor_id="hero"))
+            self.assertEqual([], store.keeper_recent_context(
+                1, size - 1, game_id="game", actor_id="hero"))
             store.close()
 
     async def test_bootstrap_skips_non_list_historical_world_patch_sections(self):
@@ -250,7 +301,8 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                     "call_id": call_id, "name": name, "result": result,
                 }, turn_id="turn", call_id=call_id)
             store.finish_keeper_interaction(run_id, "completed")
-            activity = store.keeper_recent_context(1, 16384)[0]["activity"]
+            activity = store.keeper_recent_context(
+                1, 16384, game_id="game", actor_id="hero")[0]["activity"]
             self.assertEqual([
                 {"kind": "player_facing_call", "name": "realm_world_patch",
                  "player_views": [{"description": "An accepted doorway."}]},
@@ -281,7 +333,8 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT status,input_text FROM keeper_interactions").fetchone()
             self.assertEqual("failed", row["status"])
             self.assertIsNotNone(row["input_text"])
-            self.assertEqual([], runtime.store.keeper_recent_context(8, 16384))
+            self.assertEqual([], runtime.store.keeper_recent_context(
+                8, 16384, game_id="game", actor_id="hero"))
             runtime.close()
 
     async def test_tool_activity_is_ordered_and_rollover_omits_realm_views(self):
@@ -306,10 +359,12 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["model_turn", "tool_result", "model_turn"],
                              [row["kind"] for row in rows])
             self.assertIn("secret", rows[1]["content_json"])
-            recent = runtime.store.keeper_recent_context(1, 16384)
+            recent = runtime.store.keeper_recent_context(
+                1, 16384, game_id="game", actor_id="hero")
             self.assertIn("A door remains mysterious", str(recent))
             self.assertNotIn("secret", str(recent))
-            self.assertEqual([], runtime.store.keeper_recent_context(1, 10))
+            self.assertEqual([], runtime.store.keeper_recent_context(
+                1, 10, game_id="game", actor_id="hero"))
             runtime.close()
 
     async def test_mutations_bind_actor_revision_and_call_identity(self):

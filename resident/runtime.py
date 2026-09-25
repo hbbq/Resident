@@ -1011,7 +1011,9 @@ class ResidentRuntime:
                         self.resident, self.owner, event, capabilities, handover=handover,
                         keeper_recent_context=(self.store.keeper_recent_context(
                             self.config.keeper_rollover_interactions,
-                            self.config.keeper_rollover_bytes) if keeper_history else None))
+                            self.config.keeper_rollover_bytes,
+                            game_id=self.realm_client.game_id,
+                            actor_id=self.realm_client.actor_id) if keeper_history else None))
                 else:
                     context_document = json.loads(context)
                     context_document["new_session_bootstrap"] = {
@@ -1077,7 +1079,9 @@ class ResidentRuntime:
                         self.resident, self.owner, event, capabilities, handover=handover,
                         keeper_recent_context=(self.store.keeper_recent_context(
                             self.config.keeper_rollover_interactions,
-                            self.config.keeper_rollover_bytes) if keeper_history else None))
+                            self.config.keeper_rollover_bytes,
+                            game_id=self.realm_client.game_id,
+                            actor_id=self.realm_client.actor_id) if keeper_history else None))
                     if realm_state is not None:
                         context_document = json.loads(context)
                         context_document["realm_state"] = realm_state
