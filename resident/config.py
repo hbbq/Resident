@@ -164,6 +164,8 @@ class Config:
     curator_max_batches: int = 4
     max_tool_rounds: int = 8
     context_messages: int = 8
+    keeper_rollover_interactions: int = 8
+    keeper_rollover_bytes: int = 16384
     spontaneous_message_limit: int = 3
     spontaneous_message_window_seconds: int = 180
     scheduler_poll_seconds: float = 1.0
@@ -224,6 +226,10 @@ class Config:
                             default=int(os.getenv("RESIDENT_CURATOR_BATCH_SIZE", "50")))
         parser.add_argument("--curator-max-batches", type=int,
                             default=int(os.getenv("RESIDENT_CURATOR_MAX_BATCHES", "4")))
+        parser.add_argument("--keeper-rollover-interactions", type=int,
+                            default=int(os.getenv("KEEPER_ROLLOVER_INTERACTIONS", "8")))
+        parser.add_argument("--keeper-rollover-bytes", type=int,
+                            default=int(os.getenv("KEEPER_ROLLOVER_BYTES", "16384")))
         parser.add_argument("--spontaneous-message-limit", type=int,
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_LIMIT", "3")))
         parser.add_argument("--spontaneous-message-window-seconds", type=int,
@@ -296,6 +302,8 @@ class Config:
                                        os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/"),
             curator_batch_size=max(1, min(args.curator_batch_size, 100)),
             curator_max_batches=max(1, args.curator_max_batches),
+            keeper_rollover_interactions=max(0, args.keeper_rollover_interactions),
+            keeper_rollover_bytes=max(0, args.keeper_rollover_bytes),
             spontaneous_message_limit=max(0, args.spontaneous_message_limit),
             spontaneous_message_window_seconds=max(1, args.spontaneous_message_window_seconds),
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,

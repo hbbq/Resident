@@ -154,6 +154,21 @@ class Store:
           id TEXT PRIMARY KEY, event_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
           wake_reason TEXT NOT NULL, wake_source TEXT NOT NULL, status TEXT NOT NULL,
           duration_seconds REAL, model_calls INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS keeper_interactions(
+          run_id TEXT PRIMARY KEY REFERENCES wake_runs(id), format_version INTEGER NOT NULL DEFAULT 1,
+          event_id TEXT NOT NULL, occurred_at TEXT NOT NULL, wake_source TEXT NOT NULL,
+          wake_reason TEXT NOT NULL, wake_payload_json TEXT NOT NULL,
+          status TEXT NOT NULL, session_id TEXT, input_text TEXT,
+          realm_snapshot_json TEXT, realm_game_id TEXT, realm_actor_id TEXT,
+          realm_revision INTEGER, input_bytes INTEGER, snapshot_bytes INTEGER,
+          input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+          completed_at TEXT);
+        CREATE TABLE IF NOT EXISTS keeper_activity(
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL REFERENCES keeper_interactions(run_id),
+          occurred_at TEXT NOT NULL, kind TEXT NOT NULL, session_id TEXT,
+          turn_id TEXT, call_id TEXT, content_json TEXT NOT NULL,
+          UNIQUE(run_id,kind,session_id,turn_id,call_id));
         CREATE TABLE IF NOT EXISTS journal(
           sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, run_id TEXT,
           event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, data_json TEXT NOT NULL);
@@ -283,6 +298,9 @@ class Store:
           PRIMARY KEY(output_request_id,attempt_number));
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_wake_runs_started ON wake_runs(started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_keeper_interactions_completed
+          ON keeper_interactions(status,completed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_keeper_activity_run ON keeper_activity(run_id,sequence);
         CREATE INDEX IF NOT EXISTS idx_journal_run_sequence ON journal(run_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
         CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory_records(status,updated_at DESC);
@@ -427,7 +445,7 @@ class Store:
                     json.dumps(mutable, sort_keys=True, separators=(",", ":")),
                     row["id"],
                 ))
-        self.connection.execute("UPDATE schema_version SET version=21")
+        self.connection.execute("UPDATE schema_version SET version=22")
         # A process may stop after transport acceptance but before recording it.
         # Retry uncertain attempts only while the persisted delivery policy allows it.
         now = utc_now()
@@ -1681,6 +1699,85 @@ class Store:
                 "INSERT INTO wake_runs(id,event_id,started_at,wake_reason,wake_source,status) VALUES(?,?,?,?,?,'running')",
                 (run_id, event.id, utc_now(), event.reason, event.source))
         return run_id
+
+    def start_keeper_interaction(self, run_id: str, event: WakeEvent,
+                                 game_id: str, actor_id: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO keeper_interactions(
+                  run_id,event_id,occurred_at,wake_source,wake_reason,wake_payload_json,
+                  status,realm_game_id,realm_actor_id)
+                VALUES(?,?,?,?,?,?,'running',?,?)
+            """, (run_id, event.id, event.occurred_at, event.source, event.reason,
+                  json.dumps(event.payload, ensure_ascii=False), game_id, actor_id))
+
+    def set_keeper_input(self, run_id: str, session_id: str | None,
+                         input_text: str, realm_snapshot: dict[str, Any] | None) -> None:
+        snapshot = (json.dumps(realm_snapshot, ensure_ascii=False)
+                    if realm_snapshot is not None else None)
+        revision = ((realm_snapshot.get("trusted_state") or {}).get("game") or {}).get(
+            "current_revision") if realm_snapshot and "trusted_state" in realm_snapshot else None
+        with self.connection:
+            self.connection.execute("""
+                UPDATE keeper_interactions SET session_id=?,input_text=?,realm_snapshot_json=?,
+                  realm_revision=?,input_bytes=?,snapshot_bytes=? WHERE run_id=?
+            """, (session_id, input_text, snapshot, revision,
+                  len(input_text.encode("utf-8")),
+                  len(snapshot.encode("utf-8")) if snapshot is not None else 0, run_id))
+
+    def add_keeper_activity(self, run_id: str, kind: str, content: Any, *,
+                            session_id: str | None = None, turn_id: str | None = None,
+                            call_id: str | None = None) -> None:
+        with self.connection:
+            self.connection.execute("""
+                INSERT OR IGNORE INTO keeper_activity(
+                  run_id,occurred_at,kind,session_id,turn_id,call_id,content_json)
+                VALUES(?,?,?,?,?,?,?)
+            """, (run_id, utc_now(), kind, session_id, turn_id, call_id,
+                  json.dumps(content, ensure_ascii=False)))
+
+    def finish_keeper_interaction(self, run_id: str, status: str) -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE keeper_interactions SET status=?,completed_at=? WHERE run_id=?
+            """, (status, utc_now(), run_id))
+
+    def keeper_recent_context(self, count: int, byte_limit: int) -> list[dict[str, Any]]:
+        """Newest completed wakes that fit, projected without old Realm truth."""
+        if count <= 0 or byte_limit <= 0:
+            return []
+        rows = self.connection.execute("""
+            SELECT run_id,occurred_at,wake_source,wake_reason,wake_payload_json
+            FROM keeper_interactions WHERE status='completed'
+            ORDER BY completed_at DESC, rowid DESC LIMIT ?
+        """, (count,)).fetchall()
+        selected: list[dict[str, Any]] = []
+        used = 0
+        for row in rows:
+            activities = self.connection.execute("""
+                SELECT kind,content_json FROM keeper_activity WHERE run_id=? ORDER BY sequence
+            """, (row["run_id"],)).fetchall()
+            narrative = []
+            for item in activities:
+                data = json.loads(item["content_json"])
+                if item["kind"] == "model_turn" and data.get("message"):
+                    narrative.append({"kind": "keeper_output", "text": data["message"]})
+                elif item["kind"] == "tool_result":
+                    result = data.get("result") or {}
+                    # Never replay tool-returned Realm views or mutation bodies as facts.
+                    narrative.append({"kind": "action_outcome", "name": data.get("name"),
+                                      "ok": result.get("ok", "error" not in result),
+                                      "error_code": result.get("error_code"),
+                                      "outcome": result.get("outcome")})
+            entry = {"at": row["occurred_at"], "trigger": {
+                "source": row["wake_source"], "reason": row["wake_reason"],
+                "payload": json.loads(row["wake_payload_json"])}, "activity": narrative}
+            size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+            if size > byte_limit - used:
+                break
+            selected.append(entry)
+            used += size
+        return list(reversed(selected))
 
     def finish_run(self, run_id: str, status: str, duration: float, model_calls: int,
                    schedule_id: str | None = None,

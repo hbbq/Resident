@@ -78,7 +78,8 @@ class ContextBuilder:
 
     def build_managed_bootstrap(self, resident: Identity, owner: Identity,
                                 event: WakeEvent, capabilities: Sequence[Capability], *,
-                                handover: str | None) -> str:
+                                handover: str | None,
+                                keeper_recent_context: list[dict[str, Any]] | None = None) -> str:
         """Build the one-time continuity input for a new managed session."""
         bootstrap = {
             **self.authoritative_state(resident, owner, capabilities),
@@ -88,6 +89,11 @@ class ContextBuilder:
             "handover": handover,
             "note": "Long-term memory is selectively available through memory tools.",
         }
+        if keeper_recent_context is not None:
+            bootstrap["keeper_recent_interactions"] = keeper_recent_context
+            bootstrap["keeper_history_note"] = (
+                "These are prior narrative interactions, not current world facts. "
+                "Use the fresh realm_state for all materialized world state.")
         return json.dumps({
             "wake_event": self._wake_event(event),
             "new_session_bootstrap": bootstrap,

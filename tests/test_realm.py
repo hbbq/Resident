@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from resident.realm import RealmClient, RealmHTTPError
 from resident.config import Config
-from resident.domain import ModelTurn, ToolResult
+from resident.domain import ModelTurn, ToolCall, ToolResult
 from resident.instances import load_resident_definition
 from resident.provider import OpenAIAgentsProvider
 from resident.runtime import ResidentRuntime
@@ -88,7 +88,79 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             second_state = second_provider.contexts[0]["realm_state"]
             self.assertEqual(2, second_state["trusted_state"]["game"]["current_revision"])
             self.assertEqual(15, second_state["player_state"]["game"]["world_time_minutes"])
+            history = second_provider.contexts[0]["new_session_bootstrap"]["keeper_recent_interactions"]
+            self.assertEqual(1, len(history))
+            self.assertEqual("done", history[0]["activity"][0]["text"])
+            self.assertNotIn("realm_state", str(history))
+            self.assertNotIn("secret", str(history))
             second.close()
+
+    async def test_interaction_persists_exact_input_and_trusted_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = RecordingProvider()
+            runtime = ResidentRuntime(Config(Path(directory)), provider,
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            run_id = await runtime.process(runtime.owner_message_event("open the door"))
+            row = runtime.store.connection.execute(
+                "SELECT * FROM keeper_interactions WHERE run_id=?", (run_id,)).fetchone()
+            self.assertEqual("completed", row["status"])
+            self.assertEqual("new-session", row["session_id"])
+            self.assertEqual(1, row["realm_revision"])
+            self.assertEqual(provider.contexts[0], json.loads(row["input_text"]))
+            self.assertIn("secret", row["realm_snapshot_json"])
+            self.assertEqual(["model_turn"], [item[0] for item in
+                runtime.store.connection.execute(
+                    "SELECT kind FROM keeper_activity WHERE run_id=? ORDER BY sequence", (run_id,))])
+            runtime.close()
+
+    async def test_failed_interaction_is_not_replayed(self):
+        class FailingProvider(RecordingProvider):
+            async def respond(self, context, tools, results, continuation_id=None):
+                raise RuntimeError("unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ResidentRuntime(Config(Path(directory)), FailingProvider(),
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                await runtime.process(runtime.owner_message_event("look"))
+            row = runtime.store.connection.execute(
+                "SELECT status,input_text FROM keeper_interactions").fetchone()
+            self.assertEqual("failed", row["status"])
+            self.assertIsNotNone(row["input_text"])
+            self.assertEqual([], runtime.store.keeper_recent_context(8, 16384))
+            runtime.close()
+
+    async def test_tool_activity_is_ordered_and_rollover_omits_realm_views(self):
+        class ToolProvider(RecordingProvider):
+            async def respond(self, context, tools, results, continuation_id=None):
+                self.contexts.append(json.loads(context))
+                self.session_id = "session-with-tool"
+                if not results:
+                    return ModelTurn("first", tool_calls=(
+                        ToolCall("read-1", "realm_read", {}),))
+                return ModelTurn("final", message="A door remains mysterious")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ResidentRuntime(Config(Path(directory)), ToolProvider(),
+                                      capabilities=self.client.capabilities,
+                                      realm_client=self.client,
+                                      diagnostic_output=lambda _: None)
+            run_id = await runtime.process(runtime.owner_message_event("inspect"))
+            rows = runtime.store.connection.execute(
+                "SELECT kind,content_json FROM keeper_activity WHERE run_id=? ORDER BY sequence",
+                (run_id,)).fetchall()
+            self.assertEqual(["model_turn", "tool_result", "model_turn"],
+                             [row["kind"] for row in rows])
+            self.assertIn("secret", rows[1]["content_json"])
+            recent = runtime.store.keeper_recent_context(1, 16384)
+            self.assertIn("A door remains mysterious", str(recent))
+            self.assertNotIn("secret", str(recent))
+            self.assertEqual([], runtime.store.keeper_recent_context(1, 10))
+            runtime.close()
 
     async def test_mutations_bind_actor_revision_and_call_identity(self):
         from resident.capabilities import _INVOCATION_ID
