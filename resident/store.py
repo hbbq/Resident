@@ -1762,9 +1762,16 @@ class Store:
 
         for row in rows:
             activities = self.connection.execute("""
-                SELECT kind,content_json FROM keeper_activity WHERE run_id=? ORDER BY sequence
+                SELECT kind,turn_id,call_id,content_json FROM keeper_activity
+                WHERE run_id=? ORDER BY sequence
             """, (row["run_id"],)).fetchall()
             narrative = []
+            results = {}
+            for item in activities:
+                if item["kind"] == "tool_result" and item["turn_id"] and item["call_id"]:
+                    data = json.loads(item["content_json"])
+                    if isinstance(data, dict):
+                        results[(item["turn_id"], item["call_id"])] = data
             for item in activities:
                 data = json.loads(item["content_json"])
                 if item["kind"] == "model_turn":
@@ -1774,7 +1781,13 @@ class Store:
                         name, arguments = call.get("name"), call.get("arguments")
                         if not isinstance(arguments, dict):
                             continue
-                        if name == "send_owner_message" and isinstance(
+                        completion = results.get((item["turn_id"], call.get("id")))
+                        if not completion or completion.get("name") != name:
+                            continue
+                        result = completion.get("result")
+                        if not isinstance(result, dict) or result.get("ok") is not True:
+                            continue
+                        if name == "send_owner_message" and result.get("delivered") is True and isinstance(
                                 arguments.get("content"), str):
                             narrative.append({"kind": "player_facing_call", "name": name,
                                               "content": arguments["content"]})
@@ -1796,8 +1809,11 @@ class Store:
                 elif item["kind"] == "tool_result":
                     result = data.get("result") or {}
                     # Never replay tool-returned Realm views or mutation bodies as facts.
+                    ok = result.get("ok", "error" not in result)
+                    if data.get("name") == "send_owner_message":
+                        ok = ok and result.get("delivered") is True
                     narrative.append({"kind": "action_outcome", "name": data.get("name"),
-                                      "ok": result.get("ok", "error" not in result),
+                                      "ok": ok,
                                       "error_code": result.get("error_code"),
                                       "outcome": result.get("outcome")})
             entry = {"at": row["occurred_at"], "trigger": {

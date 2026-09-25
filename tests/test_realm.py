@@ -137,12 +137,18 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             store.start_keeper_interaction(run_id, event, "game", "hero")
             store.add_keeper_activity(run_id, "model_turn", {
                 "message": None, "tool_calls": [
-                    {"name": "send_owner_message", "arguments": {"content": "The door opens."}},
-                    {"name": "realm_world_patch", "arguments": {"entities": [
+                    {"id": "message", "name": "send_owner_message", "arguments": {"content": "The door opens."}},
+                    {"id": "patch", "name": "realm_world_patch", "arguments": {"entities": [
                         {"name": "secret", "description": "trusted secret",
                          "player": {"description": "A dark doorway."}}],
                         "facts": [{"text": "hidden fact"}]}},
-                ]})
+                ]}, turn_id="turn")
+            for call_id, name, result in (
+                    ("message", "send_owner_message", {"ok": True, "delivered": True}),
+                    ("patch", "realm_world_patch", {"ok": True, "mutation": {"revision": 2}})):
+                store.add_keeper_activity(run_id, "tool_result", {
+                    "call_id": call_id, "name": name, "result": result,
+                }, turn_id="turn", call_id=call_id)
             store.finish_keeper_interaction(run_id, "completed")
             entry = store.keeper_recent_context(1, 16384)
             self.assertEqual("The door opens.", entry[0]["activity"][0]["content"])
@@ -167,16 +173,21 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
             store.start_keeper_interaction(run_id, event, "game", "hero")
             store.add_keeper_activity(run_id, "model_turn", {
                 "message": None, "tool_calls": [
-                    {"name": "realm_world_patch", "arguments": {
+                    {"id": "patch-1", "name": "realm_world_patch", "arguments": {
                         "entities": None, "entity_updates": [
                             {"player": {"description": "A doorway appears."}}]}},
-                    {"name": "realm_world_patch", "arguments": {
+                    {"id": "patch-2", "name": "realm_world_patch", "arguments": {
                         "entities": {"player": {"description": "not a list"}},
                         "entity_updates": {"player": {"description": "also not a list"}}}},
-                    {"name": "realm_world_patch", "arguments": {
+                    {"id": "patch-3", "name": "realm_world_patch", "arguments": {
                         "entities": [None, {"player": {"name": "The doorway"}}],
                         "entity_updates": None}},
-                ]})
+                ]}, turn_id="turn")
+            for call_id in ("patch-1", "patch-2", "patch-3"):
+                store.add_keeper_activity(run_id, "tool_result", {
+                    "call_id": call_id, "name": "realm_world_patch",
+                    "result": {"ok": True, "mutation": {"revision": 2}},
+                }, turn_id="turn", call_id=call_id)
             store.finish_keeper_interaction(run_id, "completed")
             store.close()
 
@@ -193,10 +204,66 @@ class RealmClientTests(unittest.IsolatedAsyncioTestCase):
                      "player_views": [{"description": "A doorway appears."}]},
                     {"kind": "player_facing_call", "name": "realm_world_patch",
                      "player_views": [{"name": "The doorway"}]},
+                    {"kind": "action_outcome", "name": "realm_world_patch",
+                     "ok": True, "error_code": None, "outcome": None},
+                    {"kind": "action_outcome", "name": "realm_world_patch",
+                     "ok": True, "error_code": None, "outcome": None},
+                    {"kind": "action_outcome", "name": "realm_world_patch",
+                     "ok": True, "error_code": None, "outcome": None},
                 ], history[0]["activity"])
                 self.assertNotIn("not a list", str(history))
             finally:
                 runtime.close()
+
+    async def test_rollover_only_projects_confirmed_player_facing_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "resident.sqlite3")
+            event = WakeEvent("wake", "owner", "play", "2026-01-01T00:00:00Z", {})
+            run_id = store.start_run(event)
+            store.start_keeper_interaction(run_id, event, "game", "hero")
+            calls = [
+                {"id": "rejected-patch", "name": "realm_world_patch", "arguments": {
+                    "entities": [{"player": {"description": "A rejected doorway."}}]}},
+                {"id": "unknown-patch", "name": "realm_world_patch", "arguments": {
+                    "entities": [{"player": {"description": "An uncertain doorway."}}]}},
+                {"id": "undelivered", "name": "send_owner_message", "arguments": {
+                    "content": "An undelivered message."}},
+                {"id": "missing-result", "name": "send_owner_message", "arguments": {
+                    "content": "An unconfirmed message."}},
+                {"id": "accepted-patch", "name": "realm_world_patch", "arguments": {
+                    "entities": [{"player": {"description": "An accepted doorway."}}]}},
+                {"id": "delivered", "name": "send_owner_message", "arguments": {
+                    "content": "A delivered message."}},
+            ]
+            store.add_keeper_activity(run_id, "model_turn", {
+                "message": None, "tool_calls": calls,
+            }, turn_id="turn")
+            for call_id, name, result in (
+                    ("rejected-patch", "realm_world_patch",
+                     {"ok": False, "error_code": "rejected"}),
+                    ("unknown-patch", "realm_world_patch",
+                     {"ok": False, "error_code": "unknown_outcome", "outcome": "unknown"}),
+                    ("undelivered", "send_owner_message", {"ok": True, "delivered": False}),
+                    ("accepted-patch", "realm_world_patch", {"ok": True}),
+                    ("delivered", "send_owner_message", {"ok": True, "delivered": True})):
+                store.add_keeper_activity(run_id, "tool_result", {
+                    "call_id": call_id, "name": name, "result": result,
+                }, turn_id="turn", call_id=call_id)
+            store.finish_keeper_interaction(run_id, "completed")
+            activity = store.keeper_recent_context(1, 16384)[0]["activity"]
+            self.assertEqual([
+                {"kind": "player_facing_call", "name": "realm_world_patch",
+                 "player_views": [{"description": "An accepted doorway."}]},
+                {"kind": "player_facing_call", "name": "send_owner_message",
+                 "content": "A delivered message."},
+            ], [item for item in activity if item["kind"] == "player_facing_call"])
+            self.assertEqual([False, False, False, True, True], [
+                item["ok"] for item in activity if item["kind"] == "action_outcome"])
+            self.assertNotIn("rejected doorway", str(activity))
+            self.assertNotIn("uncertain doorway", str(activity))
+            self.assertNotIn("undelivered message", str(activity))
+            self.assertNotIn("unconfirmed message", str(activity))
+            store.close()
 
     async def test_failed_interaction_is_not_replayed(self):
         class FailingProvider(RecordingProvider):
