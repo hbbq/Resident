@@ -15,7 +15,7 @@ from .store import utc_now
 
 
 class HomeOpsConnector:
-    """A small, read-only adapter for the HomeOps measurements API."""
+    """A small, read-only adapter for HomeOps measurements and forecasts."""
 
     readiness_items = (ReadinessItem("homeops", "HomeOps"),)
 
@@ -33,7 +33,7 @@ class HomeOpsConnector:
 
     @property
     def capabilities(self) -> list[Capability]:
-        description = "Read-only access to current and historical HomeOps measurements"
+        description = "Read-only access to HomeOps measurements and weather forecasts"
         return [
             Capability(
                 connector_id="homeops", connector_description=description,
@@ -59,6 +59,14 @@ class HomeOpsConnector:
                 },
                 handler=self.get_measurement_history,
             ),
+            Capability(
+                connector_id="homeops", connector_description=description,
+                name="homeops_get_weather_forecast",
+                description=("Get the forward-looking HomeOps weather forecast on demand. "
+                             "Check its freshness and stale metadata before relying on its periods."),
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=self.get_weather_forecast,
+            ),
         ]
 
     def _get_json(self, path: str, query: dict[str, Any] | None = None) -> Any:
@@ -70,8 +78,9 @@ class HomeOpsConnector:
             return json.load(response)
 
     async def _request(self, path: str, query: dict[str, Any] | None = None) -> Any:
-        operation = ("latest_measurements" if path == "/api/measurements/latest"
-                     else "measurement_history")
+        operation = ("weather_forecast" if path == "/api/forecast" else
+                     "latest_measurements" if path == "/api/measurements/latest" else
+                     "measurement_history")
         return await to_thread_timed(
             "homeops.request", self._get_json, path, query,
             request=operation, request_timeout_seconds=self.request_timeout_seconds)
@@ -97,6 +106,17 @@ class HomeOpsConnector:
         path = f"/api/measurement-points/{quote(point_id, safe='')}/history"
         measurements = self._measurement_list(await self._request(path, query))
         return {"measurements": measurements}
+
+    async def get_weather_forecast(self, _: dict[str, Any]) -> dict[str, Any]:
+        try:
+            forecast = await self._request("/api/forecast")
+        except Exception as exc:
+            raise ValueError("HomeOps weather forecast is unavailable") from exc
+        if (not isinstance(forecast, dict) or
+                not isinstance(forecast.get("periods"), list) or
+                not all(isinstance(period, dict) for period in forecast["periods"])):
+            raise ValueError("HomeOps weather forecast response is invalid")
+        return forecast
 
     @staticmethod
     def _index(measurements: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

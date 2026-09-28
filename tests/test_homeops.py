@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from resident.__main__ import TerminalDiagnostics
+from resident.__main__ import _select_capabilities
 from resident.config import Config
 from resident.domain import ModelTurn
 from resident.homeops import HomeOpsConnector
@@ -117,6 +118,60 @@ class HomeOpsConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(("/api/measurement-points/a%2Fb/history", {
             "from": "start", "to": "end", "limit": 5,
         }), connector.requests[1])
+
+    async def test_forecast_preserves_metadata_periods_and_stale_state(self):
+        forecast = {
+            "source": "SMHI", "issuedAt": "2026-09-28T09:00:00Z",
+            "isStale": True, "freshness": {"ageSeconds": 3600},
+            "periods": [{"from": "2026-09-29T00:00:00Z", "temperature": 10},
+                        {"from": "2026-09-29T06:00:00Z", "temperature": 12}],
+        }
+        connector = FakeHomeOpsConnector([forecast])
+
+        self.assertIs(forecast, await connector.get_weather_forecast({}))
+        self.assertEqual([("/api/forecast", None)], connector.requests)
+        self.assertIsNone(connector._snapshot)
+
+    async def test_forecast_failure_does_not_affect_measurements(self):
+        latest = [measurement("1", 20, "now")]
+        connector = FakeHomeOpsConnector([RuntimeError("private upstream detail"), latest])
+
+        with self.assertRaisesRegex(ValueError, "forecast is unavailable") as error:
+            await connector.get_weather_forecast({})
+        self.assertNotIn("private upstream detail", str(error.exception))
+        self.assertEqual({"measurements": latest},
+                         await connector.get_current_measurements({}))
+        self.assertEqual([("/api/forecast", None),
+                          ("/api/measurements/latest", None)], connector.requests)
+
+    async def test_forecast_rejects_invalid_envelope(self):
+        connector = FakeHomeOpsConnector([[], {"periods": "tomorrow"},
+                                          {"periods": [None]}])
+        for _ in range(3):
+            with self.assertRaisesRegex(ValueError, "forecast response is invalid"):
+                await connector.get_weather_forecast({})
+
+    async def test_forecast_has_individual_and_connector_grants(self):
+        connector = HomeOpsConnector("http://homeops.test")
+        names = [capability.name for capability in connector.capabilities]
+        self.assertIn("homeops_get_weather_forecast", names)
+        self.assertEqual(names, [capability.name for capability in
+                                 _select_capabilities(("homeops",), connector.capabilities)])
+        self.assertEqual(["homeops_get_weather_forecast"], [capability.name for capability in
+                         _select_capabilities(("homeops_get_weather_forecast",),
+                                              connector.capabilities)])
+
+    async def test_forecast_request_has_distinct_timeline_label(self):
+        connector = HomeOpsConnector("http://homeops.test")
+        events = []
+        token = timeline_reporter.set(events.append)
+        try:
+            with patch.object(connector, "_get_json", return_value={"periods": []}):
+                await connector.get_weather_forecast({})
+        finally:
+            timeline_reporter.reset(token)
+        finished = next(event for event in events if event["moment"] == "finished")
+        self.assertEqual("weather_forecast", finished["request"])
 
     async def test_run_reports_failure_without_waking_and_stops(self):
         diagnostics = []
