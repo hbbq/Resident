@@ -39,7 +39,7 @@ EVENT_SETUP = {
     "agentcontroller": "Set RESIDENT_AGENTCONTROLLER_SNAPSHOT_PATH; changes follow the first valid snapshot baseline.",
     "camera": "Configure RESIDENT_CAMERAS. cameras_changed requires an explicit camera-set replacement; onvif_property_changed additionally requires per-camera onvif settings and a working ONVIF Event Service.",
     "homeops": "Set RESIDENT_HOMEOPS_URL; changes follow the initial measurements baseline.",
-    "messaging": "Use a multi-Resident host and grant the sender messaging or messaging_send; the recipient subscribes to mailbox delivery.",
+    "messaging": "Use a multi-Resident host and grant the sender messaging; the recipient subscribes to mailbox delivery.",
 }
 
 
@@ -59,25 +59,79 @@ def _keyword(call: ast.Call, key: str) -> ast.AST | None:
     return next((item.value for item in call.keywords if item.arg == key), None)
 
 
+def _matches(node: ast.AST | None, expression: str) -> bool:
+    return node is not None and ast.dump(node) == ast.dump(ast.parse(expression, mode="eval").body)
+
+
+def _dynamic_family(file: Path, call: ast.Call, connector: ast.AST | None,
+                    name: ast.AST | None, parents: dict[ast.AST, ast.AST]) -> str:
+    patterns = {
+        "display.py": ("'display'", "f'{display_id}_show_text'", "display"),
+        "external_app.py": ("self.definition.id", "operation.name", "external_application"),
+        "realm.py": ("'realm'", "name", "realm"),
+    }
+    expected = patterns.get(file.name)
+    if expected is None or not (_matches(connector, expected[0]) and
+                                _matches(name, expected[1])):
+        raise ValueError(f"Uncataloged dynamic capability in {file.name}:{call.lineno}")
+    family = expected[2]
+    if family in {"realm", "external_application"}:
+        parent = parents.get(call)
+        if not isinstance(parent, ast.ListComp) or len(parent.generators) != 1:
+            raise ValueError(f"Uncataloged dynamic capability in {file.name}:{call.lineno}")
+        generator = parent.generators[0]
+        target = "(name, description, schema, route)" if family == "realm" else "operation"
+        source = "specs" if family == "realm" else "self.definition.operations"
+        if not (ast.unparse(generator.target) == target and _matches(generator.iter, source)
+                and not generator.ifs):
+            raise ValueError(f"Uncataloged dynamic capability in {file.name}:{call.lineno}")
+    return family
+
+
+def _realm_specs(tree: ast.Module) -> set[str]:
+    specs = [node.value for node in ast.walk(tree)
+             if isinstance(node, ast.Assign) and
+             any(isinstance(target, ast.Name) and target.id == "specs"
+                 for target in node.targets)]
+    if len(specs) != 1 or not isinstance(specs[0], ast.List) or not specs[0].elts:
+        raise ValueError("Realm capability specs must be one literal list")
+    names: list[str] = []
+    for item in specs[0].elts:
+        if not isinstance(item, ast.Tuple) or len(item.elts) != 4:
+            raise ValueError("Realm capability specs must contain four-field tuples")
+        name = _literal(item.elts[0])
+        if not name:
+            raise ValueError("Realm capability names must be string literals")
+        names.append(name)
+    if len(names) != len(set(names)):
+        raise ValueError("Duplicate Realm capability names")
+    return set(names)
+
+
 def _inventory() -> tuple[dict[str, set[str]], set[str], set[str], set[str]]:
     tools: dict[str, set[str]] = {}
     outputs: set[str] = set()
     core: set[str] = set()
     emitted: set[str] = set()
+    dynamic: dict[str, int] = {"display": 0, "external_application": 0, "realm": 0}
     files = tuple((ROOT / "resident").glob("*.py"))
     for file in files:
         tree = _tree(file.name)
+        parents = {child: parent for parent in ast.walk(tree)
+                   for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
                 continue
             if node.func.id == "Capability":
-                connector = _literal(_keyword(node, "connector_id") or node.args[0]) if (node.args or _keyword(node, "connector_id")) else None
+                connector_node = _keyword(node, "connector_id") or (node.args[0] if node.args else None)
+                connector = _literal(connector_node) if connector_node is not None else None
                 name_node = _keyword(node, "name") or (node.args[2] if len(node.args) > 2 else None)
                 name = _literal(name_node) if name_node is not None else None
                 if connector and name:
                     tools.setdefault(connector, set()).add(name)
-                elif file.name not in {"display.py", "external_app.py", "realm.py"}:
-                    raise ValueError(f"Uncataloged dynamic capability in {file.name}:{node.lineno}")
+                else:
+                    family = _dynamic_family(file, node, connector_node, name_node, parents)
+                    dynamic[family] += 1
             elif node.func.id == "OutputCapability":
                 output = _keyword(node, "output_type")
                 name = _literal(output) if output else None
@@ -97,16 +151,9 @@ def _inventory() -> tuple[dict[str, set[str]], set[str], set[str], set[str]]:
                     if reason is None:
                         raise ValueError(f"Uncataloged event reason in {file.name}:{node.lineno}")
                     emitted.add(f"{source}.{reason}")
-    # Realm builds capabilities from its local specs table, not one call per tool.
-    realm_tree = _tree("realm.py")
-    for node in ast.walk(realm_tree):
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "specs" for t in node.targets):
-            if isinstance(node.value, ast.List):
-                for item in node.value.elts:
-                    if isinstance(item, ast.Tuple) and item.elts:
-                        name = _literal(item.elts[0])
-                        if name:
-                            tools.setdefault("realm", set()).add(name)
+    if dynamic != {"display": 1, "external_application": 1, "realm": 1}:
+        raise ValueError(f"Dynamic capability family inventory mismatch: {dynamic}")
+    tools.setdefault("realm", set()).update(_realm_specs(_tree("realm.py")))
     # These are parameterized by a Resident definition or startup configuration.
     tools.setdefault("display", set()).add("<display-id>_show_text")
     tools.setdefault("external_application", set()).add("<provider-id>_<operation-name>")

@@ -58,9 +58,9 @@ Selectors in a Resident definition observe events; they never grant tools. `*` s
 | `camera.cameras_changed` | Configure RESIDENT_CAMERAS. cameras_changed requires an explicit camera-set replacement; onvif_property_changed additionally requires per-camera onvif settings and a working ONVIF Event Service. |
 | `camera.onvif_property_changed` | Configure RESIDENT_CAMERAS. cameras_changed requires an explicit camera-set replacement; onvif_property_changed additionally requires per-camera onvif settings and a working ONVIF Event Service. |
 | `homeops.measurement_changed` | Set RESIDENT_HOMEOPS_URL; changes follow the initial measurements baseline. |
-| `messaging.message_received` | Use a multi-Resident host and grant the sender messaging or messaging_send; the recipient subscribes to mailbox delivery. |
+| `messaging.message_received` | Use a multi-Resident host and grant the sender messaging; the recipient subscribes to mailbox delivery. |
 | `agentcontroller` | All accepted `agentcontroller.*` events; Set RESIDENT_AGENTCONTROLLER_SNAPSHOT_PATH; changes follow the first valid snapshot baseline. |
 | `camera` | All accepted `camera.*` events; Configure RESIDENT_CAMERAS. cameras_changed requires an explicit camera-set replacement; onvif_property_changed additionally requires per-camera onvif settings and a working ONVIF Event Service. |
 | `homeops` | All accepted `homeops.*` events; Set RESIDENT_HOMEOPS_URL; changes follow the initial measurements baseline. |
-| `messaging` | All accepted `messaging.*` events; Use a multi-Resident host and grant the sender messaging or messaging_send; the recipient subscribes to mailbox delivery. |
+| `messaging` | All accepted `messaging.*` events; Use a multi-Resident host and grant the sender messaging; the recipient subscribes to mailbox delivery. |
 | `*` | All accepted external events above; configure the corresponding producers to receive them. |
