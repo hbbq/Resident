@@ -104,6 +104,10 @@ class CuratorCoordinator:
                           if curator else None)
             request = (self.runtime.store.curator_request("openai_agents", session_id)
                        if session_id else None)
+            if (session_id and self.runtime._forced_abandonment(session_id)):
+                self._signal.clear()
+                await self._signal.wait()
+                continue
             if request is None:
                 self._signal.clear()
                 await self._signal.wait()
@@ -320,6 +324,14 @@ class ResidentRuntime:
     def bind_curator(self, curator: MemoryCurator) -> None:
         self.curator = curator
 
+    def _forced_abandonment(self, session_id: str | None = None) -> dict | None:
+        request = self.store.forced_session_abandonment("openai_agents")
+        if request is None:
+            return None
+        if session_id is not None and request["old_session_id"] != session_id:
+            return None
+        return request
+
     async def _reconcile_startup_curator(self) -> None:
         """Reach the durable completed-turn boundary before admitting wakes."""
         curator = self.curator
@@ -328,6 +340,8 @@ class ResidentRuntime:
         provider = "openai_agents"
         session_id = getattr(getattr(curator, "source", None), "session_id", None)
         if not session_id:
+            return
+        if self._forced_abandonment(session_id):
             return
 
         request = self.store.curator_request(provider, session_id)
@@ -729,6 +743,8 @@ class ResidentRuntime:
         if binding is None or not binding.get("last_turn_id"):
             return False
         session_id, turn_id = binding["session_id"], binding["last_turn_id"]
+        if self._forced_abandonment(session_id):
+            return False
         protocol = self.store.session_protocol("openai_agents", session_id)
         if not protocol or not protocol.get("output_schema_fingerprint"):
             return False
@@ -896,11 +912,16 @@ class ResidentRuntime:
             configured_capabilities = (
                 capability_event_state[0] if capability_event_state else self._capabilities)
             preflight_session = getattr(self.provider, "preflight_session", None)
+            forced = self._forced_abandonment(getattr(self.provider, "session_id", None))
             emit_timeline("provider.preflight", "started")
             preflight_started = time.monotonic()
             try:
-                unavailable_reason = (
-                    await preflight_session() if preflight_session is not None else None)
+                if forced is not None:
+                    self.provider.abandon_bound_session(forced["old_session_id"])
+                    unavailable_reason = "operator_forced"
+                else:
+                    unavailable_reason = (
+                        await preflight_session() if preflight_session is not None else None)
             finally:
                 emit_timeline("provider.preflight", "finished",
                               duration_seconds=time.monotonic() - preflight_started)
@@ -974,12 +995,13 @@ class ResidentRuntime:
                     self.store.request_session_rollover(
                         "openai_agents", old_session_id, rollover_reason)
                 pending_handover = self.store.pending_handover(old_session_id) if (
-                    old_session_id and pending_rollover is not None) else None
-                if pending_rollover is not None and pending_handover is not None:
+                    old_session_id and (pending_rollover is not None or forced is not None)) else None
+                if pending_handover is not None:
                     # This handover is already final for a durable create snapshot.
                     handover = pending_handover["content"]
                     handover_id = pending_handover["id"]
-                elif self.curator is not None and unavailable_reason != "remote_session_missing":
+                elif (self.curator is not None and unavailable_reason not in {
+                        "remote_session_missing", "operator_forced"}):
                     try:
                         handover = await self._curator_coordinator.barrier(final=True)
                     except SessionHistoryUnavailable as exc:
@@ -1105,6 +1127,7 @@ class ResidentRuntime:
                         and getattr(self.provider, "session_id", None) != response_session_id):
                     self.store.clear_session_rollover_request(
                         "openai_agents", response_session_id)
+                    self._curator_coordinator.signal()
                 self._emit("model.responded", {
                     "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
