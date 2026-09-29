@@ -126,6 +126,38 @@ Before the sleeping prompt, normal output includes one concise readiness line fo
 
 Agent identity precedence is explicit: `RESIDENT_OPENAI_AGENT_ID` selects a saved reusable Agent. Adopting a different saved Agent, changing immutable instructions, or adding/renaming/changing a function contract causes an intentional, audited rollover; a local tool revocation keeps a compatibility handler for the old contract. Model, `--reasoning-effort`, and `--service-tier` changes are patched on an idle existing session and their last successfully applied values are stored separately from the immutable protocol descriptor. An in-place edit of a saved Agent does not silently replace its existing session snapshot. Missing/expired remote sessions and `--new-chapter` are recorded rollover reasons. Resident state and identity survive every rollover. The exact replacement create request is persisted before POST and a successful replacement is bound transactionally. The current Agents contract exposes neither create idempotency nor lookup by Resident's rollover token; if Resident stops after an attempt may have reached the service but before the returned session ID is durable, restart reports that explicit uncertain state and does not risk creating another replacement automatically.
 
+### Recover a stuck managed session
+
+Stop the affected Resident process before editing its database. Use the affected instance's `DATA_DIR/instances/<id>/resident.sqlite3` (or its configured singleton database), and back it up with `sqlite3 <database> ".backup '<backup-path>'"`. Open that database with `sqlite3`, then inspect the current binding and unresolved work:
+
+```sql
+SELECT provider,session_id,last_turn_id FROM agent_session_bindings
+WHERE provider='openai_agents';
+SELECT * FROM session_rollover_requests WHERE provider='openai_agents';
+SELECT id,old_session_id,reason,creation_state,status FROM session_rollovers
+WHERE provider='openai_agents' AND status='pending';
+```
+
+Proceed only when the binding is the exact session to abandon and both other queries return no rows. Substitute that exact session ID for `EXPECTED_OLD_SESSION_ID` below. Run this transaction while Resident remains stopped:
+
+```sql
+BEGIN IMMEDIATE;
+INSERT INTO session_rollover_requests
+  (provider,old_session_id,reason,requested_by,created_at,updated_at)
+SELECT 'openai_agents',session_id,'operator_forced','operator',
+       strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')
+FROM agent_session_bindings AS binding
+WHERE binding.provider='openai_agents'
+  AND binding.session_id='EXPECTED_OLD_SESSION_ID'
+  AND NOT EXISTS (SELECT 1 FROM session_rollover_requests
+                  WHERE provider='openai_agents')
+  AND NOT EXISTS (SELECT 1 FROM session_rollovers
+                  WHERE provider='openai_agents' AND status='pending');
+SELECT changes();
+```
+
+Commit only if `changes()` returns `1`; otherwise `ROLLBACK` and investigate the binding or pending work. Restart Resident. The marker leaves the old binding intact and creates no remote session until the next real wake. That wake skips remote reads and final Curator catch-up for the abandoned session, bootstraps from durable local identity, guidance, intentions, memory and any already stored handover, then creates a replacement through normal rollover bookkeeping. Verify the new `agent_session_bindings.session_id` and a completed `session_rollovers` row with the expected old and new IDs, `reason='operator_forced'`, and `finalization_status='operator_forced'`. Pending Curator work for the old session remains recorded; recent remote history that was never curated is unavailable. If replacement creation becomes `create_uncertain`, reconcile it before any further attempt; do not insert another marker or clear the binding.
+
 Long-term memory is curated independently of the Resident model. Set `RESIDENT_CURATOR_MODEL` (and optionally `RESIDENT_CURATOR_API_KEY` / `RESIDENT_CURATOR_BASE_URL`) to enable startup catch-up and bounded incremental consolidation. Completed wakes durably coalesce exact turn watermarks for a per-Resident background Curator, so routine curation does not delay the next wake. Long-term-memory tool reads are therefore eventually consistent and can lag recent wakes; the managed Agents session remains the immediate episodic context. Startup and reachable session rollover retain awaited catch-up barriers, and shutdown gives active curation a bounded drain before leaving durable work for restart recovery. The Curator checkpoints session-item progress transactionally, never advances beyond the requested completed-turn boundary, and retries failures with capped exponential backoff and degraded-health journal events. Every durable memory revision requires source references verified against the fetched session page. The Resident receives bounded `search_long_term_memory` and `get_long_term_memory` tools instead of the whole store on every wake. A replacement session gets a compact memory index and a transient handover when available. Explicit lasting Owner instructions use `set_owner_guidance` / `remove_owner_guidance`; their revision history is retained while the active set has deterministic entry, count, and serialized-size bounds. New sessions receive that active set in bootstrap; existing sessions receive durable, versioned additions, revisions, and removals only when it changes. Curator input remains an explicit field projection: tool arguments/results, encrypted reasoning, attachment payloads, and unknown structured fields are excluded. Text in that projection and all Curator output are deterministically scrubbed of recognizable credential-bearing structures (including authorization values, password-bearing URLs, private-key blocks, credential assignments, and common service tokens) before crossing or being persisted. This is an enforceable structural boundary, not a claim that arbitrary natural language can be perfectly classified as secret or non-secret.
 
 ## Optional Telegram Owner transport

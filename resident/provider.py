@@ -385,6 +385,13 @@ class OpenAIAgentsProvider:
             raise ValueError("Session rollover reason must be nonempty")
         self._requested_rollover_reason = reason.strip()
 
+    def abandon_bound_session(self, session_id: str) -> None:
+        """Apply a store-validated operator marker without contacting the old session."""
+        if self._session_id != session_id:
+            raise RuntimeError("Forced abandonment does not match the bound session")
+        self._requested_rollover_reason = "operator_forced"
+        self._mark_session_unavailable(session_id, "operator_forced")
+
     @property
     def rollover_ready(self) -> bool:
         """Whether the most recent preflight found the old session idle."""
@@ -1138,7 +1145,8 @@ class OpenAIAgentsProvider:
                           self._unavailable_session_reason or "remote_session_missing")
                 result = self._intentional_rollover(
                     reason, agent, desired_protocol, initial_input, allow_create,
-                    finalization_status="unavailable")
+                    finalization_status=("operator_forced" if reason == "operator_forced"
+                                         else "unavailable"))
                 if (pending is not None and requested_reason is not None
                         and requested_reason != reason):
                     self._requested_rollover_reason = requested_reason

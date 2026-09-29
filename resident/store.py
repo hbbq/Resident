@@ -810,11 +810,32 @@ class Store:
                 ON CONFLICT(provider) DO UPDATE SET
                   old_session_id=excluded.old_session_id,reason=excluded.reason,
                   requested_by=excluded.requested_by,updated_at=excluded.updated_at
+                WHERE NOT (
+                  session_rollover_requests.old_session_id=excluded.old_session_id
+                  AND session_rollover_requests.reason='operator_forced'
+                  AND session_rollover_requests.requested_by='operator')
             """, (provider, old_session_id, reason, requested_by, now, now))
 
     def pending_session_rollover_request(self, provider: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT * FROM session_rollover_requests WHERE provider=?", (provider,)).fetchone()
+        return None if row is None else dict(row)
+
+    def forced_session_abandonment(self, provider: str) -> dict[str, Any] | None:
+        """Return an operator marker only for the current, unclaimed binding."""
+        row = self.connection.execute("""
+            SELECT request.* FROM session_rollover_requests AS request
+            JOIN agent_session_bindings AS binding
+              ON binding.provider=request.provider
+             AND binding.session_id=request.old_session_id
+            WHERE request.provider=? AND request.reason='operator_forced'
+              AND request.requested_by='operator'
+              AND NOT EXISTS (
+                SELECT 1 FROM session_rollovers AS rollover
+                WHERE rollover.provider=request.provider AND rollover.status='pending'
+                  AND (rollover.old_session_id IS NOT request.old_session_id
+                       OR rollover.reason!='operator_forced'))
+        """, (provider,)).fetchone()
         return None if row is None else dict(row)
 
     def clear_session_rollover_request(self, provider: str,
