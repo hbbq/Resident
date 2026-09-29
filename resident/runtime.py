@@ -996,7 +996,7 @@ class ResidentRuntime:
                         "openai_agents", old_session_id, rollover_reason)
                 pending_handover = self.store.pending_handover(old_session_id) if (
                     old_session_id and (pending_rollover is not None or forced is not None)) else None
-                if pending_rollover is not None and pending_handover is not None:
+                if pending_handover is not None:
                     # This handover is already final for a durable create snapshot.
                     handover = pending_handover["content"]
                     handover_id = pending_handover["id"]

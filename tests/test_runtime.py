@@ -3748,6 +3748,60 @@ class OpenAIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "openai_agents", "session-stuck"))
             runtime.close()
 
+    async def test_operator_forced_abandonment_uses_saved_handover_without_pending_rollover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "resident.sqlite3"
+            store = Store(database)
+            store.save_agent_session_binding(
+                "openai_agents", "session-stuck", None, "turn-old")
+            handover_id = store.create_handover(
+                "session-stuck", "durable old-session handover",
+                (datetime.now(UTC) + timedelta(hours=1)).isoformat())
+            store.request_session_rollover(
+                "openai_agents", "session-stuck", "operator_forced", "operator")
+            self.assertIsNone(store.pending_session_rollover("openai_agents"))
+            store.close()
+            store = Store(database)
+            creates = []
+            provider = OpenAIAgentsProvider("test-key", "model", poll_seconds=0)
+
+            def fake_request(method, path, body=None, **_):
+                if "session-stuck" in path:
+                    raise AssertionError("abandoned session was read")
+                if method == "POST" and path == "/agents/sessions":
+                    creates.append(body)
+                    return {"id": "session-new", "status": "idle"}
+                raise AssertionError((method, path, body))
+
+            provider._request = fake_request
+            provider._wait_for_submitted_wake = lambda *_: ModelTurn(
+                "turn-new", "replacement ready")
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider, store=store, capabilities=[],
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            class UnreadableCurator:
+                source = type("Source", (), {"session_id": "session-stuck"})()
+
+                async def catch_up(self, **_):
+                    raise AssertionError("abandoned history was read")
+
+            runtime.bind_curator(UnreadableCurator())
+            await runtime.process(WakeEvent(
+                "wake-recovery", "scheduler", "due", utc_now(), {}))
+
+            self.assertEqual(1, len(creates))
+            self.assertEqual(
+                "durable old-session handover",
+                json.loads(creates[0]["input"])["new_session_bootstrap"]["handover"])
+            saved = store.connection.execute(
+                "SELECT new_session_id,consumed_at FROM session_handovers WHERE id=?",
+                (handover_id,)).fetchone()
+            self.assertEqual("session-new", saved["new_session_id"])
+            self.assertIsNotNone(saved["consumed_at"])
+            self.assertIsNone(store.pending_session_rollover_request("openai_agents"))
+            runtime.close()
+
     def test_operator_marker_cannot_replace_uncertain_create(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
