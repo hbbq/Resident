@@ -12,6 +12,8 @@ The first experimental vertical slice is a Python 3.12+ asynchronous process wit
 
 ### Declarative Resident instances
 
+See [CAPABILITIES.md](CAPABILITIES.md) for the generated catalog of available tools, outputs, subscription selectors, and their setup requirements. It describes platform choices across configurations rather than the grants in any one Resident definition. Regenerate it with `python -m resident.catalog` and check for drift with `python -m resident.catalog --check`; the offline unittest suite also checks it.
+
 The runtime can host multiple independently configured Residents from startup-time YAML definitions. Pass `--residents-dir residents` (or set `RESIDENTS_DIR`); prompt references are resolved below `--prompt-root`, which defaults to the sibling `prompts` directory. Each stable definition ID receives its own database at `DATA_DIR/instances/<id>/resident.sqlite3`, including its durable identity, journal, schedules, tool actions, and Agents session binding. Editing its name, personality, role, or policy does not create a new identity. Shared connector events are polled once and fanned out only to matching `subscriptions`; tools are separately selected by `capabilities`, so observation never grants action authority.
 
 A minimal Dungeon Master can be introduced without Python changes:
