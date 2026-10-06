@@ -34,7 +34,6 @@ subscriptions:
   - agentcontroller
   - homeops
   - messaging
-  - camera
 
 owner_transport:
   type: telegram
