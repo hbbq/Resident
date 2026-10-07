@@ -31,6 +31,8 @@ outputs:
   - display/display1
 
 subscriptions:
+  - agentcontroller
+  - homeops
   - messaging
 
 owner_transport:
