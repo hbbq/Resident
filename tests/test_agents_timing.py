@@ -6,13 +6,15 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.httpx_support import ResponseMixin
+
 from resident.observability import timeline_reporter
 from resident.provider import (
     OpenAIAgentsProvider, _agents_http_trace, _agents_stream_timing,
 )
 
 
-class StreamResponse:
+class StreamResponse(ResponseMixin):
     def __init__(self, entries, clock, *, trailing=False):
         self.clock = clock
         self.lines = iter([
@@ -49,7 +51,7 @@ def trace_stream(entries, *, enabled=True, trailing=False):
     reporter_token = timeline_reporter.set((lambda _: None) if enabled else None)
     try:
         with patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), patch(
-                "resident.provider.urllib.request.urlopen", return_value=response):
+                "resident.provider.httpx.Client.send", return_value=response):
             yield provider, trace, response
     finally:
         timeline_reporter.reset(reporter_token)

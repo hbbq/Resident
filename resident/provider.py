@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sys
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Protocol, Sequence
+
+import httpx
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
 from .memory import SessionHistoryUnavailable, SessionItemPage
@@ -228,6 +231,14 @@ class OpenAIAgentsProvider:
         self.reasoning_effort, self.service_tier = reasoning_effort, service_tier
         self.poll_seconds = poll_seconds
         self.timeout_seconds = timeout_seconds
+        # SSE occupies one connection while input submissions use another.
+        self._client = httpx.Client(
+            http1=True, http2=False, follow_redirects=True,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
+            timeout=timeout_seconds,
+            headers={"Accept-Encoding": "identity",
+                     "User-Agent": f"Python-urllib/{sys.version_info.major}.{sys.version_info.minor}"})
+        self._client.headers.pop("Accept", None)
         self._session_id: str | None = None
         self._last_turn_id: str | None = None
         self._tool_fingerprint: str | None = None
@@ -285,6 +296,10 @@ class OpenAIAgentsProvider:
         self._confirmed_rollover_session: dict[str, Any] | None = None
         self._rollover_deferred_while_busy = False
         self._lifecycle_bound = False
+
+    def close(self) -> None:
+        """Release pooled connections when the owning runtime shuts down."""
+        self._client.close()
 
     def bind_session_store(self, load: Callable[[], dict | None],
                            save: Callable[[str, str | None, str | None], None]) -> None:
@@ -863,6 +878,9 @@ class OpenAIAgentsProvider:
             if (isinstance(cause, urllib.error.HTTPError)
                     and 400 <= cause.code < 500):
                 return True
+            if (isinstance(cause, httpx.HTTPStatusError)
+                    and 400 <= cause.response.status_code < 500):
+                return True
             cause = cause.__cause__ or cause.__context__
         return False
 
@@ -1170,7 +1188,7 @@ class OpenAIAgentsProvider:
     def _stream_fallback_reason(exc: Exception) -> str:
         if isinstance(exc, (_AgentsSSEError, _AgentsStreamSemanticError)):
             return exc.reason
-        if isinstance(exc, (TimeoutError, urllib.error.URLError)):
+        if isinstance(exc, (TimeoutError, urllib.error.URLError, httpx.TransportError)):
             return "stream_timeout_or_disconnect"
         if isinstance(exc, json.JSONDecodeError):
             return "sse_invalid_json"
@@ -1902,38 +1920,43 @@ class OpenAIAgentsProvider:
     @contextmanager
     def _open_event_stream(self, session_id: str) -> Iterator[Iterator[dict]]:
         """Open and parse the live session SSE stream without assuming replay."""
-        request = urllib.request.Request(
-            f"{self.base_url}/agents/sessions/{session_id}/events", method="GET",
+        request = self._client.build_request(
+            "GET", f"{self.base_url}/agents/sessions/{session_id}/events",
+            timeout=self.timeout_seconds,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Accept": "text/event-stream",
                 "OpenAI-Beta": "agents=v1",
             })
+        request.headers.pop("Cookie", None)
         started = time.monotonic()
         outcome = "ok"
         event_count = 0
         response = None
+        lines = None
         timing = (_AgentsStreamTiming(started)
                   if timeline_reporter.get() is not None else None)
         timing_token = _agents_stream_timing.set(timing)
         try:
-            response = urllib.request.urlopen(request, timeout=self.timeout_seconds)
+            response = self._client.send(request, stream=True)
             if timing is not None:
                 timing.headers_available = time.monotonic()
                 timing.fields.update(self._http_response_timing(
                     response, started, timing.headers_available))
 
+            response.raise_for_status()
+
             def events() -> Iterator[dict]:
-                nonlocal event_count
+                nonlocal event_count, lines
                 data_lines: list[str] = []
                 expires = started + self.timeout_seconds
+                lines = self._stream_lines(response, expires)
                 while True:
                     remaining = expires - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("Timed out waiting for the OpenAI Agents stream")
-                    response.fp.raw._sock.settimeout(remaining)
                     try:
-                        raw_line = next(response)
+                        raw_line = next(lines)
                     except StopIteration:
                         break
                     try:
@@ -1976,20 +1999,21 @@ class OpenAIAgentsProvider:
                         yield event
 
             yield events()
-        except urllib.error.HTTPError as exc:
+        except httpx.HTTPStatusError as exc:
             outcome = "error"
-            if timing is not None:
-                timing.headers_available = time.monotonic()
-                timing.fields.update(self._http_response_timing(
-                    exc, started, timing.headers_available))
-            detail = exc.read().decode(errors="replace")[:2000]
+            detail = exc.response.read().decode(errors="replace")[:2000]
             raise RuntimeError(
-                f"OpenAI Agents stream returned HTTP {exc.code}: {detail}") from exc
+                f"OpenAI Agents stream returned HTTP {exc.response.status_code}: {detail}") from exc
+        except httpx.TimeoutException as exc:
+            outcome = "error"
+            raise TimeoutError("Timed out waiting for the OpenAI Agents stream") from exc
         except BaseException:
             outcome = "error"
             raise
         finally:
             if response is not None:
+                if lines is not None:
+                    lines.close()
                 response.close()
             self._trace_span(
                 "openai.agents_stream", started, outcome,
@@ -1997,6 +2021,39 @@ class OpenAIAgentsProvider:
                 request_timeout_seconds=self.timeout_seconds,
                 **(timing.fields if timing is not None else {}))
             _agents_stream_timing.reset(timing_token)
+
+    @staticmethod
+    def _stream_lines(response: httpx.Response, expires: float) -> Iterator[bytes]:
+        """Keep strict UTF-8 parsing and the existing whole-stream deadline.
+
+        HTTPX read timeouts normally apply to each read. Bound each network
+        read to the remaining deadline through its network_stream extension,
+        then restore the method before the connection returns to the pool.
+        """
+        network = response.extensions.get("network_stream")
+        original_read = network.read if network is not None else None
+        if network is not None:
+            def read(max_bytes: int, timeout: float | None = None) -> bytes:
+                remaining = expires - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for the OpenAI Agents stream")
+                return original_read(max_bytes, timeout=min(timeout, remaining)
+                                     if timeout is not None else remaining)
+            network.read = read
+        pending = b""
+        try:
+            # Iterate the byte stream directly: iter_raw/iter_bytes auto-close
+            # on EOF, before we can restore the pooled network stream.
+            for chunk in response.stream:
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    yield line
+            if pending:
+                yield pending
+        finally:
+            if network is not None:
+                network.read = original_read
 
     def _trace_span(self, operation: str, started: float, outcome: str, **details: Any) -> None:
         trace = _agents_http_trace.get()
@@ -2084,15 +2141,14 @@ class OpenAIAgentsProvider:
     def _http_response_timing(response: Any, started: float, headers_at: float) -> dict:
         """Observe only the public response boundary, never socket internals.
 
-        Header wait includes DNS, connect, TLS, upload and endpoint processing;
-        urllib does not expose those phases separately. No headers are retained.
+        Header wait includes DNS, connect, TLS, upload and endpoint processing.
+        These phases remain comparable across transports; no headers are retained.
         """
-        version = getattr(response, "version", None)
+        version = getattr(response, "http_version", "unknown")
         return {
             "time_to_headers_seconds": headers_at - started,
             "headers_available_monotonic_seconds": headers_at,
-            "http_version": {10: "HTTP/1.0", 11: "HTTP/1.1", 20: "HTTP/2"}.get(
-                version if isinstance(version, int) else None, "unknown"),
+            "http_version": version,
         }
 
     def _request(self, method: str, path: str, body: dict | None = None, *,
@@ -2106,9 +2162,12 @@ class OpenAIAgentsProvider:
         }
         if extra_headers:
             headers.update(extra_headers)
-        request = urllib.request.Request(
-            f"{self.base_url}{path}", data=data, method=method,
-            headers=headers)
+        request = self._client.build_request(
+            method, f"{self.base_url}{path}", content=data,
+            headers=headers, timeout=self.timeout_seconds)
+        # urllib did not persist response cookies between requests.
+        if not extra_headers or not any(key.lower() == "cookie" for key in extra_headers):
+            request.headers.pop("Cookie", None)
         started = time.monotonic()
         outcome = "ok"
         trace = _agents_http_trace.get()
@@ -2116,7 +2175,7 @@ class OpenAIAgentsProvider:
         phases: dict[str, Any] = {}
         headers_at = body_at = None
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with closing(self._client.send(request, stream=True)) as response:
                 if observed:
                     headers_at = time.monotonic()
                     phases.update(self._http_response_timing(response, started, headers_at))
@@ -2124,6 +2183,7 @@ class OpenAIAgentsProvider:
                 if observed:
                     body_at = time.monotonic()
                     phases["headers_to_body_seconds"] = body_at - headers_at
+                response.raise_for_status()
                 if not payload and allow_empty:
                     if observed:
                         phases["body_parse_seconds"] = 0.0
@@ -2135,15 +2195,14 @@ class OpenAIAgentsProvider:
                     phases["body_parse_seconds"] = parsed_at - body_at
                     phases["headers_to_parsed_body_seconds"] = parsed_at - headers_at
                 return parsed
-        except urllib.error.HTTPError as exc:
+        except httpx.HTTPStatusError as exc:
             outcome = "error"
-            if observed:
-                headers_at = time.monotonic()
-                phases.update(self._http_response_timing(exc, started, headers_at))
-            detail = exc.read().decode(errors="replace")[:2000]
-            if observed:
-                phases["headers_to_body_seconds"] = time.monotonic() - headers_at
-            raise RuntimeError(f"OpenAI Agents API returned HTTP {exc.code}: {detail}") from exc
+            detail = exc.response.content.decode(errors="replace")[:2000]
+            raise RuntimeError(
+                f"OpenAI Agents API returned HTTP {exc.response.status_code}: {detail}") from exc
+        except httpx.TimeoutException as exc:
+            outcome = "error"
+            raise TimeoutError("Timed out waiting for the OpenAI Agents API") from exc
         except BaseException:
             outcome = "error"
             raise

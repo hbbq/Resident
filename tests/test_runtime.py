@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import asyncio
 import json
 import sqlite3
@@ -12,6 +13,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+
+from tests.httpx_support import ResponseMixin
 
 from resident.config import Config
 from resident.capabilities import Capability
@@ -1039,7 +1042,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("sensitive-argument", json.dumps(tool_events))
 
     async def test_agents_http_timeline_is_nested_and_preserves_request_gaps(self):
-        class FakeResponse:
+        class FakeResponse(ResponseMixin):
             def __enter__(self):
                 return self
 
@@ -1070,7 +1073,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         events = []
         token = timeline_reporter.set(events.append)
         try:
-            with patch("resident.provider.urllib.request.urlopen",
+            with patch("resident.provider.httpx.Client.send",
                        return_value=FakeResponse()):
                 await provider.respond(
                     "sensitive context", [], [ToolResult("call", {"secret": True})],
@@ -1102,7 +1105,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             def settimeout(self, _timeout):
                 pass
 
-        class FakeStreamResponse:
+        class FakeStreamResponse(ResponseMixin):
             def __init__(self):
                 self.lines = iter([
                     b"event: ignored-envelope-name\n",
@@ -1137,14 +1140,14 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         events = []
         token = timeline_reporter.set(events.append)
         try:
-            with patch("resident.provider.urllib.request.urlopen",
+            with patch("resident.provider.httpx.Client.send",
                        return_value=response) as urlopen:
                 await provider.respond("sensitive context", [], [])
         finally:
             timeline_reporter.reset(token)
 
         request = urlopen.call_args.args[0]
-        self.assertEqual("text/event-stream", request.get_header("Accept"))
+        self.assertEqual("text/event-stream", request.headers["Accept"])
         self.assertTrue(response.closed)
         stream_events = [event for event in events
                          if event["operation"] == "openai.agents_stream"]
@@ -1157,7 +1160,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             def settimeout(self, _timeout):
                 pass
 
-        class FakeStreamResponse:
+        class FakeStreamResponse(ResponseMixin):
             def __init__(self, lines):
                 self.lines = iter(lines)
                 self.fp = type("File", (), {
@@ -1180,7 +1183,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             b'data: "turn_id":"secret-turn"}\r\n', b"\r\n",
             b'data: {"type":"trailing"}',
         ])
-        with patch("resident.provider.urllib.request.urlopen", return_value=valid):
+        with patch("resident.provider.httpx.Client.send", return_value=valid):
             with provider._open_event_stream("session-1") as stream:
                 observed = list(stream)
         self.assertEqual(
@@ -1190,7 +1193,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         for payload, reason in ((b"data: {invalid}\n\n", "sse_invalid_json"),
                                 (b"data: []\n\n", "sse_non_object")):
             with self.subTest(reason=reason), patch(
-                    "resident.provider.urllib.request.urlopen",
+                    "resident.provider.httpx.Client.send",
                     return_value=FakeStreamResponse([payload])):
                 with self.assertRaisesRegex(ValueError, reason):
                     with provider._open_event_stream("session-1") as stream:
@@ -1259,17 +1262,27 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.timeouts = []
 
-            def settimeout(self, timeout):
+            def read(self, max_bytes, timeout=None):
                 self.timeouts.append(timeout)
+                return next(self.response)
 
-        class FakeStreamResponse:
+        class FakeStreamResponse(ResponseMixin):
             def __init__(self):
                 self.socket = FakeSocket()
                 self.fp = type("File", (), {
                     "raw": type("Raw", (), {"_sock": self.socket})()
                 })()
+                self.socket.response = self
+                self.extensions = {"network_stream": self.socket}
                 self.reads = 0
                 self.closed = False
+
+            @property
+            def stream(self):
+                def chunks():
+                    while True:
+                        yield self.socket.read(65536, timeout=1.0)
+                return chunks()
 
             def __iter__(self):
                 return self
@@ -1293,7 +1306,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return response
 
         with patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), \
-                patch("resident.provider.urllib.request.urlopen",
+                patch("resident.provider.httpx.Client.send",
                       side_effect=open_near_deadline):
             with self.assertRaisesRegex(TimeoutError, "simulated stalled read"):
                 with provider._open_event_stream("session-1") as stream:

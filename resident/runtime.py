@@ -530,7 +530,12 @@ class ResidentRuntime:
         self._curator_coordinator.cancel()
         if self.realm_client is not None:
             self.realm_client.bind_mutation_store(None)
-        self.store.close()
+        close_provider = getattr(self.provider, "close", None)
+        try:
+            if close_provider is not None:
+                close_provider()
+        finally:
+            self.store.close()
 
     async def stop_background_services(self) -> None:
         await self._curator_coordinator.stop()

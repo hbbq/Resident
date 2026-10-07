@@ -1,13 +1,14 @@
 """HTTP phase diagnostics only: no live requests or transport substitution."""
 import asyncio
-import io
 import json
 import threading
-import urllib.error
 from contextlib import contextmanager
 from unittest.mock import patch
 
+import httpx
 import pytest
+
+from tests.httpx_support import ResponseMixin
 
 from resident.observability import timeline_reporter
 from resident.provider import OpenAIAgentsProvider, _agents_http_trace
@@ -26,10 +27,11 @@ def tracing(enabled=True):
         _agents_http_trace.reset(token)
 
 
-class Response:
+class Response(ResponseMixin):
     version = 11
 
-    def __init__(self, clock, payload=b'{"status":"idle"}'):
+    def __init__(self, clock, payload=b'{"status":"idle"}', status=200):
+        self.status_code = status
         self.clock, self.payload = clock, payload
 
     def __enter__(self):
@@ -58,7 +60,8 @@ def test_rest_header_body_and_parse_phases(method, path, body, classification):
     loads = json.loads
 
     def open_response(*args, **kwargs):
-        assert kwargs == {"timeout": provider.timeout_seconds}
+        assert kwargs == {"stream": True}
+        assert args[0].extensions["timeout"]["read"] == provider.timeout_seconds
         clock[0] = 102.0
         return response
 
@@ -67,7 +70,7 @@ def test_rest_header_body_and_parse_phases(method, path, body, classification):
         return loads(payload)
 
     with tracing() as (trace, _), patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "resident.provider.urllib.request.urlopen", side_effect=open_response), patch(
+            "resident.provider.httpx.Client.send", side_effect=open_response), patch(
             "resident.provider.json.loads", side_effect=parse):
         assert provider._request(method, path, body) == {"status": "idle"}
     event, = trace["events"]
@@ -90,14 +93,14 @@ def test_failure_reports_only_observed_phases(failure):
     def open_response(*_args, **_kwargs):
         clock[0] = 102.0
         if failure == "connect":
-            raise urllib.error.URLError("secret")
+            raise httpx.ConnectError("secret")
         if failure == "http":
-            raise urllib.error.HTTPError("url-secret", 400, "reason-secret", {}, io.BytesIO(b"body-secret"))
+            return Response(clock, b"body-secret", status=400)
         return Response(clock, b"invalid-secret")
 
     with tracing() as (trace, _), patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "resident.provider.urllib.request.urlopen", side_effect=open_response):
-        with pytest.raises((RuntimeError, urllib.error.URLError, ValueError)):
+            "resident.provider.httpx.Client.send", side_effect=open_response):
+        with pytest.raises((RuntimeError, httpx.ConnectError, ValueError)):
             provider._request("GET", "/agents/sessions/secret")
     event, = trace["events"]
     assert event["outcome"] == "error"
@@ -110,7 +113,7 @@ def test_failure_reports_only_observed_phases(failure):
 def test_diagnostics_off_does_not_inspect_response():
     provider = OpenAIAgentsProvider("key", "model")
     with tracing(enabled=False) as (trace, _), patch(
-            "resident.provider.urllib.request.urlopen", return_value=Response([100])), patch.object(
+            "resident.provider.httpx.Client.send", return_value=Response([100])), patch.object(
             provider, "_http_response_timing", side_effect=AssertionError):
         assert provider._request("GET", "/agents/sessions/secret") == {"status": "idle"}
     assert "time_to_headers_seconds" not in trace["events"][0]
@@ -128,11 +131,11 @@ def test_preflight_trace_emitted_on_event_loop_and_context_restored(fail):
         lambda event: records.append((threading.get_ident(), event)))
     response = Response([100])
     response.payload = b'{"status":"idle"}'
-    effect = urllib.error.URLError("secret") if fail else None
+    effect = httpx.ConnectError("secret") if fail else None
     try:
-        with patch("resident.provider.urllib.request.urlopen", return_value=response, side_effect=effect):
+        with patch("resident.provider.httpx.Client.send", return_value=response, side_effect=effect):
             if fail:
-                with pytest.raises(urllib.error.URLError):
+                with pytest.raises(httpx.ConnectError):
                     asyncio.run(provider.preflight_session())
             else:
                 assert asyncio.run(provider.preflight_session()) is None
@@ -155,7 +158,7 @@ def test_sse_headers_checkpoint_submit_order(checkpoint_fails):
     clock = [100.0]
     order = []
 
-    class Stream:
+    class Stream(ResponseMixin):
         version = 11
 
         def close(self):
@@ -182,7 +185,7 @@ def test_sse_headers_checkpoint_submit_order(checkpoint_fails):
     provider._consume_event_stream = lambda *_args, **_kwargs: "complete"
     provider._fallback_wait = lambda *_args, **_kwargs: "fallback"
     with tracing() as (trace, _), patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "resident.provider.urllib.request.urlopen", side_effect=open_response):
+            "resident.provider.httpx.Client.send", side_effect=open_response):
         result = provider._submit_wake("session-secret", "message-secret", "wake-secret", "correlation-secret")
     event, = trace["events"]
     assert event["time_to_headers_seconds"] == 2
@@ -207,7 +210,7 @@ def test_empty_acknowledgement_has_body_boundary_without_json_parse():
         return Response(clock, b"")
 
     with tracing() as (trace, _), patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "resident.provider.urllib.request.urlopen", side_effect=opened), patch(
+            "resident.provider.httpx.Client.send", side_effect=opened), patch(
             "resident.provider.json.loads", side_effect=AssertionError):
         assert provider._request("POST", "/agents/sessions/secret/events", allow_empty=True) == {}
     event, = trace["events"]
@@ -222,10 +225,10 @@ def test_sse_http_rejection_retains_header_wait_only():
 
     def rejected(*_args, **_kwargs):
         clock[0] = 102.0
-        raise urllib.error.HTTPError("url-secret", 400, "reason-secret", {}, io.BytesIO(b"body-secret"))
+        return Response(clock, b"body-secret", status=400)
 
     with tracing() as (trace, _), patch("resident.provider.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "resident.provider.urllib.request.urlopen", side_effect=rejected):
+            "resident.provider.httpx.Client.send", side_effect=rejected):
         with pytest.raises(RuntimeError):
             with provider._open_event_stream("session-secret"):
                 pytest.fail("rejected stream must not yield")
