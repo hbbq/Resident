@@ -231,3 +231,206 @@ def test_identityless_items_before_wake_correlation_do_not_mark_model_phases():
     assert summary["time_to_first_event_seconds"] == 1
     assert "time_to_first_model_activity_seconds" not in summary
     assert "time_to_first_output_seconds" not in summary
+
+
+@contextmanager
+def settings_trace(*, enabled=True):
+    provider = OpenAIAgentsProvider("key", "model", reasoning_effort="none")
+    trace = {"events": []}
+    trace_token = _agents_http_trace.set(trace)
+    reporter_token = timeline_reporter.set((lambda _: None) if enabled else None)
+    try:
+        yield provider, trace
+    finally:
+        timeline_reporter.reset(reporter_token)
+        _agents_http_trace.reset(trace_token)
+
+
+@pytest.mark.parametrize("reasoning,reason", [
+    ({"effort": "low", "summary": None}, "effort_changed"),
+    ({"summary": None}, "effort_presence_changed"),
+    (None, "reasoning_shape_changed"),
+])
+def test_settings_difference_reports_real_managed_difference(reasoning, reason):
+    with settings_trace() as (provider, trace):
+        result = provider._mutable_patch({"model": "model", "reasoning": reasoning})
+    assert result == {"reasoning": {"effort": "none"}}
+    event, = trace["events"]
+    assert event["timeline_operation"] == "openai.agents_settings_difference"
+    assert event["changed_settings"] == ["reasoning"]
+    assert event["reasoning_source"] == "remote"
+    assert event["desired_reasoning_effort"] == "none"
+    assert event["desired_reasoning_fields"] == ["effort"]
+    assert event["returned_reasoning_fields"] == sorted(reasoning or {})
+    assert event["current_reasoning_fields"] == event["returned_reasoning_fields"]
+    assert event["reasoning_change_reason"] == reason
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        assert event["current_reasoning_effort"] == reasoning["effort"]
+    else:
+        assert "current_reasoning_effort" not in event
+
+
+def test_settings_difference_identifies_all_changed_names_without_values():
+    with settings_trace() as (provider, trace):
+        provider.service_tier = "priority-secret"
+        result = provider._mutable_patch({
+            "model": "model-secret", "service_tier": "tier-secret",
+            "reasoning": {"effort": "low", "summary": "summary-secret"},
+            "instructions": "instructions-secret", "messages": ["message-secret"],
+        })
+    assert set(result) == {"model", "reasoning", "service_tier"}
+    event, = trace["events"]
+    assert event["changed_settings"] == ["model", "reasoning", "service_tier"]
+    assert event["reasoning_change_reason"] == "effort_changed"
+    assert "secret" not in json.dumps(event)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_equal_settings_emit_no_difference(enabled):
+    with settings_trace(enabled=enabled) as (provider, trace):
+        assert provider._mutable_patch({
+            "model": "model", "reasoning": {"effort": "none"}}) == {}
+    assert trace["events"] == []
+
+
+def test_settings_diagnostics_off_preserves_patch_without_building_record():
+    with settings_trace(enabled=False) as (provider, trace):
+        with patch.object(provider, "_trace_mutable_settings_difference",
+                          side_effect=AssertionError("diagnostics must stay off")):
+            assert provider._mutable_patch({"reasoning": {"effort": "low"}}) == {
+                "reasoning": {"effort": "none"}}
+    assert trace["events"] == []
+
+
+@pytest.mark.parametrize("applied,source,reason", [
+    ({"reasoning": {"effort": "low"}}, "persisted", "effort_changed"),
+    ({}, "unknown", "current_unknown"),
+])
+def test_settings_difference_uses_same_fallback_as_comparison(applied, source, reason):
+    with settings_trace() as (provider, trace):
+        provider._mutable_settings_descriptor = applied
+        assert provider._mutable_patch({"model": "model"}) == {
+            "reasoning": {"effort": "none"}}
+    event, = trace["events"]
+    assert event["reasoning_source"] == source
+    assert event["returned_reasoning_fields"] == []
+    assert event["current_reasoning_fields"] == (["effort"] if applied else [])
+    assert event["reasoning_change_reason"] == reason
+
+
+def test_settings_difference_bounds_names_and_redacts_unknown_effort():
+    reasoning = {f"field_{i:02}": "value-secret" for i in range(30)}
+    reasoning.update({"effort": "effort-secret", "bad\nname": "secret",
+                      "x" * 65: "secret"})
+    with settings_trace() as (provider, trace):
+        provider._mutable_patch({"model": "model", "reasoning": reasoning})
+    event, = trace["events"]
+    assert len(event["returned_reasoning_fields"]) == 16
+    assert all(len(name) <= 64 and "\n" not in name
+               for name in event["returned_reasoning_fields"])
+    assert event["current_reasoning_effort"] == "unknown"
+    assert "secret" not in json.dumps(event)
+
+
+def test_settings_difference_keeps_reconciliation_post_and_safe_journal_fields(tmp_path):
+    from resident.store import Store
+
+    with settings_trace() as (provider, trace):
+        provider._session_id = "session"
+        remote = {"model": "model", "reasoning": {"effort": "low", "summary": None}}
+        requests = []
+
+        def request(method, path, body=None):
+            requests.append((method, path, body))
+            return {"id": "session", "status": "idle", "agent": remote}
+
+        provider._request = request
+        session, created = provider._ensure_session([])
+    assert session["id"] == "session" and not created
+    assert requests == [
+        ("GET", "/agents/sessions/session", None),
+        ("POST", "/agents/sessions/session", {"agent": {"reasoning": {"effort": "none"}}}),
+    ]
+    event, = trace["events"]
+    store = Store(tmp_path / "diagnostics.sqlite3")
+    try:
+        store.journal("timeline", {"operation": event.pop("timeline_operation"),
+                                  "moment": "finished", **event}, run_id="run")
+        # Scalar diagnostics also survive the existing safe journal projection.
+        safe, truncated = store._safe_journal_events("run")
+        assert not truncated
+        assert safe[0]["reasoning_source"] == "remote"
+        assert safe[0]["desired_reasoning_effort"] == "none"
+        assert safe[0]["current_reasoning_effort"] == "low"
+        assert safe[0]["reasoning_change_reason"] == "effort_changed"
+        row = store.connection.execute(
+            "SELECT data_json FROM journal WHERE event_type='timeline'").fetchone()
+        recorded = json.loads(row[0])
+        assert recorded["changed_settings"] == ["reasoning"]
+        assert recorded["returned_reasoning_fields"] == ["effort", "summary"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("reasoning", [
+    {"effort": "none", "summary": None},
+    {"effort": "none", "summary": "auto", "server_default": "unmanaged"},
+])
+def test_matching_managed_reasoning_ignores_returned_defaults(reasoning, enabled):
+    with settings_trace(enabled=enabled) as (provider, trace):
+        provider._session_id = "session"
+        requests = []
+        remote = {"model": "model", "reasoning": reasoning}
+
+        def request(method, path, body=None):
+            requests.append((method, path, body))
+            return {"id": "session", "status": "idle", "agent": remote}
+
+        provider._request = request
+        session, created = provider._ensure_session([])
+    assert session["agent"] == remote and not created
+    assert requests == [("GET", "/agents/sessions/session", None)]
+    assert trace["events"] == []
+
+
+@pytest.mark.parametrize("current,expected", [
+    ({"effort": "none", "summary": "auto", "extra": None}, {}),
+    ({"effort": "none", "summary": None}, {"effort": "none", "summary": "auto"}),
+    ({"effort": "none"}, {"effort": "none", "summary": "auto"}),
+])
+def test_reasoning_comparison_covers_every_explicit_desired_field(current, expected):
+    # Public configuration currently exposes only effort. Exercise the partial
+    # object comparator without introducing any new configuration/API settings.
+    desired = {"model": "model", "reasoning": {"effort": "none", "summary": "auto"}}
+    with settings_trace() as (provider, trace):
+        with patch.object(provider, "_desired_mutable_settings", return_value=desired):
+            result = provider._mutable_patch({"model": "model", "reasoning": current})
+    assert result == ({"reasoning": expected} if expected else {})
+    if expected:
+        event, = trace["events"]
+        assert event["reasoning_change_reason"] == "object_changed_equal_effort"
+        assert event["desired_reasoning_fields"] == ["effort", "summary"]
+    else:
+        assert trace["events"] == []
+
+
+@pytest.mark.parametrize("current,expected", [
+    ({"effort": "none", "summary": None}, {}),
+    ({"effort": "low", "summary": None}, {"reasoning": {"effort": "none"}}),
+])
+def test_partial_reasoning_comparison_also_applies_to_persisted_fallback(current, expected):
+    with settings_trace() as (provider, _):
+        provider._mutable_settings_descriptor = {"reasoning": current}
+        assert provider._mutable_patch({"model": "model"}) == expected
+
+
+def test_unmanaged_reasoning_and_service_tier_remain_unmanaged():
+    with settings_trace() as (provider, trace):
+        provider.reasoning_effort = None
+        assert provider._mutable_patch({
+            "model": "different-model", "reasoning": {"effort": "high", "summary": None},
+            "service_tier": "priority"}) == {"model": "model"}
+    event, = trace["events"]
+    assert event["changed_settings"] == ["model"]
+    assert "reasoning_change_reason" not in event

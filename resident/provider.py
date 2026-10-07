@@ -29,6 +29,7 @@ class _AgentsStreamTiming:
 
     started: float
     previous: float | None = None
+    headers_available: float | None = None
     fields: dict[str, Any] = field(default_factory=lambda: {
         "largest_inter_event_gap_seconds": 0.0})
 
@@ -470,9 +471,21 @@ class OpenAIAgentsProvider:
         if session_id is None:
             self._preflight_session_status = None
             return None
+        trace = {"events": [], "request_phase": "preflight"}
+        trace_token = _agents_http_trace.set(
+            trace if timeline_reporter.get() is not None else None)
         try:
-            session = await asyncio.to_thread(
-                self._request, "GET", f"/agents/sessions/{session_id}")
+            try:
+                session = await asyncio.to_thread(
+                    self._request, "GET", f"/agents/sessions/{session_id}")
+            finally:
+                # Emit on the event-loop thread; the reporter may own SQLite.
+                from .observability import emit_timeline
+                try:
+                    for event in trace["events"]:
+                        emit_timeline("openai.agents_http", "finished", **event)
+                finally:
+                    _agents_http_trace.reset(trace_token)
         except RuntimeError as exc:
             if not self._definitive_session_unavailable(exc):
                 raise
@@ -599,7 +612,8 @@ class OpenAIAgentsProvider:
 
         lifecycle_token = self._lifecycle_writer.set(lifecycle_on_event_loop)
         http_trace: dict[str, Any] = {
-            "lifecycle_started": time.monotonic(), "events": []}
+            "lifecycle_started": time.monotonic(), "events": [],
+            "request_phase": "lifecycle"}
         trace_token = _agents_http_trace.set(
             http_trace if timeline_reporter.get() is not None else None)
 
@@ -741,6 +755,10 @@ class OpenAIAgentsProvider:
             # never interpret an uncertain remote POST as a fresh wake.
             self._lifecycle_call(
                 self._mark_wake_attempted, session_id, wake_key, correlation)
+            timing = _agents_stream_timing.get()
+            if timing is not None and timing.headers_available is not None:
+                timing.fields["headers_to_checkpoint_seconds"] = (
+                    time.monotonic() - timing.headers_available)
             try:
                 self._submit_events(
                     session_id, [event], f"resident-wake:{wake_key}"[:256])
@@ -1544,11 +1562,67 @@ class OpenAIAgentsProvider:
                 known, current = True, applied.get(key)
             else:
                 known, current = False, None
-            if (known and current != desired_value) or (
+            differs = current != desired_value
+            if key == "reasoning" and isinstance(desired_value, dict) and isinstance(current, dict):
+                # Session updates merge supplied reasoning fields. Omitted desired
+                # fields are unmanaged, so server defaults must not force a POST.
+                differs = any(field not in current or current[field] != value
+                              for field, value in desired_value.items())
+            if (known and differs) or (
                     not known and desired_value is not None
                     and (key != "model" or self._lifecycle_bound)):
                 patch[key] = desired_value
+        if patch and timeline_reporter.get() is not None:
+            self._trace_mutable_settings_difference(remote, desired, applied, patch)
         return patch
+
+    def _trace_mutable_settings_difference(
+            self, remote: dict, desired: dict, applied: dict, patch: dict) -> None:
+        """Describe the comparison without retaining arbitrary setting values."""
+        source = ("remote" if "reasoning" in remote else
+                  "persisted" if "reasoning" in applied else "unknown")
+        current = (remote.get("reasoning") if source == "remote" else
+                   applied.get("reasoning") if source == "persisted" else None)
+        desired_reasoning = desired.get("reasoning")
+
+        def field_names(value: object) -> list[str]:
+            if not isinstance(value, dict):
+                return []
+            # Limit both count and length, and reject non-schema-shaped names.
+            names = (key for key in value if isinstance(key, str)
+                     and 0 < len(key) <= 64 and key.isascii()
+                     and all(c.isalnum() or c == "_" for c in key))
+            return sorted(names)[:16]
+
+        details: dict[str, Any] = {
+            "changed_settings": sorted(key for key in patch
+                                       if key in {"model", "reasoning", "service_tier"}),
+            "reasoning_source": source,
+            "desired_reasoning_fields": field_names(desired_reasoning),
+            "current_reasoning_fields": field_names(current),
+            "returned_reasoning_fields": field_names(remote.get("reasoning")),
+        }
+        for label, value in (("desired", desired_reasoning), ("current", current)):
+            if isinstance(value, dict) and "effort" in value:
+                effort = value["effort"]
+                details[f"{label}_reasoning_effort"] = (
+                    effort if effort is None or (isinstance(effort, str) and effort in
+                    {"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+                    else "unknown")
+        if "reasoning" in patch:
+            if source == "unknown":
+                reason = "current_unknown"
+            elif not isinstance(current, dict) or not isinstance(desired_reasoning, dict):
+                reason = "reasoning_shape_changed"
+            elif "effort" in desired_reasoning and "effort" not in current:
+                reason = "effort_presence_changed"
+            elif ("effort" in desired_reasoning
+                  and current.get("effort") != desired_reasoning["effort"]):
+                reason = "effort_changed"
+            else:
+                reason = "object_changed_equal_effort"
+            details["reasoning_change_reason"] = reason
+        self._trace_instant("openai.agents_settings_difference", **details)
 
     @staticmethod
     def _definitive_create_rejection(exc: Exception) -> bool:
@@ -1844,6 +1918,10 @@ class OpenAIAgentsProvider:
         timing_token = _agents_stream_timing.set(timing)
         try:
             response = urllib.request.urlopen(request, timeout=self.timeout_seconds)
+            if timing is not None:
+                timing.headers_available = time.monotonic()
+                timing.fields.update(self._http_response_timing(
+                    response, started, timing.headers_available))
 
             def events() -> Iterator[dict]:
                 nonlocal event_count
@@ -1900,6 +1978,10 @@ class OpenAIAgentsProvider:
             yield events()
         except urllib.error.HTTPError as exc:
             outcome = "error"
+            if timing is not None:
+                timing.headers_available = time.monotonic()
+                timing.fields.update(self._http_response_timing(
+                    exc, started, timing.headers_available))
             detail = exc.read().decode(errors="replace")[:2000]
             raise RuntimeError(
                 f"OpenAI Agents stream returned HTTP {exc.code}: {detail}") from exc
@@ -1998,6 +2080,21 @@ class OpenAIAgentsProvider:
             event["error"] = str(result.output.get("error") or metadata)
         return event
 
+    @staticmethod
+    def _http_response_timing(response: Any, started: float, headers_at: float) -> dict:
+        """Observe only the public response boundary, never socket internals.
+
+        Header wait includes DNS, connect, TLS, upload and endpoint processing;
+        urllib does not expose those phases separately. No headers are retained.
+        """
+        version = getattr(response, "version", None)
+        return {
+            "time_to_headers_seconds": headers_at - started,
+            "headers_available_monotonic_seconds": headers_at,
+            "http_version": {10: "HTTP/1.0", 11: "HTTP/1.1", 20: "HTTP/2"}.get(
+                version if isinstance(version, int) else None, "unknown"),
+        }
+
     def _request(self, method: str, path: str, body: dict | None = None, *,
                  allow_empty: bool = False,
                  extra_headers: dict[str, str] | None = None) -> dict:
@@ -2014,15 +2111,38 @@ class OpenAIAgentsProvider:
             headers=headers)
         started = time.monotonic()
         outcome = "ok"
+        trace = _agents_http_trace.get()
+        observed = trace is not None and timeline_reporter.get() is not None
+        phases: dict[str, Any] = {}
+        headers_at = body_at = None
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                if observed:
+                    headers_at = time.monotonic()
+                    phases.update(self._http_response_timing(response, started, headers_at))
                 payload = response.read()
+                if observed:
+                    body_at = time.monotonic()
+                    phases["headers_to_body_seconds"] = body_at - headers_at
                 if not payload and allow_empty:
+                    if observed:
+                        phases["body_parse_seconds"] = 0.0
+                        phases["headers_to_parsed_body_seconds"] = body_at - headers_at
                     return {}
-                return json.loads(payload)
+                parsed = json.loads(payload)
+                if observed:
+                    parsed_at = time.monotonic()
+                    phases["body_parse_seconds"] = parsed_at - body_at
+                    phases["headers_to_parsed_body_seconds"] = parsed_at - headers_at
+                return parsed
         except urllib.error.HTTPError as exc:
             outcome = "error"
+            if observed:
+                headers_at = time.monotonic()
+                phases.update(self._http_response_timing(exc, started, headers_at))
             detail = exc.read().decode(errors="replace")[:2000]
+            if observed:
+                phases["headers_to_body_seconds"] = time.monotonic() - headers_at
             raise RuntimeError(f"OpenAI Agents API returned HTTP {exc.code}: {detail}") from exc
         except BaseException:
             outcome = "error"
@@ -2038,6 +2158,8 @@ class OpenAIAgentsProvider:
                     "started_monotonic_seconds": started,
                     "finished_monotonic_seconds": finished,
                     "request_timeout_seconds": self.timeout_seconds,
+                    "request_phase": trace.get("request_phase", "lifecycle"),
+                    **phases,
                 })
 
     @staticmethod
@@ -2062,6 +2184,7 @@ class OpenAIAgentsProvider:
             return "reconcile_turns"
         if method == "GET":
             return "poll_session"
-        if method == "PATCH":
+        if method == "PATCH" or (method == "POST" and body is not None
+                                  and "agent" in body):
             return "update_session"
         return "session_request"

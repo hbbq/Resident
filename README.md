@@ -221,6 +221,8 @@ Input/output token fields remain null when usage is absent; no usage-only reques
 is made. These are best-effort API counts and can be unavailable at completion.
 See [OpenAI usage documentation](https://developers.openai.com/api/docs/guides/agents-api/observability).
 
+Agents HTTP records also split header wait, response body read, and JSON parse time; stream records include header availability and time to the durable pre-submit checkpoint. Runtime preflight and lifecycle session GETs are distinguished by `request_phase`. See [the transport latency investigation](AGENTS_TRANSPORT_LATENCY.md) for field definitions, measured limits, and the proposed pooling A/B experiment.
+
 ## Experimental HomeOps connector
 
 Set `RESIDENT_HOMEOPS_URL` (or pass `--homeops-url`) to opt into read-only HomeOps observation. With no URL configured, Resident makes no HomeOps requests. The connector silently establishes a baseline from `GET /api/measurements/latest`, then polls every 30 seconds and emits one wake containing all values changed during that poll. New measurement points count as changes; timestamp-only updates do not. Polling failures are retried without waking Resident or discarding the last successful baseline. These recoverable failures are shown with verbose diagnostics and suppressed in the default terminal mode.
