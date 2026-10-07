@@ -13,12 +13,11 @@ from .external_app import ExternalApplicationConnector
 from .realm import RealmClient
 from .homeops import HomeOpsConnector
 from .host import InstancePolicy, RuntimeHost, messaging_capability
-from .instances import (ResidentDefinition, load_resident_catalog, migrate_legacy_state,
+from .instances import (ResidentDefinition, load_resident_catalog,
                         resolve_environment)
 from .mailbox import Mailbox
-from .memory import MemoryCurator, OpenAICuratorModel
 from .outputs import OutputCapability
-from .provider import OpenAIAgentsProvider, OpenAIResponsesProvider
+from .provider import OpenAIResponsesProvider
 from .runtime import ResidentRuntime
 from .telegram import TelegramTransport
 
@@ -55,14 +54,11 @@ def _provider(definition: ResidentDefinition):
     api_key = resolve_environment(definition.agent.api_key_env)
     base_url = (resolve_environment(definition.agent.base_url_env, required=False)
                 or "https://api.openai.com/v1").rstrip("/")
-    agent_id = (resolve_environment(definition.agent.agent_id_env, required=False)
-                if definition.agent.agent_id_env else None)
-    if definition.agent.provider == "openai-agents":
-        return OpenAIAgentsProvider(
-            api_key, definition.agent.model, base_url, agent_id=agent_id,
-            reasoning_effort=definition.agent.reasoning_effort,
-            service_tier=definition.agent.service_tier)
-    return OpenAIResponsesProvider(api_key, definition.agent.model, base_url)
+    return OpenAIResponsesProvider(
+        api_key, definition.agent.model, base_url,
+        reasoning_effort=definition.agent.reasoning_effort,
+        service_tier=definition.agent.service_tier,
+        compact_threshold=definition.agent.compact_threshold)
 
 
 def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
@@ -80,7 +76,6 @@ def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
         display = DisplayConnector(
             config.homeops_url, config.displays,
             request_timeout_seconds=config.homeops_request_timeout_seconds)
-        capabilities.extend(display.capabilities)
         output_capabilities.extend(display.output_capabilities)
     if config.agentcontroller_snapshot_path is not None:
         connector = AgentControllerConnector(
@@ -102,16 +97,6 @@ def _shared_resources(config: Config, diagnostics: TerminalDiagnostics):
         producers.append(connector)
         capabilities.extend(connector.capabilities)
     return producers, capabilities, output_capabilities
-
-
-def _bind_curator(runtime: ResidentRuntime, config: Config) -> None:
-    if not config.curator_model or not isinstance(runtime.provider, OpenAIAgentsProvider):
-        return
-    runtime.bind_curator(MemoryCurator(
-        runtime.store, runtime.provider,
-        OpenAICuratorModel(config.curator_api_key, config.curator_model,
-                           config.curator_base_url),
-        batch_size=config.curator_batch_size, max_batches=config.curator_max_batches))
 
 
 def _select_capabilities(grants: tuple[str, ...], available: list[Capability]) -> list[Capability]:
@@ -165,13 +150,6 @@ def _select_outputs(resident_id: str, grants: tuple[str, ...],
             "notify_owner" in grants)
 
 
-def _legacy_output_capabilities(
-        selected: list[OutputCapability], available: list[Capability],
-) -> list[Capability]:
-    names = {output.legacy_tool_name for output in selected if output.legacy_tool_name}
-    return [capability for capability in available if capability.name in names]
-
-
 def build_host(config: Config) -> RuntimeHost:
     if config.residents_dir is None:
         raise ValueError("A Resident definitions directory is required")
@@ -196,33 +174,17 @@ def build_host(config: Config) -> RuntimeHost:
     recipients = lambda: recipient_addresses
     try:
         for definition in catalog.residents:
-            curator = definition.curator
-            curator_model = curator.model if curator else None
-            curator_api_key = (
-                resolve_environment(curator.api_key_env)
-                if curator and curator_model else None)
-            curator_base_url = (
-                (resolve_environment(curator.base_url_env, required=False)
-                 or "https://api.openai.com/v1").rstrip("/")
-                if curator else "https://api.openai.com/v1")
             instance_config = replace(
                 config, data_dir=config.data_dir / "instances" / definition.id,
                 instance_id=definition.id, resident_name=definition.name,
                 personality=definition.personality, role=definition.role,
                 owner_communication_enabled=("notify_owner" in definition.outputs),
-                provider=definition.agent.provider, model=definition.agent.model,
+                model=definition.agent.model,
+                compact_threshold=definition.agent.compact_threshold,
                 reasoning_effort=definition.agent.reasoning_effort,
                 service_tier=definition.agent.service_tier,
                 keeper_history=definition.keeper_history,
-                curator_model=curator_model,
-                curator_api_key=curator_api_key,
-                curator_base_url=curator_base_url,
-                curator_batch_size=curator.batch_size if curator else 50,
-                curator_max_batches=curator.max_batches if curator else 4,
-                # The command-line request intentionally targets every enabled
-                # Resident constructed for this catalog startup, exactly once.
-                new_chapter=config.new_chapter,
-                openai_api_key=None, openai_agent_id=None, residents_dir=None)
+                openai_api_key=None, residents_dir=None)
             transport = None
             if definition.owner_transport:
                 item = definition.owner_transport
@@ -276,9 +238,6 @@ def build_host(config: Config) -> RuntimeHost:
                 owner_available=(
                     definition.owner_transport is not None
                     or definition.id == catalog.default_id))
-            granted_names = {capability.name for capability in grants}
-            grants.extend(capability for capability in _legacy_output_capabilities(
-                output_grants, instance_available) if capability.name not in granted_names)
             if "messaging" in definition.capabilities:
                 grants.append(special_messaging)
             runtime = ResidentRuntime(
@@ -289,7 +248,6 @@ def build_host(config: Config) -> RuntimeHost:
                 owner_output_enabled=owner_output_enabled,
                 diagnostic_output=lambda message, item=definition.id:
                     diagnostics.runtime(f"{item}: {message}"))
-            _bind_curator(runtime, instance_config)
             runtimes[definition.id] = runtime
             policies[definition.id] = InstancePolicy(frozenset(definition.subscriptions))
             if transport:
@@ -310,15 +268,13 @@ def build_host(config: Config) -> RuntimeHost:
         raise
 
 
-def _legacy_runtime(config: Config) -> ResidentRuntime:
+def _single_runtime(config: Config) -> ResidentRuntime:
     if not config.openai_api_key:
         raise ValueError("OPENAI_API_KEY must be set for the OpenAI provider")
-    provider = (OpenAIAgentsProvider(config.openai_api_key, config.model, config.openai_base_url,
-                                     agent_id=config.openai_agent_id,
-                                     reasoning_effort=config.reasoning_effort,
-                                     service_tier=config.service_tier)
-                if config.provider == "openai-agents" else
-                OpenAIResponsesProvider(config.openai_api_key, config.model, config.openai_base_url))
+    provider = OpenAIResponsesProvider(
+        config.openai_api_key, config.model, config.openai_base_url,
+        reasoning_effort=config.reasoning_effort, service_tier=config.service_tier,
+        compact_threshold=config.compact_threshold)
     diagnostics = TerminalDiagnostics(config.verbose)
     producers, capabilities, output_capabilities = _shared_resources(config, diagnostics)
     telegram = None
@@ -333,7 +289,6 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
         config, provider, capabilities=capabilities, event_producers=producers,
         output_capabilities=output_capabilities,
         owner_transport=telegram, diagnostic_output=diagnostics.runtime)
-    _bind_curator(runtime, config)
     for producer in producers:
         bind = getattr(producer, "bind_checkpoint", None)
         if bind is not None:
@@ -353,10 +308,6 @@ def _legacy_runtime(config: Config) -> ResidentRuntime:
 def main() -> int:
     try:
         config = Config.from_env_and_args()
-        if config.migrate_legacy:
-            target = migrate_legacy_state(config.data_dir)
-            print(f"Migrated legacy Resident state to {target}")
-            return 0
         if config.residents_dir is not None:
             host = build_host(config)
             try:
@@ -364,7 +315,7 @@ def main() -> int:
             finally:
                 host.close()
         else:
-            runtime = _legacy_runtime(config)
+            runtime = _single_runtime(config)
             try:
                 asyncio.run(runtime.run_interactive())
             finally:

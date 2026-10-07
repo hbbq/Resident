@@ -27,8 +27,6 @@ class CatalogTests(unittest.TestCase):
 
     def test_dynamic_capability_patterns_must_be_accounted_for(self) -> None:
         changes = (
-            ("display.py", 'name=f"{display_id}_show_text"',
-             'name=f"{display_id}_clear_text"'),
             ("external_app.py", "name=operation.name", "name=operation.alias"),
             ("realm.py", "for name, description, schema, route in specs",
              "for name, description, schema, route in extra_specs"),

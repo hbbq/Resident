@@ -6,7 +6,6 @@ from typing import Any, Sequence
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
-from .capabilities import Capability
 from .config import DisplayConfig
 from .observability import to_thread_timed
 from .outputs import OutputCapability
@@ -25,7 +24,6 @@ class DisplayConnector:
         display_ids = [display.id for display in displays]
         if len(set(display_ids)) != len(display_ids):
             raise ValueError("Duplicate display id")
-        self.capabilities = [self._capability(display_id) for display_id in display_ids]
         self.output_capabilities = [self._output_capability(display) for display in displays]
 
     def _output_capability(self, display: DisplayConfig) -> OutputCapability:
@@ -43,26 +41,8 @@ class DisplayConnector:
                 "required": ["content"], "additionalProperties": False,
             },
             route_identity=f"homeops-display:{display.id}", handler=deliver,
-            legacy_tool_name=f"{display.id}_show_text",
         )
 
-    def _capability(self, display_id: str) -> Capability:
-        async def show_text(arguments: dict[str, Any]) -> dict[str, Any]:
-            return await self.show_text(display_id, arguments["text"])
-
-        return Capability(
-            connector_id="display",
-            connector_description="Configured text displays backed by HomeOps queues",
-            name=f"{display_id}_show_text",
-            description=f"Enqueue plain text for the configured {display_id} display.",
-            input_schema={
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-                "additionalProperties": False,
-            },
-            handler=show_text,
-        )
 
     def _post_text(self, display_id: str, text: str) -> None:
         path_id = quote(display_id, safe="")

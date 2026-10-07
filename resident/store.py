@@ -23,7 +23,7 @@ _SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
                         "cached_input_tokens"),
     "tool.called": ("name",),
     "tool.completed": ("name",),
-    "disposition.generated": ("disposition_id", "turn_id", "validation_state", "output_count"),
+    "disposition.generated": ("disposition_id", "response_id", "validation_state", "output_count"),
     "output.queued": ("output_id", "output_type", "target"),
     "output.rejected": ("output_id", "output_type", "target", "classification"),
     "output.delivery_attempted": ("output_id", "output_type", "target", "attempt"),
@@ -37,78 +37,16 @@ _SAFE_JOURNAL_FIELDS: dict[str, tuple[str, ...]] = {
         "request", "request_timeout_seconds", "display_id", "lag_seconds",
         "max_event_loop_lag_seconds", "average_event_loop_lag_seconds",
         "sample_count", "started_monotonic_seconds", "finished_monotonic_seconds",
-        "gap_since_previous_seconds", "lifecycle_offset_seconds",
-        "turn_id", "tool_result_count", "event_id", "event_count",
-        "time_to_first_event_seconds", "first_event_type",
-        "time_to_first_model_activity_seconds", "first_model_activity_type",
-        "time_to_first_output_seconds", "first_output_type",
-        "time_to_completion_seconds", "completion_type",
-        "largest_inter_event_gap_seconds",
-        "reasoning_source",
-        "desired_reasoning_effort", "current_reasoning_effort",
-        "reasoning_change_reason"),
+        "response_id", "tool_result_count", "event_id"),
     "wake.failed": ("error_type",),
     "wake.finished": ("status", "duration_seconds", "model_calls"),
     "wake.sleeping": ("status",),
-    "curator.requested": ("status",),
-    "curator.started": ("attempt",),
-    "curator.caught_up": ("attempt",),
-    "curator.retry_scheduled": ("attempt", "error_type", "retry_seconds"),
-    "curator.degraded": ("attempt", "error_type", "retry_seconds"),
-    "curator.failed": ("phase", "error_type", "history_status"),
     "wakeup.scheduled": ("schedule_id", "due_at"),
 }
 _SAFE_JOURNAL_EVENT_LIMIT = 50
 MAX_OWNER_GUIDANCE_ENTRY_BYTES = 4096
 MAX_ACTIVE_OWNER_GUIDANCE_COUNT = 16
 MAX_ACTIVE_OWNER_GUIDANCE_BYTES = 32768
-
-
-def _create_request_configuration(request: dict[str, Any]) -> tuple[dict, dict]:
-    """Reconstruct the applied descriptors solely from a durable create request."""
-    agent = request.get("agent") if isinstance(request.get("agent"), dict) else {}
-    schema = ((agent.get("text") or {}).get("format") or {}).get("schema")
-    output_descriptors = []
-    if isinstance(schema, dict):
-        branches = (((schema.get("properties") or {}).get("outputs") or {})
-                    .get("items", {}).get("anyOf", []))
-        for branch in branches:
-            properties = branch.get("properties", {})
-            type_enum = properties.get("type", {}).get("enum", [])
-            target_enum = properties.get("target", {}).get("enum", [])
-            if len(type_enum) != 1:
-                continue
-            payload_properties = {key: value for key, value in properties.items()
-                                  if key not in {"type", "target"}}
-            payload_required = [key for key in branch.get("required", [])
-                                if key not in {"type", "target"}]
-            output_descriptors.append({
-                "type": type_enum[0] if len(type_enum) == 1 else None,
-                "target": target_enum[0] if len(target_enum) == 1 else None,
-                "description": branch.get("description"),
-                "payload_schema": {
-                    "type": "object", "properties": payload_properties,
-                    "required": payload_required, "additionalProperties": False,
-                },
-            })
-    protocol = {
-        "version": 2 if agent.get("text") else 1,
-        "instructions": agent.get("instructions"),
-        "tools": [{key: tool.get(key) for key in
-                   ("type", "name", "description", "parameters")}
-                  for tool in agent.get("tools", []) if isinstance(tool, dict)],
-        "saved_agent_id": request.get("agent_id"),
-        "environment": request.get("environment"),
-        "security_policy_revision": 1,
-        "output_schema_fingerprint": (hashlib.sha256(json.dumps(
-            schema, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            if schema is not None else None),
-        "output_schema": schema,
-        "output_capabilities": output_descriptors,
-    }
-    mutable = {key: agent[key] for key in ("model", "reasoning", "service_tier")
-               if key in agent}
-    return protocol, mutable
 
 
 def utc_now() -> str:
@@ -140,15 +78,23 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
-        self._migrate()
+        try:
+            self._create_schema()
+        except Exception:
+            self.connection.close()
+            raise
 
     def close(self) -> None:
         self.connection.close()
 
-    def _migrate(self) -> None:
+    def _create_schema(self) -> None:
+        # Runtime databases are disposable. There is deliberately no upgrade path.
+        version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = self.connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        if tables and version != 100:
+            raise ValueError("Unsupported Resident database; stop Resident and delete its disposable instance database")
         self.connection.executescript("""
-        CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-        INSERT INTO schema_version(version) SELECT 14 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+
         CREATE TABLE IF NOT EXISTS identities(
           role TEXT PRIMARY KEY CHECK(role IN ('resident','owner')), id TEXT NOT NULL UNIQUE,
           address_name TEXT NOT NULL, personality TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
@@ -167,7 +113,7 @@ class Store:
           run_id TEXT PRIMARY KEY REFERENCES wake_runs(id), format_version INTEGER NOT NULL DEFAULT 1,
           event_id TEXT NOT NULL, occurred_at TEXT NOT NULL, wake_source TEXT NOT NULL,
           wake_reason TEXT NOT NULL, wake_payload_json TEXT NOT NULL,
-          status TEXT NOT NULL, session_id TEXT, input_text TEXT,
+          status TEXT NOT NULL, conversation_id TEXT, input_text TEXT,
           realm_snapshot_json TEXT, realm_game_id TEXT, realm_actor_id TEXT,
           realm_revision INTEGER, input_bytes INTEGER, snapshot_bytes INTEGER,
           input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -175,9 +121,9 @@ class Store:
         CREATE TABLE IF NOT EXISTS keeper_activity(
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
           run_id TEXT NOT NULL REFERENCES keeper_interactions(run_id),
-          occurred_at TEXT NOT NULL, kind TEXT NOT NULL, session_id TEXT,
-          turn_id TEXT, call_id TEXT, content_json TEXT NOT NULL,
-          UNIQUE(run_id,kind,session_id,turn_id,call_id));
+          occurred_at TEXT NOT NULL, kind TEXT NOT NULL, conversation_id TEXT,
+          response_id TEXT, call_id TEXT, content_json TEXT NOT NULL,
+          UNIQUE(run_id,kind,conversation_id,response_id,call_id));
         CREATE TABLE IF NOT EXISTS journal(
           sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, run_id TEXT,
           event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, data_json TEXT NOT NULL);
@@ -194,102 +140,25 @@ class Store:
           message_id TEXT PRIMARY KEY REFERENCES messages(id),
           status TEXT NOT NULL CHECK(status IN ('pending','completed')),
           completed_at TEXT);
-        CREATE TABLE IF NOT EXISTS agent_session_bindings(
-          provider TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT,
-          last_turn_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS memory_records(
-          id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL
-            CHECK(status IN ('active','superseded','invalidated')),
-          current_revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS memory_revisions(
-          memory_id TEXT NOT NULL REFERENCES memory_records(id), revision INTEGER NOT NULL,
-          operation TEXT NOT NULL CHECK(operation IN ('create','update','supersede','invalidate')),
-          content TEXT NOT NULL, rationale TEXT NOT NULL DEFAULT '', confidence REAL,
-          operation_key TEXT NOT NULL, created_at TEXT NOT NULL,
-          PRIMARY KEY(memory_id,revision), UNIQUE(operation_key));
-        CREATE TABLE IF NOT EXISTS memory_provenance(
-          memory_id TEXT NOT NULL, revision INTEGER NOT NULL, source_session_id TEXT,
-          source_item_id TEXT, source_type TEXT NOT NULL, source_timestamp TEXT,
-          excerpt TEXT, content_hash TEXT,
-          FOREIGN KEY(memory_id,revision) REFERENCES memory_revisions(memory_id,revision));
         CREATE TABLE IF NOT EXISTS owner_guidance(
           id TEXT PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL
             CHECK(status IN ('active','superseded','removed')),
-          revision INTEGER NOT NULL, source_session_id TEXT, source_item_id TEXT,
+          revision INTEGER NOT NULL, source_message_id TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS owner_guidance_revisions(
           guidance_id TEXT NOT NULL REFERENCES owner_guidance(id), revision INTEGER NOT NULL,
           operation TEXT NOT NULL CHECK(operation IN ('set','remove')), content TEXT NOT NULL,
-          source_session_id TEXT, source_item_id TEXT, created_at TEXT NOT NULL,
+          source_message_id TEXT, created_at TEXT NOT NULL,
           PRIMARY KEY(guidance_id,revision));
-        CREATE TABLE IF NOT EXISTS curator_checkpoints(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, cursor TEXT,
-          last_item_id TEXT, last_turn_id TEXT, handover_draft TEXT, updated_at TEXT NOT NULL,
-          PRIMARY KEY(provider,session_id));
-        CREATE TABLE IF NOT EXISTS curator_consumed_turns(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
-          cursor TEXT NOT NULL, PRIMARY KEY(provider,session_id,turn_id));
-        CREATE TABLE IF NOT EXISTS curator_operations(
-          operation_key TEXT PRIMARY KEY, session_id TEXT NOT NULL,
-          cursor TEXT, applied_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS curator_jobs(
-          id TEXT PRIMARY KEY, session_id TEXT NOT NULL, source_cursor TEXT,
-          status TEXT NOT NULL CHECK(status IN ('claimed','completed','failed')),
-          attempts INTEGER NOT NULL, last_error_type TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS curator_requests(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, target_turn_id TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('pending','running','retrying')),
-          attempts INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT, last_error_type TEXT,
-          requested_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          PRIMARY KEY(provider,session_id));
-        CREATE TABLE IF NOT EXISTS session_handovers(
-          id TEXT PRIMARY KEY, old_session_id TEXT NOT NULL, new_session_id TEXT,
-          content TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-          consumed_at TEXT);
-        CREATE TABLE IF NOT EXISTS session_protocol_descriptors(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, descriptor_json TEXT NOT NULL,
-          created_at TEXT NOT NULL, PRIMARY KEY(provider,session_id));
-        CREATE TABLE IF NOT EXISTS session_mutable_settings(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, settings_json TEXT NOT NULL,
-          updated_at TEXT NOT NULL, PRIMARY KEY(provider,session_id));
-        CREATE TABLE IF NOT EXISTS session_authoritative_state(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, state_json TEXT NOT NULL,
-          updated_at TEXT NOT NULL, PRIMARY KEY(provider,session_id));
-        CREATE TABLE IF NOT EXISTS session_rollovers(
-          id TEXT PRIMARY KEY, provider TEXT NOT NULL, old_session_id TEXT,
-          new_session_id TEXT, reason TEXT NOT NULL, requested_by TEXT NOT NULL,
-          finalization_status TEXT NOT NULL, status TEXT NOT NULL,
-          creation_state TEXT NOT NULL DEFAULT 'not_attempted', create_token TEXT,
-          create_request_json TEXT, create_request_hash TEXT, handover_id TEXT,
-          protocol_descriptor_json TEXT, mutable_settings_json TEXT,
-          created_at TEXT NOT NULL, create_started_at TEXT, bound_at TEXT, completed_at TEXT);
-        CREATE TABLE IF NOT EXISTS session_rollover_requests(
-          provider TEXT PRIMARY KEY, old_session_id TEXT NOT NULL, reason TEXT NOT NULL,
-          requested_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS agent_tool_actions(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
-          call_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('pending','completed')),
-          output_json TEXT, attachments_ephemeral INTEGER NOT NULL DEFAULT 0
-            CHECK(attachments_ephemeral IN (0,1)), created_at TEXT NOT NULL, completed_at TEXT,
-          PRIMARY KEY(provider,session_id,call_id));
         CREATE TABLE IF NOT EXISTS realm_mutation_requests(
           idempotency_key TEXT PRIMARY KEY, path TEXT NOT NULL,
           body_json TEXT NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS agent_wake_submissions(
-          provider TEXT NOT NULL, session_id TEXT NOT NULL, wake_key TEXT NOT NULL,
-          correlation TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('possibly_accepted','settled')),
-          turn_id TEXT, wake_id TEXT, wake_source TEXT, wake_reason TEXT,
-          attempted_at TEXT NOT NULL, settled_at TEXT,
-          PRIMARY KEY(provider,session_id,wake_key));
         CREATE TABLE IF NOT EXISTS final_dispositions(
-          id TEXT PRIMARY KEY, provider TEXT NOT NULL, session_id TEXT NOT NULL,
-          turn_id TEXT NOT NULL, run_id TEXT, wake_id TEXT,
+          id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+          response_id TEXT NOT NULL, run_id TEXT, wake_id TEXT,
           schema_fingerprint TEXT NOT NULL, raw_disposition TEXT,
           normalized_disposition_json TEXT, validation_state TEXT NOT NULL,
-          created_at TEXT NOT NULL, UNIQUE(provider,session_id,turn_id));
+          created_at TEXT NOT NULL, UNIQUE(conversation_id,response_id));
         CREATE TABLE IF NOT EXISTS output_requests(
           id TEXT PRIMARY KEY, disposition_id TEXT NOT NULL REFERENCES final_dispositions(id),
           ordinal INTEGER NOT NULL, output_type TEXT NOT NULL, target TEXT,
@@ -312,177 +181,28 @@ class Store:
         CREATE INDEX IF NOT EXISTS idx_keeper_activity_run ON keeper_activity(run_id,sequence);
         CREATE INDEX IF NOT EXISTS idx_journal_run_sequence ON journal(run_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON scheduled_wakeups(status, due_at);
-        CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory_records(status,updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_memory_provenance_source
-          ON memory_provenance(source_session_id,source_item_id);
         CREATE INDEX IF NOT EXISTS idx_output_dispatch
           ON output_requests(delivery_state,next_attempt_at,created_at);
+        CREATE TABLE IF NOT EXISTS conversation_binding(
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1), conversation_id TEXT NOT NULL,
+          created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS response_steps(
+          id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES wake_runs(id),
+          conversation_id TEXT NOT NULL, round INTEGER NOT NULL, wake_json TEXT NOT NULL,
+          schema_json TEXT NOT NULL, response_id TEXT, turn_json TEXT,
+          status TEXT NOT NULL CHECK(status IN ('submitting','returned','settled','rejected')),
+          created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS tool_executions(
+          conversation_id TEXT NOT NULL, call_id TEXT NOT NULL, response_id TEXT NOT NULL,
+          name TEXT NOT NULL, arguments_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+          output_json TEXT, attachments_ephemeral INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL, completed_at TEXT,
+          PRIMARY KEY(conversation_id,call_id));
+        CREATE INDEX IF NOT EXISTS idx_response_steps_status ON response_steps(status);
+
+        PRAGMA user_version=100;
         """)
-        # SQLite's table UNIQUE constraint considers NULL values distinct. Keep
-        # the first persisted event (and its sequence) when upgrading databases
-        # that may already contain retried model turns.
-        activity_identity_index = self.connection.execute("""
-            SELECT 1 FROM sqlite_master WHERE type='index'
-              AND name='idx_keeper_activity_identity'
-        """).fetchone()
-        if activity_identity_index is None:
-            with self.connection:
-                self.connection.execute("""
-                DELETE FROM keeper_activity
-                WHERE EXISTS (
-                  SELECT 1 FROM keeper_activity AS earlier
-                  WHERE earlier.sequence < keeper_activity.sequence
-                    AND earlier.run_id = keeper_activity.run_id
-                    AND earlier.kind = keeper_activity.kind
-                    AND earlier.session_id IS keeper_activity.session_id
-                    AND earlier.turn_id IS keeper_activity.turn_id
-                    AND earlier.call_id IS keeper_activity.call_id)
-                """)
-                self.connection.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_keeper_activity_identity
-                ON keeper_activity(
-                  run_id, kind,
-                  COALESCE(session_id, ''), session_id IS NULL,
-                  COALESCE(turn_id, ''), turn_id IS NULL,
-                  COALESCE(call_id, ''), call_id IS NULL)
-                """)
-        # An already-provisioned Resident predates capability snapshots. Seed an
-        # empty baseline so its first run with this feature sees the currently
-        # available capabilities as additions. A genuinely new database has no
-        # Resident identity yet and will establish its first baseline silently.
-        existing_resident = self.connection.execute(
-            "SELECT 1 FROM identities WHERE role='resident'"
-        ).fetchone()
-        existing_capability_snapshot = self.connection.execute(
-            "SELECT 1 FROM observed_snapshots WHERE scope='runtime.capabilities'"
-        ).fetchone()
-        if existing_resident is not None and existing_capability_snapshot is None:
-            self.connection.execute(
-                "INSERT INTO observed_snapshots(scope,data_json,updated_at) VALUES(?,?,?)",
-                ("runtime.capabilities", "{}", utc_now()),
-            )
-        table_sql = self.connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='scheduled_wakeups'"
-        ).fetchone()[0]
-        if "'failed'" not in table_sql:
-            with self.connection:
-                self.connection.execute("DROP INDEX IF EXISTS idx_schedules_due")
-                self.connection.execute("ALTER TABLE scheduled_wakeups RENAME TO scheduled_wakeups_v1")
-                self.connection.execute("""
-                    CREATE TABLE scheduled_wakeups(
-                      id TEXT PRIMARY KEY, due_at TEXT NOT NULL, reason TEXT NOT NULL,
-                      context_json TEXT NOT NULL, status TEXT NOT NULL
-                      CHECK(status IN ('pending','claimed','completed','failed')), created_at TEXT NOT NULL)
-                """)
-                self.connection.execute("""
-                    INSERT INTO scheduled_wakeups(id,due_at,reason,context_json,status,created_at)
-                    SELECT id,due_at,reason,context_json,status,created_at FROM scheduled_wakeups_v1
-                """)
-                self.connection.execute("DROP TABLE scheduled_wakeups_v1")
-                self.connection.execute(
-                    "CREATE INDEX idx_schedules_due ON scheduled_wakeups(status, due_at)")
-        telegram_columns = self.connection.execute(
-            "PRAGMA table_info(telegram_owner_updates)"
-        ).fetchall()
-        if "bot_identity" not in {row["name"] for row in telegram_columns}:
-            with self.connection:
-                self.connection.execute(
-                    "ALTER TABLE telegram_owner_updates RENAME TO telegram_owner_updates_v1")
-                self.connection.execute("""
-                    CREATE TABLE telegram_owner_updates(
-                      bot_identity TEXT NOT NULL, update_id INTEGER NOT NULL,
-                      message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
-                      PRIMARY KEY(bot_identity, update_id))
-                """)
-                self.connection.execute("""
-                    INSERT INTO telegram_owner_updates(bot_identity,update_id,message_id)
-                    SELECT 'legacy',update_id,message_id FROM telegram_owner_updates_v1
-                """)
-                self.connection.execute("DROP TABLE telegram_owner_updates_v1")
-        with self.connection:
-            self.connection.execute("DROP TABLE IF EXISTS memories")
-        action_columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(agent_tool_actions)")
-        }
-        if "attachments_ephemeral" not in action_columns:
-            with self.connection:
-                self.connection.execute(
-                    "ALTER TABLE agent_tool_actions ADD COLUMN "
-                    "attachments_ephemeral INTEGER NOT NULL DEFAULT 0 "
-                    "CHECK(attachments_ephemeral IN (0,1))")
-        checkpoint_columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(curator_checkpoints)")
-        }
-        if "handover_draft" not in checkpoint_columns:
-            with self.connection:
-                self.connection.execute(
-                    "ALTER TABLE curator_checkpoints ADD COLUMN handover_draft TEXT")
-        if "last_turn_id" not in checkpoint_columns:
-            with self.connection:
-                self.connection.execute(
-                    "ALTER TABLE curator_checkpoints ADD COLUMN last_turn_id TEXT")
-        wake_submission_columns = {
-            row["name"] for row in self.connection.execute(
-                "PRAGMA table_info(agent_wake_submissions)")
-        }
-        with self.connection:
-            for name in ("wake_id", "wake_source", "wake_reason"):
-                if name not in wake_submission_columns:
-                    self.connection.execute(
-                        f"ALTER TABLE agent_wake_submissions ADD COLUMN {name} TEXT")
-        output_request_columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(output_requests)")
-        }
-        if "max_attempts" not in output_request_columns:
-            with self.connection:
-                self.connection.execute(
-                    "ALTER TABLE output_requests ADD COLUMN "
-                    "max_attempts INTEGER NOT NULL DEFAULT 3")
-        rollover_columns = {
-            row["name"] for row in self.connection.execute("PRAGMA table_info(session_rollovers)")
-        }
-        rollover_additions = {
-            "creation_state": "TEXT NOT NULL DEFAULT 'not_attempted'",
-            "create_token": "TEXT",
-            "create_request_json": "TEXT",
-            "create_request_hash": "TEXT",
-            "handover_id": "TEXT",
-            "protocol_descriptor_json": "TEXT",
-            "mutable_settings_json": "TEXT",
-            "create_started_at": "TEXT",
-            "bound_at": "TEXT",
-        }
-        with self.connection:
-            for name, declaration in rollover_additions.items():
-                if name not in rollover_columns:
-                    self.connection.execute(
-                        f"ALTER TABLE session_rollovers ADD COLUMN {name} {declaration}")
-            # A pending row written by the old implementation may already have
-            # crossed the remote POST. Treat it as uncertain, never as an
-            # unattempted create merely because the old schema lacked this state.
-            self.connection.execute("""
-                UPDATE session_rollovers SET creation_state='create_uncertain'
-                WHERE status='pending' AND create_request_json IS NULL
-                  AND creation_state='not_attempted'
-            """)
-            legacy_snapshots = self.connection.execute("""
-                SELECT id,create_request_json FROM session_rollovers
-                WHERE status='pending' AND creation_state='not_attempted'
-                  AND create_request_json IS NOT NULL
-                  AND (protocol_descriptor_json IS NULL OR mutable_settings_json IS NULL)
-            """).fetchall()
-            for row in legacy_snapshots:
-                request = json.loads(row["create_request_json"])
-                protocol, mutable = _create_request_configuration(request)
-                self.connection.execute("""
-                    UPDATE session_rollovers
-                    SET protocol_descriptor_json=?,mutable_settings_json=? WHERE id=?
-                """, (
-                    json.dumps(protocol, sort_keys=True, separators=(",", ":")),
-                    json.dumps(mutable, sort_keys=True, separators=(",", ":")),
-                    row["id"],
-                ))
-        self.connection.execute("UPDATE schema_version SET version=22")
         # A process may stop after transport acceptance but before recording it.
         # Retry uncertain attempts only while the persisted delivery policy allows it.
         now = utc_now()
@@ -551,24 +271,6 @@ class Store:
                     updated_at=excluded.updated_at
             """, (scope, encoded, utc_now()))
 
-    def session_authoritative_state(self, provider: str,
-                                    session_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT state_json FROM session_authoritative_state
-            WHERE provider=? AND session_id=?
-        """, (provider, session_id)).fetchone()
-        return None if row is None else json.loads(row["state_json"])
-
-    def save_session_authoritative_state(self, provider: str, session_id: str,
-                                         state: dict[str, Any]) -> None:
-        encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO session_authoritative_state(
-                  provider,session_id,state_json,updated_at) VALUES(?,?,?,?)
-                ON CONFLICT(provider,session_id) DO UPDATE SET
-                  state_json=excluded.state_json,updated_at=excluded.updated_at
-            """, (provider, session_id, encoded, utc_now()))
 
     def owner_guidance_revision(self, guidance_id: str) -> int | None:
         row = self.connection.execute("""
@@ -577,690 +279,6 @@ class Store:
         """, (guidance_id,)).fetchone()
         return None if row is None or row["revision"] is None else int(row["revision"])
 
-    def agent_session_binding(self, provider: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT provider,session_id,agent_id,last_turn_id,created_at,updated_at
-            FROM agent_session_bindings WHERE provider=?
-        """, (provider,)).fetchone()
-        return None if row is None else dict(row)
-
-    def save_agent_session_binding(self, provider: str, session_id: str,
-                                   agent_id: str | None, last_turn_id: str | None) -> None:
-        now = utc_now()
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO agent_session_bindings(
-                  provider,session_id,agent_id,last_turn_id,created_at,updated_at)
-                VALUES(?,?,?,?,?,?)
-                ON CONFLICT(provider) DO UPDATE SET
-                  session_id=excluded.session_id, agent_id=excluded.agent_id,
-                  last_turn_id=excluded.last_turn_id, updated_at=excluded.updated_at
-            """, (provider, session_id, agent_id, last_turn_id, now, now))
-
-    def agent_wake_submission(self, provider: str, session_id: str,
-                              wake_key: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT provider,session_id,wake_key,correlation,state,turn_id,
-                   wake_id,wake_source,wake_reason,attempted_at,settled_at
-            FROM agent_wake_submissions
-            WHERE provider=? AND session_id=? AND wake_key=?
-        """, (provider, session_id, wake_key)).fetchone()
-        return None if row is None else dict(row)
-
-    def mark_agent_wake_submission_attempted(self, provider: str, session_id: str,
-                                             wake_key: str,
-                                             correlation: str, *, wake_id: str | None = None,
-                                             wake_source: str | None = None,
-                                             wake_reason: str | None = None) -> None:
-        """Durably cross the point of no blind retry before the remote POST."""
-        now = utc_now()
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO agent_wake_submissions(
-                  provider,session_id,wake_key,correlation,state,turn_id,wake_id,
-                  wake_source,wake_reason,attempted_at,settled_at)
-                VALUES(?,?,?,?,'possibly_accepted',NULL,?,?,?,?,NULL)
-                ON CONFLICT(provider,session_id,wake_key) DO UPDATE SET
-                  correlation=excluded.correlation,state='possibly_accepted',
-                  turn_id=NULL,
-                  wake_id=COALESCE(excluded.wake_id,agent_wake_submissions.wake_id),
-                  wake_source=COALESCE(
-                    excluded.wake_source,agent_wake_submissions.wake_source),
-                  wake_reason=COALESCE(
-                    excluded.wake_reason,agent_wake_submissions.wake_reason),
-                  attempted_at=excluded.attempted_at,
-                  settled_at=NULL
-            """, (provider, session_id, wake_key, correlation, wake_id,
-                  wake_source, wake_reason, now))
-
-    def disposition_wake_context(self, provider: str, session_id: str,
-                                 turn_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT wake_id,wake_source,wake_reason FROM agent_wake_submissions
-            WHERE provider=? AND session_id=? AND turn_id=?
-        """, (provider, session_id, turn_id)).fetchone()
-        if row is None or row["wake_source"] is None or row["wake_reason"] is None:
-            return None
-        return dict(row)
-
-    def correlate_agent_wake_submission(self, provider: str, session_id: str,
-                                        wake_key: str, turn_id: str) -> None:
-        with self.connection:
-            cursor = self.connection.execute("""
-                UPDATE agent_wake_submissions SET turn_id=?
-                WHERE provider=? AND session_id=? AND wake_key=?
-                  AND state='possibly_accepted'
-            """, (turn_id, provider, session_id, wake_key))
-            if cursor.rowcount != 1:
-                raise RuntimeError("Agents wake submission checkpoint is missing")
-
-    def settle_agent_wake_submission(self, provider: str, session_id: str,
-                                     turn_id: str) -> None:
-        with self.connection:
-            self.connection.execute("""
-                UPDATE agent_wake_submissions SET state='settled',settled_at=?
-                WHERE provider=? AND session_id=? AND turn_id=?
-            """, (utc_now(), provider, session_id, turn_id))
-
-    def clear_agent_wake_submission(self, provider: str, session_id: str,
-                                    wake_key: str) -> None:
-        with self.connection:
-            self.connection.execute("""
-                DELETE FROM agent_wake_submissions
-                WHERE provider=? AND session_id=? AND wake_key=?
-            """, (provider, session_id, wake_key))
-
-    def bind_initial_agent_session(self, provider: str, session_id: str,
-                                   agent_id: str | None,
-                                   create_request: dict[str, Any],
-                                   protocol_descriptor: dict[str, Any],
-                                   mutable_settings: dict[str, Any]) -> None:
-        """Atomically bind a created session and its exact applied configuration."""
-        request_protocol, request_mutable = _create_request_configuration(create_request)
-        if protocol_descriptor != request_protocol or mutable_settings != request_mutable:
-            raise ValueError(
-                "Initial create request and configuration descriptors must match")
-        descriptor_json = json.dumps(
-            protocol_descriptor, sort_keys=True, separators=(",", ":"))
-        settings_json = json.dumps(
-            mutable_settings, sort_keys=True, separators=(",", ":"))
-        now = utc_now()
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO agent_session_bindings(
-                  provider,session_id,agent_id,last_turn_id,created_at,updated_at)
-                VALUES(?,?,?,NULL,?,?) ON CONFLICT(provider) DO UPDATE SET
-                  session_id=excluded.session_id,agent_id=excluded.agent_id,last_turn_id=NULL,
-                  updated_at=excluded.updated_at
-            """, (provider, session_id, agent_id, now, now))
-            self.connection.execute("""
-                INSERT INTO session_protocol_descriptors(provider,session_id,descriptor_json,created_at)
-                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
-                  descriptor_json=excluded.descriptor_json
-            """, (provider, session_id, descriptor_json, now))
-            self.connection.execute("""
-                INSERT INTO session_mutable_settings(provider,session_id,settings_json,updated_at)
-                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
-                  settings_json=excluded.settings_json,updated_at=excluded.updated_at
-            """, (provider, session_id, settings_json, now))
-
-    def save_session_protocol(self, provider: str, session_id: str,
-                              descriptor: dict[str, Any]) -> None:
-        encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO session_protocol_descriptors(provider,session_id,descriptor_json,created_at)
-                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
-                  descriptor_json=excluded.descriptor_json
-            """, (provider, session_id, encoded, utc_now()))
-
-    def session_protocol(self, provider: str, session_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT descriptor_json FROM session_protocol_descriptors
-            WHERE provider=? AND session_id=?
-        """, (provider, session_id)).fetchone()
-        return None if row is None else json.loads(row["descriptor_json"])
-
-    def save_session_mutable_settings(self, provider: str, session_id: str,
-                                      settings: dict[str, Any]) -> None:
-        encoded = json.dumps(settings, sort_keys=True, separators=(",", ":"))
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO session_mutable_settings(provider,session_id,settings_json,updated_at)
-                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
-                  settings_json=excluded.settings_json,updated_at=excluded.updated_at
-            """, (provider, session_id, encoded, utc_now()))
-
-    def session_mutable_settings(self, provider: str,
-                                 session_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT settings_json FROM session_mutable_settings
-            WHERE provider=? AND session_id=?
-        """, (provider, session_id)).fetchone()
-        return None if row is None else json.loads(row["settings_json"])
-
-    def begin_session_rollover(self, provider: str, old_session_id: str | None,
-                               reason: str, requested_by: str,
-                               create_request: dict[str, Any],
-                               protocol_descriptor: dict[str, Any],
-                               mutable_settings: dict[str, Any]) -> dict[str, Any]:
-        # Once a create may have crossed the remote boundary, its recorded
-        # transition excludes every competing create for this provider/session.
-        # Its historical reason and snapshots remain authoritative.
-        pending = self.connection.execute("""
-            SELECT * FROM session_rollovers
-            WHERE provider=? AND old_session_id IS ? AND status='pending'
-              AND creation_state IN ('create_uncertain','not_attempted')
-            ORDER BY CASE creation_state WHEN 'create_uncertain' THEN 0 ELSE 1 END,
-              created_at ASC LIMIT 1
-        """, (provider, old_session_id)).fetchone()
-        if pending is not None:
-            result = dict(pending)
-            if result.get("create_request_json"):
-                result["create_request"] = json.loads(result["create_request_json"])
-            if result.get("protocol_descriptor_json"):
-                result["protocol_descriptor"] = json.loads(
-                    result["protocol_descriptor_json"])
-            if result.get("mutable_settings_json"):
-                result["mutable_settings"] = json.loads(result["mutable_settings_json"])
-            return result
-        rollover_id = str(uuid.uuid4())
-        create_token = str(uuid.uuid4())
-        request = json.loads(json.dumps(create_request))
-        request.setdefault("metadata", {})["rollover_token"] = create_token
-        encoded = json.dumps(request, sort_keys=True, separators=(",", ":"))
-        request_hash = hashlib.sha256(encoded.encode()).hexdigest()
-        request_protocol, request_mutable = _create_request_configuration(request)
-        if protocol_descriptor != request_protocol or mutable_settings != request_mutable:
-            raise ValueError(
-                "Rollover create request and configuration descriptors must match")
-        descriptor_json = json.dumps(
-            protocol_descriptor, sort_keys=True, separators=(",", ":"))
-        settings_json = json.dumps(mutable_settings, sort_keys=True, separators=(",", ":"))
-        handover = self.pending_handover(old_session_id) if old_session_id else None
-        if handover is not None:
-            try:
-                bootstrap = json.loads(request.get("input", ""))["new_session_bootstrap"]
-            except (KeyError, TypeError, json.JSONDecodeError):
-                handover = None
-            else:
-                if bootstrap.get("handover") != handover["content"]:
-                    handover = None
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO session_rollovers(
-                  id,provider,old_session_id,reason,requested_by,finalization_status,status,
-                  creation_state,create_token,create_request_json,create_request_hash,
-                  handover_id,protocol_descriptor_json,mutable_settings_json,created_at)
-                VALUES(?,?,?,?,?,'pending','pending','not_attempted',?,?,?,?,?,?,?)
-            """, (rollover_id, provider, old_session_id, reason, requested_by,
-                  create_token, encoded, request_hash,
-                  handover["id"] if handover else None, descriptor_json, settings_json,
-                  utc_now()))
-        return {
-            "id": rollover_id, "provider": provider, "old_session_id": old_session_id,
-            "reason": reason, "status": "pending", "creation_state": "not_attempted",
-            "create_token": create_token, "create_request": request,
-            "create_request_hash": request_hash,
-            "handover_id": handover["id"] if handover else None,
-            "protocol_descriptor": json.loads(descriptor_json),
-            "mutable_settings": json.loads(settings_json),
-        }
-
-    def request_session_rollover(self, provider: str, old_session_id: str,
-                                 reason: str, requested_by: str = "runtime") -> None:
-        """Durably retain a pre-create request while final consolidation runs."""
-        now = utc_now()
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO session_rollover_requests(
-                  provider,old_session_id,reason,requested_by,created_at,updated_at)
-                VALUES(?,?,?,?,?,?)
-                ON CONFLICT(provider) DO UPDATE SET
-                  old_session_id=excluded.old_session_id,reason=excluded.reason,
-                  requested_by=excluded.requested_by,updated_at=excluded.updated_at
-                WHERE NOT (
-                  session_rollover_requests.old_session_id=excluded.old_session_id
-                  AND session_rollover_requests.reason='operator_forced'
-                  AND session_rollover_requests.requested_by='operator')
-            """, (provider, old_session_id, reason, requested_by, now, now))
-
-    def pending_session_rollover_request(self, provider: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT * FROM session_rollover_requests WHERE provider=?", (provider,)).fetchone()
-        return None if row is None else dict(row)
-
-    def forced_session_abandonment(self, provider: str) -> dict[str, Any] | None:
-        """Return an operator marker only for the current, unclaimed binding."""
-        row = self.connection.execute("""
-            SELECT request.* FROM session_rollover_requests AS request
-            JOIN agent_session_bindings AS binding
-              ON binding.provider=request.provider
-             AND binding.session_id=request.old_session_id
-            WHERE request.provider=? AND request.reason='operator_forced'
-              AND request.requested_by='operator'
-              AND NOT EXISTS (
-                SELECT 1 FROM session_rollovers AS rollover
-                WHERE rollover.provider=request.provider AND rollover.status='pending'
-                  AND (rollover.old_session_id IS NOT request.old_session_id
-                       OR rollover.reason!='operator_forced'))
-        """, (provider,)).fetchone()
-        return None if row is None else dict(row)
-
-    def clear_session_rollover_request(self, provider: str,
-                                       old_session_id: str) -> None:
-        with self.connection:
-            self.connection.execute("""
-                DELETE FROM session_rollover_requests
-                WHERE provider=? AND old_session_id=?
-            """, (provider, old_session_id))
-
-    def pending_session_rollover(self, provider: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT * FROM session_rollovers WHERE provider=? AND status='pending'
-            ORDER BY CASE WHEN creation_state='create_uncertain' AND old_session_id IS (
-                SELECT session_id FROM agent_session_bindings WHERE provider=?
-              ) THEN 0 WHEN old_session_id IS (
-                SELECT session_id FROM agent_session_bindings WHERE provider=?
-              ) THEN 1 ELSE 2 END,
-              CASE WHEN creation_state='create_uncertain' THEN created_at END ASC,
-              created_at DESC LIMIT 1
-        """, (provider, provider, provider)).fetchone()
-        if row is None:
-            return None
-        result = dict(row)
-        if result.get("create_request_json"):
-            result["create_request"] = json.loads(result["create_request_json"])
-        if result.get("protocol_descriptor_json"):
-            result["protocol_descriptor"] = json.loads(result["protocol_descriptor_json"])
-        if result.get("mutable_settings_json"):
-            result["mutable_settings"] = json.loads(result["mutable_settings_json"])
-        return result
-
-    def mark_session_rollover_create_started(self, rollover_id: str) -> None:
-        with self.connection:
-            result = self.connection.execute("""
-                UPDATE session_rollovers SET creation_state='create_uncertain',create_started_at=?
-                WHERE id=? AND status='pending' AND creation_state='not_attempted'
-            """, (utc_now(), rollover_id))
-        if result.rowcount != 1:
-            raise RuntimeError("Rollover remote creation is not safe to start again")
-
-    def bind_session_rollover(self, rollover_id: str, new_session_id: str,
-                              agent_id: str | None,
-                              finalization_status: str) -> None:
-        now = utc_now()
-        row = self.connection.execute(
-            "SELECT provider,protocol_descriptor_json,mutable_settings_json "
-            "FROM session_rollovers WHERE id=? AND status='pending' "
-            "AND creation_state='create_uncertain'", (rollover_id,)).fetchone()
-        if row is None:
-            raise RuntimeError("Rollover is not awaiting a remote create result")
-        provider = row["provider"]
-        descriptor_json = row["protocol_descriptor_json"]
-        settings_json = row["mutable_settings_json"]
-        if descriptor_json is None or settings_json is None:
-            raise RuntimeError("Rollover has no durable configuration snapshot")
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO agent_session_bindings(
-                  provider,session_id,agent_id,last_turn_id,created_at,updated_at)
-                VALUES(?,?,?,NULL,?,?) ON CONFLICT(provider) DO UPDATE SET
-                  session_id=excluded.session_id,agent_id=excluded.agent_id,last_turn_id=NULL,
-                  updated_at=excluded.updated_at
-            """, (provider, new_session_id, agent_id, now, now))
-            self.connection.execute("""
-                INSERT INTO session_protocol_descriptors(provider,session_id,descriptor_json,created_at)
-                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
-                  descriptor_json=excluded.descriptor_json
-            """, (provider, new_session_id, descriptor_json, now))
-            self.connection.execute("""
-                INSERT INTO session_mutable_settings(provider,session_id,settings_json,updated_at)
-                VALUES(?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
-                  settings_json=excluded.settings_json,updated_at=excluded.updated_at
-            """, (provider, new_session_id, settings_json, now))
-            self.connection.execute("""
-                UPDATE session_rollovers SET new_session_id=?,creation_state='bound',
-                  finalization_status=?,bound_at=? WHERE id=?
-            """, (new_session_id, finalization_status, now, rollover_id))
-
-    def recover_session_rollovers(self, provider: str) -> int:
-        """Finish only replacements whose binding was durably committed."""
-        now = utc_now()
-        binding = self.agent_session_binding(provider)
-        with self.connection:
-            if binding is not None:
-                # Legacy rows did not record the explicit bound state. A binding
-                # away from the recorded old session is nevertheless durable
-                # proof that the replacement ID reached SQLite.
-                self.connection.execute("""
-                    UPDATE session_rollovers SET new_session_id=?,creation_state='bound',
-                      bound_at=?,finalization_status=CASE
-                        WHEN finalization_status='pending' THEN 'unknown_after_restart'
-                        ELSE finalization_status END
-                    WHERE provider=? AND status='pending'
-                      AND create_request_json IS NULL AND creation_state='create_uncertain'
-                      AND (old_session_id IS NULL OR old_session_id<>?)
-                """, (binding["session_id"], now, provider, binding["session_id"]))
-            result = self.connection.execute("""
-                UPDATE session_rollovers SET status='completed',completed_at=?
-                WHERE provider=? AND status='pending' AND creation_state='bound'
-            """, (now, provider))
-            self.connection.execute("""
-                UPDATE session_handovers SET new_session_id=(
-                    SELECT new_session_id FROM session_rollovers
-                    WHERE session_rollovers.handover_id=session_handovers.id
-                      AND provider=? AND creation_state='bound'
-                    ORDER BY bound_at DESC LIMIT 1),consumed_at=?
-                WHERE consumed_at IS NULL AND id IN (
-                    SELECT handover_id FROM session_rollovers
-                    WHERE provider=? AND creation_state='bound' AND handover_id IS NOT NULL)
-            """, (provider, now, provider))
-        return result.rowcount
-
-    def complete_session_rollover(self, rollover_id: str) -> None:
-        with self.connection:
-            self.connection.execute("""
-                UPDATE session_rollovers SET status='completed',completed_at=?
-                WHERE id=? AND status='pending' AND creation_state='bound'
-            """, (utc_now(), rollover_id))
-
-    def fail_session_rollover(self, rollover_id: str,
-                              finalization_status: str = "failed") -> None:
-        with self.connection:
-            self.connection.execute("""
-                UPDATE session_rollovers SET finalization_status=?,status='failed',
-                  creation_state='rejected',completed_at=?
-                WHERE id=? AND status='pending'
-            """, (finalization_status, utc_now(), rollover_id))
-
-    def curator_checkpoint(self, provider: str, session_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT cursor,last_item_id,last_turn_id,handover_draft,updated_at FROM curator_checkpoints
-            WHERE provider=? AND session_id=?
-        """, (provider, session_id)).fetchone()
-        return None if row is None else dict(row)
-
-    def curator_turn_consumed(self, provider: str, session_id: str,
-                              turn_id: str) -> bool:
-        return self.connection.execute("""
-            SELECT 1 FROM curator_consumed_turns
-            WHERE provider=? AND session_id=? AND turn_id=?
-        """, (provider, session_id, turn_id)).fetchone() is not None
-
-    def mark_curator_turn_consumed(self, provider: str, session_id: str,
-                                   turn_id: str, cursor: str) -> bool:
-        """Verify the checkpoint still sits at a source-proven turn boundary."""
-        with self.connection:
-            result = self.connection.execute("""
-                INSERT INTO curator_consumed_turns(provider,session_id,turn_id,cursor)
-                SELECT provider,session_id,?,cursor FROM curator_checkpoints
-                WHERE provider=? AND session_id=? AND cursor=? AND last_turn_id=?
-                ON CONFLICT DO NOTHING
-            """, (turn_id, provider, session_id, cursor, turn_id))
-        return result.rowcount == 1
-
-    def record_verified_historical_turn(self, provider: str, session_id: str,
-                                        turn_id: str, boundary_cursor: str,
-                                        checkpoint_cursor: str) -> bool:
-        """Backfill a source-verified boundary under the checkpoint that was scanned."""
-        with self.connection:
-            result = self.connection.execute("""
-                INSERT INTO curator_consumed_turns(provider,session_id,turn_id,cursor)
-                SELECT provider,session_id,?,? FROM curator_checkpoints
-                WHERE provider=? AND session_id=? AND cursor=?
-                ON CONFLICT DO NOTHING
-            """, (turn_id, boundary_cursor, provider, session_id, checkpoint_cursor))
-        return result.rowcount == 1
-
-    def upgrade_legacy_curator_checkpoint(self, provider: str, session_id: str,
-                                          cursor: str, last_item_id: str,
-                                          last_turn_id: str) -> bool:
-        """Record a verified turn only if the legacy checkpoint is unchanged."""
-        with self.connection:
-            result = self.connection.execute("""
-                UPDATE curator_checkpoints SET last_turn_id=?,updated_at=?
-                WHERE provider=? AND session_id=? AND cursor=? AND last_item_id=?
-                  AND last_turn_id IS NULL
-            """, (last_turn_id, utc_now(), provider, session_id, cursor, last_item_id))
-            if result.rowcount:
-                self.connection.execute("""
-                    INSERT OR IGNORE INTO curator_consumed_turns
-                    (provider,session_id,turn_id,cursor) VALUES(?,?,?,?)
-                """, (provider, session_id, last_turn_id, cursor))
-        return result.rowcount == 1
-
-    def apply_curator_batch(self, provider: str, session_id: str, cursor: str | None,
-                            last_item_id: str | None, operation_key: str,
-                            mutations: list[dict[str, Any]],
-                            handover_operation: str = "keep",
-                            handover_draft: str | None = None,
-                            last_turn_id: str | None = None,
-                            consumed_turns: tuple[tuple[str, str], ...] = ()) -> bool:
-        """Atomically apply validated curator decisions and advance its source checkpoint."""
-        if any(not mutation.get("provenance") for mutation in mutations):
-            raise ValueError("Durable Curator memory requires verified provenance")
-        if handover_operation not in {"keep", "replace", "clear"}:
-            raise ValueError("Unsupported Curator handover operation")
-        if handover_operation == "replace" and not handover_draft:
-            raise ValueError("Replacement Curator handover must be nonempty")
-        if handover_operation != "replace" and handover_draft is not None:
-            raise ValueError("Only handover replacement may provide draft content")
-        now = utc_now()
-        with self.connection:
-            claimed = self.connection.execute("""
-                INSERT INTO curator_operations(operation_key,session_id,cursor,applied_at)
-                VALUES(?,?,?,?) ON CONFLICT DO NOTHING
-            """, (operation_key, session_id, cursor, now))
-            if claimed.rowcount == 0:
-                return False
-            for index, mutation in enumerate(mutations):
-                memory_id = str(mutation.get("memory_id") or uuid.uuid4())
-                operation = mutation["operation"]
-                existing = self.connection.execute(
-                    "SELECT current_revision FROM memory_records WHERE id=?", (memory_id,)
-                ).fetchone()
-                if operation == "create" and existing is not None:
-                    raise ValueError(f"Memory create targets an existing record: {memory_id}")
-                revision = (existing["current_revision"] + 1) if existing else 1
-                if operation != "create" and existing is None:
-                    raise ValueError(f"Memory mutation targets an unknown record: {memory_id}")
-                status = {"create": "active", "update": "active",
-                          "supersede": "superseded", "invalidate": "invalidated"}[operation]
-                if existing is None:
-                    self.connection.execute("""
-                        INSERT INTO memory_records(id,kind,status,current_revision,created_at,updated_at)
-                        VALUES(?,?,?,?,?,?)
-                    """, (memory_id, mutation.get("kind", "experience"), status, revision, now, now))
-                else:
-                    self.connection.execute("""
-                        UPDATE memory_records SET status=?,current_revision=?,updated_at=? WHERE id=?
-                    """, (status, revision, now, memory_id))
-                mutation_key = f"{operation_key}:{index}"
-                self.connection.execute("""
-                    INSERT INTO memory_revisions(
-                      memory_id,revision,operation,content,rationale,confidence,operation_key,created_at)
-                    VALUES(?,?,?,?,?,?,?,?)
-                """, (memory_id, revision, operation, mutation.get("content", ""),
-                      mutation.get("rationale", ""), mutation.get("confidence"), mutation_key, now))
-                for evidence in mutation.get("provenance", []):
-                    self.connection.execute("""
-                        INSERT INTO memory_provenance(
-                          memory_id,revision,source_session_id,source_item_id,source_type,
-                          source_timestamp,excerpt,content_hash) VALUES(?,?,?,?,?,?,?,?)
-                    """, (memory_id, revision, session_id,
-                          evidence.get("item_id"), evidence.get("source_type", "session_item"),
-                          evidence.get("timestamp"), evidence.get("excerpt"),
-                          evidence.get("content_hash")))
-            self.connection.execute("""
-                INSERT INTO curator_checkpoints(
-                  provider,session_id,cursor,last_item_id,last_turn_id,handover_draft,updated_at)
-                VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET
-                  cursor=excluded.cursor,last_item_id=excluded.last_item_id,
-                  last_turn_id=excluded.last_turn_id,
-                  handover_draft=CASE ?
-                    WHEN 'keep' THEN curator_checkpoints.handover_draft
-                    WHEN 'replace' THEN excluded.handover_draft
-                    WHEN 'clear' THEN NULL END,
-                  updated_at=excluded.updated_at
-            """, (provider, session_id, cursor, last_item_id, last_turn_id,
-                  handover_draft, now,
-                  handover_operation))
-            for turn_id, boundary_cursor in consumed_turns:
-                self.connection.execute("""
-                    INSERT OR IGNORE INTO curator_consumed_turns
-                    (provider,session_id,turn_id,cursor) VALUES(?,?,?,?)
-                """, (provider, session_id, turn_id, boundary_cursor))
-        return True
-
-    def request_curator_catch_up(self, provider: str, session_id: str,
-                                 target_turn_id: str) -> bool:
-        """Durably coalesce routine work to the newest completed turn."""
-        now = utc_now()
-        with self.connection:
-            if self.curator_turn_consumed(provider, session_id, target_turn_id):
-                return False
-            current = self.connection.execute("""
-                SELECT target_turn_id FROM curator_requests
-                WHERE provider=? AND session_id=?
-            """, (provider, session_id)).fetchone()
-            if current is not None and current["target_turn_id"] == target_turn_id:
-                return False
-            self.connection.execute("""
-                INSERT INTO curator_requests(
-                  provider,session_id,target_turn_id,status,attempts,requested_at,updated_at)
-                VALUES(?,?,?,'pending',0,?,?)
-                ON CONFLICT(provider,session_id) DO UPDATE SET
-                  target_turn_id=excluded.target_turn_id,status='pending',attempts=0,
-                  next_retry_at=NULL,last_error_type=NULL,requested_at=excluded.requested_at,
-                  updated_at=excluded.updated_at
-            """, (provider, session_id, target_turn_id, now, now))
-        return True
-
-    def curator_request(self, provider: str, session_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT provider,session_id,target_turn_id,status,attempts,next_retry_at,
-                   last_error_type,requested_at,updated_at
-            FROM curator_requests WHERE provider=? AND session_id=?
-        """, (provider, session_id)).fetchone()
-        return None if row is None else dict(row)
-
-    def start_curator_request(self, provider: str, session_id: str,
-                              target_turn_id: str) -> int | None:
-        now = utc_now()
-        with self.connection:
-            result = self.connection.execute("""
-                UPDATE curator_requests SET status='running',attempts=attempts+1,
-                  next_retry_at=NULL,updated_at=?
-                WHERE provider=? AND session_id=? AND target_turn_id=?
-            """, (now, provider, session_id, target_turn_id))
-            if result.rowcount == 0:
-                return None
-            row = self.connection.execute("""
-                SELECT attempts FROM curator_requests WHERE provider=? AND session_id=?
-            """, (provider, session_id)).fetchone()
-        return int(row["attempts"])
-
-    def retry_curator_request(self, provider: str, session_id: str,
-                              target_turn_id: str, error_type: str,
-                              retry_seconds: float) -> bool:
-        next_retry = (datetime.now(UTC) + timedelta(seconds=retry_seconds)).isoformat()
-        with self.connection:
-            result = self.connection.execute("""
-                UPDATE curator_requests SET status='retrying',next_retry_at=?,
-                  last_error_type=?,updated_at=?
-                WHERE provider=? AND session_id=? AND target_turn_id=?
-            """, (next_retry, error_type[:100], utc_now(), provider, session_id,
-                  target_turn_id))
-        return result.rowcount > 0
-
-    def complete_curator_request(self, provider: str, session_id: str,
-                                 target_turn_id: str | None = None) -> bool:
-        parameters: list[Any] = [provider, session_id]
-        target_clause = ""
-        if target_turn_id is not None:
-            target_clause = " AND target_turn_id=?"
-            parameters.append(target_turn_id)
-        with self.connection:
-            result = self.connection.execute(
-                "DELETE FROM curator_requests WHERE provider=? AND session_id=?" + target_clause,
-                parameters)
-        return result.rowcount > 0
-
-    def claim_curator_job(self, job_id: str, session_id: str,
-                          source_cursor: str | None) -> bool:
-        now = utc_now()
-        with self.connection:
-            row = self.connection.execute(
-                "SELECT status FROM curator_jobs WHERE id=?", (job_id,)).fetchone()
-            if row is not None and row["status"] == "completed":
-                return False
-            self.connection.execute("""
-                INSERT INTO curator_jobs(
-                  id,session_id,source_cursor,status,attempts,created_at,updated_at)
-                VALUES(?,?,?,'claimed',1,?,?)
-                ON CONFLICT(id) DO UPDATE SET status='claimed',attempts=attempts+1,
-                  last_error_type=NULL,updated_at=excluded.updated_at
-            """, (job_id, session_id, source_cursor, now, now))
-        return True
-
-    def finish_curator_job(self, job_id: str) -> None:
-        with self.connection:
-            self.connection.execute("""
-                UPDATE curator_jobs SET status='completed',updated_at=? WHERE id=?
-            """, (utc_now(), job_id))
-
-    def fail_curator_job(self, job_id: str, error_type: str) -> None:
-        with self.connection:
-            self.connection.execute("""
-                UPDATE curator_jobs SET status='failed',last_error_type=?,updated_at=? WHERE id=?
-            """, (error_type[:100], utc_now(), job_id))
-
-    def search_memories(self, query: str = "", *, limit: int = 10,
-                        offset: int = 0) -> list[dict[str, Any]]:
-        limit = max(1, min(limit, 20))
-        offset = max(0, min(offset, 1000))
-        parameters: list[Any] = []
-        where = "WHERE records.status='active'"
-        if query:
-            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            where += " AND lower(revisions.content) LIKE lower(?) ESCAPE '\\'"
-            parameters.append(f"%{escaped}%")
-        parameters.extend((limit, offset))
-        rows = self.connection.execute(f"""
-            SELECT records.id,records.kind,revisions.content,revisions.confidence,
-                   records.updated_at FROM memory_records records
-            JOIN memory_revisions revisions ON revisions.memory_id=records.id
-              AND revisions.revision=records.current_revision
-            {where} ORDER BY records.updated_at DESC,records.id LIMIT ? OFFSET ?
-        """, parameters).fetchall()
-        return [dict(row) for row in rows]
-
-    def memory_awareness(self, *, limit: int = 8) -> list[dict[str, Any]]:
-        """Compact type-level index for replacement-session bootstrap."""
-        rows = self.connection.execute("""
-            SELECT kind,count(*) AS active_count,max(updated_at) AS most_recent_at
-            FROM memory_records WHERE status='active' GROUP BY kind
-            ORDER BY most_recent_at DESC,kind LIMIT ?
-        """, (max(1, min(limit, 20)),)).fetchall()
-        return [dict(row) for row in rows]
-
-    def memory(self, memory_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT records.id,records.kind,records.status,records.current_revision,
-                   revisions.content,revisions.rationale,revisions.confidence,records.updated_at
-            FROM memory_records records JOIN memory_revisions revisions
-              ON revisions.memory_id=records.id AND revisions.revision=records.current_revision
-            WHERE records.id=?
-        """, (memory_id,)).fetchone()
-        if row is None:
-            return None
-        result = dict(row)
-        result["provenance"] = [dict(item) for item in self.connection.execute("""
-            SELECT source_session_id,source_item_id,source_type,source_timestamp,excerpt,content_hash
-            FROM memory_provenance WHERE memory_id=? AND revision=?
-        """, (memory_id, row["current_revision"]))]
-        return result
 
     def active_owner_guidance(self) -> list[dict[str, Any]]:
         entries = [dict(row) for row in self.connection.execute("""
@@ -1271,8 +289,7 @@ class Store:
         return entries
 
     def set_owner_guidance(self, content: str, *, guidance_id: str | None = None,
-                           source_session_id: str | None = None,
-                           source_item_id: str | None = None) -> str:
+                           source_message_id: str | None = None) -> str:
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Owner guidance must be nonempty text")
         if len(content.encode("utf-8")) > MAX_OWNER_GUIDANCE_ENTRY_BYTES:
@@ -1293,26 +310,23 @@ class Store:
             prospective.sort(key=lambda entry: (entry["updated_at"], entry["id"]))
             _validate_owner_guidance_projection(prospective)
             self.connection.execute("""
-                INSERT INTO owner_guidance(id,content,status,revision,source_session_id,
-                  source_item_id,created_at,updated_at) VALUES(?,?,'active',?,?,?,?,?)
+                INSERT INTO owner_guidance(id,content,status,revision,source_message_id,created_at,updated_at) VALUES(?,?,'active',?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET content=excluded.content,status='active',
-                  revision=excluded.revision,source_session_id=excluded.source_session_id,
-                  source_item_id=excluded.source_item_id,updated_at=excluded.updated_at
+                  revision=excluded.revision,source_message_id=excluded.source_message_id,updated_at=excluded.updated_at
             """, (guidance_id, content, revision,
-                  source_session_id, source_item_id, now, now))
+                  source_message_id, now, now))
             self.connection.execute("""
                 INSERT INTO owner_guidance_revisions(
-                  guidance_id,revision,operation,content,source_session_id,source_item_id,created_at)
-                VALUES(?,?,'set',?,?,?,?)
-            """, (guidance_id, revision, content, source_session_id, source_item_id, now))
+                  guidance_id,revision,operation,content,source_message_id,created_at)
+                VALUES(?,?,'set',?,?,?)
+            """, (guidance_id, revision, content, source_message_id, now))
         return guidance_id
 
     def remove_owner_guidance(self, guidance_id: str, *,
-                              source_session_id: str | None = None,
-                              source_item_id: str | None = None) -> bool:
+                                 source_message_id: str | None = None) -> bool:
         with self.connection:
             current = self.connection.execute("""
-                SELECT content,revision,source_session_id,source_item_id FROM owner_guidance
+                SELECT content,revision,source_message_id FROM owner_guidance
                 WHERE id=? AND status='active'
             """, (guidance_id,)).fetchone()
             if current is None:
@@ -1323,10 +337,10 @@ class Store:
             """, (utc_now(), guidance_id))
             self.connection.execute("""
                 INSERT INTO owner_guidance_revisions(
-                  guidance_id,revision,operation,content,source_session_id,source_item_id,created_at)
-                VALUES(?,?,'remove',?,?,?,?)
+                  guidance_id,revision,operation,content,source_message_id,created_at)
+                VALUES(?,?,'remove',?,?,?)
             """, (guidance_id, current["revision"] + 1, current["content"],
-                  source_session_id, source_item_id, utc_now()))
+                  source_message_id, utc_now()))
         return result.rowcount == 1
 
     def is_pending_owner_message(self, message_id: str, owner_id: str) -> bool:
@@ -1341,48 +355,6 @@ class Store:
               AND messages.sender_id=? AND owner_message_processing.status='pending'
         """, (message_id, owner_id)).fetchone() is not None
 
-    def create_handover(self, old_session_id: str, content: str, expires_at: str) -> str:
-        pending = self.pending_handover(old_session_id)
-        if pending is not None:
-            bound = self.connection.execute(
-                "SELECT 1 FROM session_rollovers WHERE handover_id=? AND status='pending'",
-                (pending["id"],)).fetchone()
-            if bound is None:
-                with self.connection:
-                    self.connection.execute(
-                        "UPDATE session_handovers SET content=?,created_at=?,expires_at=? "
-                        "WHERE id=? AND consumed_at IS NULL",
-                        (content, utc_now(), expires_at, pending["id"]))
-            return pending["id"]
-        handover_id = str(uuid.uuid4())
-        with self.connection:
-            self.connection.execute("""
-                INSERT INTO session_handovers(id,old_session_id,content,created_at,expires_at)
-                VALUES(?,?,?,?,?)
-            """, (handover_id, old_session_id, content, utc_now(), expires_at))
-        return handover_id
-
-    def pending_handover(self, old_session_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute("""
-            SELECT id,old_session_id,new_session_id,content,created_at,expires_at,consumed_at
-            FROM session_handovers WHERE old_session_id=? AND consumed_at IS NULL
-              AND expires_at>? ORDER BY created_at DESC LIMIT 1
-        """, (old_session_id, utc_now())).fetchone()
-        return None if row is None else dict(row)
-
-    def consume_handover(self, handover_id: str, new_session_id: str) -> str | None:
-        now = utc_now()
-        with self.connection:
-            row = self.connection.execute("""
-                SELECT content FROM session_handovers WHERE id=? AND consumed_at IS NULL
-                  AND expires_at>?
-            """, (handover_id, now)).fetchone()
-            if row is None:
-                return None
-            self.connection.execute("""
-                UPDATE session_handovers SET new_session_id=?,consumed_at=? WHERE id=?
-            """, (new_session_id, now, handover_id))
-        return row["content"]
 
     def realm_mutation_request(self, key: str, path: str | None = None,
                                body: dict[str, Any] | None = None
@@ -1400,56 +372,25 @@ class Store:
             """, (key,)).fetchone()
         return (row["path"], json.loads(row["body_json"])) if row else None
 
-    def begin_agent_tool_action(self, provider: str, session_id: str, turn_id: str,
-                                call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-        with self.connection:
-            cursor = self.connection.execute("""
-                INSERT INTO agent_tool_actions(
-                  provider,session_id,turn_id,call_id,name,arguments_json,status,created_at)
-                VALUES(?,?,?,?,?,?,'pending',?) ON CONFLICT DO NOTHING
-            """, (provider, session_id, turn_id, call_id, name, encoded, utc_now()))
-            row = self.connection.execute("""
-                SELECT turn_id,name,arguments_json,status,output_json,attachments_ephemeral
-                FROM agent_tool_actions WHERE provider=? AND session_id=? AND call_id=?
-            """, (provider, session_id, call_id)).fetchone()
-        if row["turn_id"] != turn_id or row["name"] != name or row["arguments_json"] != encoded:
-            raise RuntimeError("Agents function call id was reused with different action data")
-        return {
-            "claimed": cursor.rowcount == 1, "status": row["status"],
-            "output": json.loads(row["output_json"]) if row["output_json"] else None,
-            "attachments_ephemeral": bool(row["attachments_ephemeral"]),
-        }
-
-    def complete_agent_tool_action(self, provider: str, session_id: str,
-                                   call_id: str, output: dict[str, Any],
-                                   attachments_ephemeral: bool = False) -> None:
-        encoded = json.dumps(output, sort_keys=True, separators=(",", ":"))
-        with self.connection:
-            self.connection.execute("""
-                UPDATE agent_tool_actions SET status='completed',output_json=?,
-                  attachments_ephemeral=?,completed_at=?
-                WHERE provider=? AND session_id=? AND call_id=? AND status='pending'
-            """, (encoded, int(attachments_ephemeral), utc_now(), provider, session_id, call_id))
 
     @staticmethod
-    def _disposition_id(provider: str, session_id: str, turn_id: str) -> str:
+    def _disposition_id(conversation_id: str, response_id: str) -> str:
         return hashlib.sha256(
-            f"{provider}\0{session_id}\0{turn_id}".encode()).hexdigest()
+            f"{conversation_id}\0{response_id}".encode()).hexdigest()
 
-    def has_final_disposition(self, provider: str, session_id: str, turn_id: str) -> bool:
+    def has_final_disposition(self, conversation_id: str, response_id: str) -> bool:
         return self.connection.execute("""
             SELECT 1 FROM final_dispositions
-            WHERE provider=? AND session_id=? AND turn_id=?
-        """, (provider, session_id, turn_id)).fetchone() is not None
+            WHERE conversation_id=? AND response_id=?
+        """, (conversation_id, response_id)).fetchone() is not None
 
     def persist_final_disposition(
-            self, provider: str, session_id: str, turn_id: str,
+            self, conversation_id: str, response_id: str,
             schema_fingerprint: str, raw_disposition: str | None,
             normalized: dict[str, Any] | None, validation_state: str,
             jobs: list[dict[str, Any]], *, run_id: str | None = None,
             wake_id: str | None = None) -> dict[str, Any]:
-        disposition_id = self._disposition_id(provider, session_id, turn_id)
+        disposition_id = self._disposition_id(conversation_id, response_id)
         now = utc_now()
         normalized_json = (json.dumps(normalized, ensure_ascii=False, sort_keys=True,
                                       separators=(",", ":"))
@@ -1458,10 +399,10 @@ class Store:
         with self.connection:
             inserted = self.connection.execute("""
                 INSERT INTO final_dispositions(
-                  id,provider,session_id,turn_id,run_id,wake_id,schema_fingerprint,
+                  id,conversation_id,response_id,run_id,wake_id,schema_fingerprint,
                   raw_disposition,normalized_disposition_json,validation_state,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,session_id,turn_id) DO NOTHING
-            """, (disposition_id, provider, session_id, turn_id, run_id, wake_id,
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(conversation_id,response_id) DO NOTHING
+            """, (disposition_id, conversation_id, response_id, run_id, wake_id,
                   schema_fingerprint, raw_disposition, normalized_json,
                   validation_state, now)).rowcount == 1
             if not inserted:
@@ -1497,6 +438,17 @@ class Store:
                         "UPDATE output_requests SET failure_event_generated=1 WHERE id=?",
                         (output_id,))
                 created_requests.append({"id": output_id, **job, "message_id": message_id})
+            if run_id is not None:
+                self.connection.execute("UPDATE response_steps SET status='settled' WHERE run_id=?", (run_id,))
+                if validation_state == 'valid':
+                    self.connection.execute("UPDATE wake_runs SET status='completed',finished_at=? WHERE id=?", (now, run_id))
+                    step = self.connection.execute("SELECT wake_json FROM response_steps WHERE run_id=? LIMIT 1", (run_id,)).fetchone()
+                    if step:
+                        wake = json.loads(step['wake_json'])
+                        if wake['source'] == 'owner':
+                            self.connection.execute("UPDATE owner_message_processing SET status='completed',completed_at=? WHERE message_id=?", (now, wake['payload'].get('message_id')))
+                        if wake['source'] == 'scheduler':
+                            self.connection.execute("UPDATE scheduled_wakeups SET status='completed' WHERE id=?", (wake['payload'].get('schedule_id'),))
         return {"id": disposition_id, "created": True, "requests": created_requests}
 
     def claim_output_request(self, now: str | None = None) -> dict[str, Any] | None:
@@ -1769,7 +721,7 @@ class Store:
             """, (run_id, event.id, event.occurred_at, event.source, event.reason,
                   json.dumps(event.payload, ensure_ascii=False), game_id, actor_id))
 
-    def set_keeper_input(self, run_id: str, session_id: str | None,
+    def set_keeper_input(self, run_id: str, conversation_id: str | None,
                          input_text: str, realm_snapshot: dict[str, Any] | None) -> None:
         snapshot = (json.dumps(realm_snapshot, ensure_ascii=False)
                     if realm_snapshot is not None else None)
@@ -1777,21 +729,21 @@ class Store:
             "current_revision") if realm_snapshot and "trusted_state" in realm_snapshot else None
         with self.connection:
             self.connection.execute("""
-                UPDATE keeper_interactions SET session_id=?,input_text=?,realm_snapshot_json=?,
+                UPDATE keeper_interactions SET conversation_id=?,input_text=?,realm_snapshot_json=?,
                   realm_revision=?,input_bytes=?,snapshot_bytes=? WHERE run_id=?
-            """, (session_id, input_text, snapshot, revision,
+            """, (conversation_id, input_text, snapshot, revision,
                   len(input_text.encode("utf-8")),
                   len(snapshot.encode("utf-8")) if snapshot is not None else 0, run_id))
 
     def add_keeper_activity(self, run_id: str, kind: str, content: Any, *,
-                            session_id: str | None = None, turn_id: str | None = None,
+                            conversation_id: str | None = None, response_id: str | None = None,
                             call_id: str | None = None) -> None:
         with self.connection:
             self.connection.execute("""
                 INSERT OR IGNORE INTO keeper_activity(
-                  run_id,occurred_at,kind,session_id,turn_id,call_id,content_json)
+                  run_id,occurred_at,kind,conversation_id,response_id,call_id,content_json)
                 VALUES(?,?,?,?,?,?,?)
-            """, (run_id, utc_now(), kind, session_id, turn_id, call_id,
+            """, (run_id, utc_now(), kind, conversation_id, response_id, call_id,
                   json.dumps(content, ensure_ascii=False)))
 
     def finish_keeper_interaction(self, run_id: str, status: str) -> None:
@@ -1800,96 +752,13 @@ class Store:
                 UPDATE keeper_interactions SET status=?,completed_at=? WHERE run_id=?
             """, (status, utc_now(), run_id))
 
-    def keeper_recent_context(self, count: int, byte_limit: int, *,
-                              game_id: str, actor_id: str) -> list[dict[str, Any]]:
-        """Newest completed wakes for this Realm game and actor that fit."""
-        if count <= 0 or byte_limit <= 0:
-            return []
-        rows = self.connection.execute("""
-            SELECT run_id,occurred_at,wake_source,wake_reason,wake_payload_json
-            FROM keeper_interactions
-            WHERE status='completed' AND realm_game_id=? AND realm_actor_id=?
-            ORDER BY completed_at DESC, rowid DESC LIMIT ?
-        """, (game_id, actor_id, count)).fetchall()
-        selected: list[dict[str, Any]] = []
-        def bootstrap_bytes(entries: list[dict[str, Any]]) -> int:
-            # Match the field's nesting and indentation in build_managed_bootstrap.
-            wrapper = {"new_session_bootstrap": {
-                "preceding_field": None, "keeper_recent_interactions": entries}}
-            empty = {"new_session_bootstrap": {"preceding_field": None}}
-            return len(json.dumps(wrapper, ensure_ascii=False, indent=2).encode("utf-8")) - len(
-                json.dumps(empty, ensure_ascii=False, indent=2).encode("utf-8"))
-
-        for row in rows:
-            activities = self.connection.execute("""
-                SELECT kind,turn_id,call_id,content_json FROM keeper_activity
-                WHERE run_id=? ORDER BY sequence
-            """, (row["run_id"],)).fetchall()
-            narrative = []
-            results = {}
-            for item in activities:
-                if item["kind"] == "tool_result" and item["turn_id"] and item["call_id"]:
-                    data = json.loads(item["content_json"])
-                    if isinstance(data, dict):
-                        results[(item["turn_id"], item["call_id"])] = data
-            for item in activities:
-                data = json.loads(item["content_json"])
-                if item["kind"] == "model_turn":
-                    if data.get("message"):
-                        narrative.append({"kind": "keeper_output", "text": data["message"]})
-                    for call in data.get("tool_calls") or []:
-                        name, arguments = call.get("name"), call.get("arguments")
-                        if not isinstance(arguments, dict):
-                            continue
-                        completion = results.get((item["turn_id"], call.get("id")))
-                        if not completion or completion.get("name") != name:
-                            continue
-                        result = completion.get("result")
-                        if not isinstance(result, dict) or result.get("ok") is not True:
-                            continue
-                        if name == "send_owner_message" and result.get("delivered") is True and isinstance(
-                                arguments.get("content"), str):
-                            narrative.append({"kind": "player_facing_call", "name": name,
-                                              "content": arguments["content"]})
-                        elif name == "realm_world_patch":
-                            # Only explicit player projections may cross from a
-                            # trusted world patch into the rollover narrative.
-                            player_views = []
-                            for section in ("entities", "entity_updates"):
-                                items = arguments.get(section)
-                                if not isinstance(items, list):
-                                    continue
-                                player_views.extend(
-                                    item["player"] for item in items
-                                    if isinstance(item, dict) and isinstance(
-                                        item.get("player"), dict))
-                            if player_views:
-                                narrative.append({"kind": "player_facing_call", "name": name,
-                                                  "player_views": player_views})
-                elif item["kind"] == "tool_result":
-                    result = data.get("result") or {}
-                    # Never replay tool-returned Realm views or mutation bodies as facts.
-                    ok = result.get("ok", "error" not in result)
-                    if data.get("name") == "send_owner_message":
-                        ok = ok and result.get("delivered") is True
-                    narrative.append({"kind": "action_outcome", "name": data.get("name"),
-                                      "ok": ok,
-                                      "error_code": result.get("error_code"),
-                                      "outcome": result.get("outcome")})
-            entry = {"at": row["occurred_at"], "trigger": {
-                "source": row["wake_source"], "reason": row["wake_reason"],
-                "payload": json.loads(row["wake_payload_json"])}, "activity": narrative}
-            if bootstrap_bytes([entry, *selected]) > byte_limit:
-                break
-            selected.append(entry)
-        return list(reversed(selected))
 
     def finish_run(self, run_id: str, status: str, duration: float, model_calls: int,
                    schedule_id: str | None = None,
                    owner_message_id: str | None = None) -> None:
         with self.connection:
             self.connection.execute(
-                "UPDATE wake_runs SET finished_at=?,status=?,duration_seconds=?,model_calls=? WHERE id=?",
+                "UPDATE wake_runs SET finished_at=?,status=CASE WHEN status='completed' THEN status ELSE ? END,duration_seconds=?,model_calls=? WHERE id=?",
                 (utc_now(), status, duration, model_calls, run_id))
             if schedule_id is not None:
                 schedule_status = "completed" if status == "completed" else "failed"
@@ -1988,3 +857,70 @@ class Store:
                 self.connection.executemany("UPDATE scheduled_wakeups SET status='claimed' WHERE id=? AND status='pending'", ((r["id"],) for r in rows))
         return [{"id": r["id"], "due_at": r["due_at"], "reason": r["reason"],
                  "context": json.loads(r["context_json"])} for r in rows]
+
+    def conversation_id(self) -> str | None:
+        row = self.connection.execute("SELECT conversation_id FROM conversation_binding WHERE singleton=1").fetchone()
+        return row[0] if row else None
+
+    def bind_conversation(self, conversation_id: str) -> None:
+        with self.connection:
+            self.connection.execute("INSERT INTO conversation_binding VALUES(1,?,?)", (conversation_id, utc_now()))
+
+    def completed_event_run(self, event_id: str) -> str | None:
+        row = self.connection.execute("SELECT id FROM wake_runs WHERE event_id=? AND status='completed'", (event_id,)).fetchone()
+        return row[0] if row else None
+
+    def begin_response_step(self, run_id: str, conversation_id: str, round_number: int,
+                            wake: WakeEvent, schema: dict) -> str:
+        from dataclasses import asdict
+        step_id = str(uuid.uuid4())
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO response_steps(id,run_id,conversation_id,round,wake_json,schema_json,status,created_at)
+                VALUES(?,?,?,?,?,?,'submitting',?)
+            """, (step_id, run_id, conversation_id, round_number, json.dumps(asdict(wake)),
+                  json.dumps(schema), utc_now()))
+        return step_id
+
+    def record_response(self, step_id: str, turn: Any) -> None:
+        from dataclasses import asdict
+        with self.connection:
+            self.connection.execute("UPDATE response_steps SET response_id=?,turn_json=?,status='returned' WHERE id=?",
+                                    (turn.response_id, json.dumps(asdict(turn)), step_id))
+
+    def note_response_id(self, step_id: str, response_id: str) -> None:
+        with self.connection:
+            self.connection.execute("UPDATE response_steps SET response_id=? WHERE id=?",
+                                    (response_id, step_id))
+
+    def reject_response_step(self, step_id: str) -> None:
+        with self.connection:
+            self.connection.execute("UPDATE response_steps SET status='rejected' WHERE id=?", (step_id,))
+
+    def unfinished_response_steps(self) -> list[dict]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM response_steps WHERE status IN ('submitting','returned') ORDER BY created_at,round")]
+
+    def begin_tool_execution(self, conversation_id: str, response_id: str,
+                             call_id: str, name: str, arguments: dict) -> dict:
+        encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+        with self.connection:
+            claimed = self.connection.execute("""
+                INSERT INTO tool_executions(conversation_id,call_id,response_id,name,arguments_json,status,created_at)
+                VALUES(?,?,?,?,?,'pending',?) ON CONFLICT DO NOTHING
+            """, (conversation_id, call_id, response_id, name, encoded, utc_now())).rowcount == 1
+            row = self.connection.execute("SELECT * FROM tool_executions WHERE conversation_id=? AND call_id=?",
+                                          (conversation_id, call_id)).fetchone()
+        if row['name'] != name or row['arguments_json'] != encoded:
+            raise RuntimeError("Function call ID reused with different arguments")
+        return {'claimed': claimed, 'status': row['status'],
+                'output': json.loads(row['output_json']) if row['output_json'] else None,
+                'attachments_ephemeral': bool(row['attachments_ephemeral'])}
+
+    def complete_tool_execution(self, conversation_id: str, call_id: str, output: dict,
+                                attachments_ephemeral: bool = False) -> None:
+        with self.connection:
+            self.connection.execute("""
+                UPDATE tool_executions SET status='completed',output_json=?,attachments_ephemeral=?,completed_at=?
+                WHERE conversation_id=? AND call_id=? AND status='pending'
+            """, (json.dumps(output), int(attachments_ephemeral), utc_now(), conversation_id, call_id))

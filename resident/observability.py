@@ -103,7 +103,6 @@ def emit_timeline(operation: str, moment: str, **fields: Any) -> None:
 
 
 async def to_thread_timed(operation: str, function: Callable[..., Any], *args: Any,
-                          timeline_before_finished: Callable[[], None] | None = None,
                           **fields: Any) -> Any:
     """Run blocking work while separating executor queue and execution time."""
     queued_at = time.monotonic()
@@ -128,8 +127,6 @@ async def to_thread_timed(operation: str, function: Callable[..., Any], *args: A
         resumed_at = time.monotonic()
         worker_started = timing.get("started", resumed_at)
         worker_ended = timing.get("ended", resumed_at)
-        if timeline_before_finished is not None:
-            timeline_before_finished()
         emit_timeline(
             operation, "finished", outcome=outcome,
             duration_seconds=resumed_at - queued_at,

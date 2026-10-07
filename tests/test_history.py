@@ -94,7 +94,7 @@ class HistoryToolTests(unittest.IsolatedAsyncioTestCase):
             resident, owner = store.provision("Resident", "Owner", "")
             message_id = store.add_message("inbound", owner.id, "older message")
             emitted = []
-            registry = ToolRegistry(store, [], lambda _: {}, lambda *event: emitted.append(event))
+            registry = ToolRegistry(store, [], lambda *event: emitted.append(event))
             changes_before = store.connection.total_changes
 
             result = await registry.execute("search_communication", {"limit": 1})
@@ -115,7 +115,7 @@ class HistoryToolTests(unittest.IsolatedAsyncioTestCase):
             prior = store.start_run(WakeEvent("prior-event", "owner", "prior", "", {}))
             active = store.start_run(WakeEvent("active-event", "owner", "active", "", {}))
             registry = ToolRegistry(
-                store, [], lambda _: {}, lambda *_: None, current_run_id=active)
+                store, [], lambda *_: None, current_run_id=active)
 
             result = await registry.execute("list_wake_history", {})
 
@@ -126,7 +126,7 @@ class HistoryToolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "resident.sqlite3")
             store.provision("Resident", "Owner", "")
-            registry = ToolRegistry(store, [], lambda _: {}, lambda *_: None)
+            registry = ToolRegistry(store, [], lambda *_: None)
 
             result = await registry.execute("search_communication", {"from_time": "not-a-time"})
 

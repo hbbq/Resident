@@ -11,15 +11,21 @@ from resident.store import utc_now
 
 
 class FailingProvider:
-    async def respond(self, context, tools, results, previous_response_id=None):
+    async def create_conversation(self):
+        return 'conversation-test'
+
+    async def respond(self, context, tools, results, **request):
         raise RuntimeError("simulated provider failure")
 
 
 class BlockingProvider:
+    async def create_conversation(self):
+        return 'conversation-test'
+
     def __init__(self):
         self.started = asyncio.Event()
 
-    async def respond(self, context, tools, results, previous_response_id=None):
+    async def respond(self, context, tools, results, **request):
         self.started.set()
         await asyncio.Future()
 

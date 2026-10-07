@@ -126,7 +126,12 @@ class RuntimeHost:
     async def _worker(self, instance_id: str, stop: asyncio.Event) -> None:
         runtime, queue = self.runtimes[instance_id], self.queues[instance_id]
         runtime._event_queue = queue
-        await runtime.enqueue_startup_wakeups(queue)
+        try:
+            await runtime.enqueue_startup_wakeups(queue)
+        except Exception as exc:
+            self.diagnostic_output(f"{instance_id}: startup failed: {type(exc).__name__}: {exc}")
+            runtime._event_queue = None
+            return
         scheduler = asyncio.create_task(runtime.scheduler_loop(queue, stop))
         dispatcher = asyncio.create_task(runtime.output_dispatcher_loop(stop))
         try:
@@ -144,7 +149,6 @@ class RuntimeHost:
             scheduler.cancel()
             dispatcher.cancel()
             await asyncio.gather(scheduler, dispatcher, return_exceptions=True)
-            await runtime.stop_background_services()
 
     async def _collect_startup_readiness(
             self, shared_queue: asyncio.Queue[WakeEvent], stop: asyncio.Event,

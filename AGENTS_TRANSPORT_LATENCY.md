@@ -1,5 +1,7 @@
 # Agents HTTP transport latency investigation
 
+Historical investigation of the removed Agents integration. Resident now uses Responses + Conversations; the transport findings below are retained as experiment notes, not current runtime instructions.
+
 Investigation date: 2026-10-07. Transport and higher-level behavior are unchanged.
 The redundant settings POST fix and existing settings diagnostics were already
 present in the working tree and were preserved.

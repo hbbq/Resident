@@ -240,7 +240,10 @@ class HomeOpsConfigTests(unittest.TestCase):
 
 
 class IdleProvider:
-    async def respond(self, context, tools, results, previous_response_id=None):
+    async def create_conversation(self):
+        return 'conversation-test'
+
+    async def respond(self, context, tools, results, **request):
         raise AssertionError("No wake should be processed")
 
 
@@ -274,9 +277,12 @@ class ReadinessProducer(RecordingProducer):
 class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_interactive_runtime_measures_event_loop_lag(self):
         class BlockingProvider:
-            async def respond(self, context, tools, results, continuation_id=None):
+            async def create_conversation(self):
+                return 'conversation-test'
+
+            async def respond(self, context, tools, results, **request):
                 time.sleep(0.02)
-                return ModelTurn("turn", None, ())
+                return ModelTurn("turn", '{"outputs":[]}', ())
 
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(

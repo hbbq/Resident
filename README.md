@@ -8,13 +8,13 @@ See [VISION.md](VISION.md) for the current product/behavior vision and [ARCHITEC
 
 ## Minimal runtime
 
-The first experimental vertical slice is a Python 3.12+ asynchronous process with durable SQLite state. It preserves Resident and owner identities, curated long-term memory, standing Owner guidance, pending intentions, communication, wake runs, an append-only journal, self-requested scheduled wakeups, and OpenAI Agents session bindings across restarts. Owner messages and due schedules become wake events; inference stops after each bounded model/tool exchange while terminal input and scheduling remain active.
+The first experimental vertical slice is a Python 3.12+ asynchronous process with durable SQLite state. It preserves Resident and owner identities, standing Owner guidance, pending intentions, communication, wake runs, an append-only journal, self-requested scheduled wakeups, and OpenAI Conversation bindings across restarts. Owner messages and due schedules become wake events; inference stops after each bounded model/tool exchange while terminal input and scheduling remain active.
 
 ### Declarative Resident instances
 
 See [CAPABILITIES.md](CAPABILITIES.md) for the generated catalog of available tools, outputs, subscription selectors, and their setup requirements. It describes platform choices across configurations rather than the grants in any one Resident definition. Regenerate it with `python -m resident.catalog` and check for drift with `python -m resident.catalog --check`; the offline unittest suite also checks it.
 
-The runtime can host multiple independently configured Residents from startup-time YAML definitions. Pass `--residents-dir residents` (or set `RESIDENTS_DIR`); prompt references are resolved below `--prompt-root`, which defaults to the sibling `prompts` directory. Each stable definition ID receives its own database at `DATA_DIR/instances/<id>/resident.sqlite3`, including its durable identity, journal, schedules, tool actions, and Agents session binding. Editing its name, personality, role, or policy does not create a new identity. Shared connector events are polled once and fanned out only to matching `subscriptions`; tools are separately selected by `capabilities`, so observation never grants action authority.
+The runtime can host multiple independently configured Residents from startup-time YAML definitions. Pass `--residents-dir residents` (or set `RESIDENTS_DIR`); prompt references are resolved below `--prompt-root`, which defaults to the sibling `prompts` directory. Each stable definition ID receives its own database at `DATA_DIR/instances/<id>/resident.sqlite3`, including its durable identity, journal, schedules, tool actions, and Conversation binding. Editing its name, personality, role, or policy does not create a new identity. Shared connector events are polled once and fanned out only to matching `subscriptions`; tools are separately selected by `capabilities`, so observation never grants action authority.
 
 A minimal Dungeon Master can be introduced without Python changes:
 
@@ -26,10 +26,7 @@ name: Dungeon Master
 personality_prompt: dungeon-master.md
 role: Run a persistent tabletop campaign.
 agent:
-  provider: openai-agents
-  model: gpt-5.6-luna
-  api_key_env: OPENAI_API_KEY
-curator:
+  provider: openai-responses
   model: gpt-5.6-luna
   api_key_env: OPENAI_API_KEY
 capabilities: [messaging]
@@ -37,7 +34,7 @@ outputs: [notify_owner]
 subscriptions: []
 ```
 
-Definitions accept inline `personality`/`role` or `personality_prompt`/`role_prompt`, Agent settings, per-Resident Curator settings, callable `capabilities` grants, terminal `outputs` grants, event subscriptions, an optional Telegram Owner transport, and optional body metadata. `capabilities` controls tools whose results can be used while reasoning during the current wake. `outputs` separately authorizes terminal side effects whose delivery happens after the turn; supported identifiers are `notify_owner` and `display/<display-id>`. A configured Owner route or display makes an output available but does not grant it. Every output grant must name an available route, and `outputs: []` authorizes only a silent disposition. A Curator is disabled when its block or `model` is omitted; `base_url_env`, `batch_size`, and `max_batches` are optional. YAML aliases, unknown fields, prompt path traversal, and inline secret-shaped fields are rejected. Secrets are named with `*_env` references and resolved only while constructing local resources. A Telegram transport uses `token_env`, `owner_user_id_env`, and `owner_chat_id_env`; one resolved bot token may serve exactly one Resident. Unsuffixed terminal input targets `--default-resident` (`resident` by default), and configuration changes require restart.
+Definitions accept inline `personality`/`role` or `personality_prompt`/`role_prompt`, model settings, callable `capabilities` grants, terminal `outputs` grants, event subscriptions, an optional Telegram Owner transport, and optional body metadata. `capabilities` controls tools whose results can be used while reasoning during the current wake. `outputs` separately authorizes terminal side effects whose delivery happens after the turn; supported identifiers are `notify_owner` and `display/<display-id>`. A configured Owner route or display makes an output available but does not grant it. Every output grant must name an available route, and `outputs: []` authorizes only a silent disposition. YAML aliases, unknown fields, prompt path traversal, and inline secret-shaped fields are rejected. Secrets are named with `*_env` references and resolved only while constructing local resources. A Telegram transport uses `token_env`, `owner_user_id_env`, and `owner_chat_id_env`; one resolved bot token may serve exactly one Resident. Unsuffixed terminal input targets `--default-resident` (`resident` by default), and configuration changes require restart.
 
 ### External application capabilities
 
@@ -46,18 +43,8 @@ Keeper's Realm v1 integration uses the service's native routes. Set
 existing creature ID in that game, then configure `realm.base_url` in
 `residents/keeper.yaml` for the trusted Realm service. The game and actor must
 be seeded before play. Keeper reads both the actor projection and trusted state
-on every wake, including a replacement session. Mutations use the latest Realm
-revision and the durable tool-call ID as the idempotency key. Successful calls
-return the mutation result and fresh views. A conflict requires reassessment;
-an uncertain result must not be repeated with a new key. Realm v1 has no
-authentication or operation lookup, so keep it inside a trusted network boundary
-and resolve uncertain outcomes from Realm state before continuing play.
-`keeper_history: true` in `residents/keeper.yaml` enables Keeper's local
-interaction history and bounded replay on a new managed session. It requires
-both `realm` and `agent.provider: openai-agents`; other Resident definitions
-default to `false`, including Realm-backed managed Residents. The replay bounds
-remain `KEEPER_ROLLOVER_INTERACTIONS` (8) and `KEEPER_ROLLOVER_BYTES` (16384).
-The byte limit applies to the serialized history field in the bootstrap.
+on every wake. Mutations use the latest Realm revision and a stable tool-call-derived idempotency key. Successful calls return the mutation result and fresh views. A conflict requires reassessment; an uncertain result must not be repeated with a new key. Realm v1 has no authentication or operation lookup, so keep it inside a trusted network boundary and inspect Realm state after uncertain mutations.
+`keeper_history: true` enables an optional local interaction archive for Realm-backed Residents. It records submitted wake input, Realm snapshots, model calls and tool results for inspection; it is never replayed into the Conversation.
 `realm_world_patch` accepts Realm's seven patch sections with its native field
 names, including `containment[].child_id` and `parent_id`, and
 `observations[].actor_id`. A single patch can create an entity and refer to it
@@ -105,62 +92,30 @@ external_applications:
 
 Resident sends `POST <base_url>/api/capabilities/invoke` with JSON fields `operation`, `request_id`, `arguments`, and `bindings`. The application returns a JSON object or array. Resident validates model arguments against the pinned schema, keeps bindings outside model control, limits requests to 256 KiB and responses to 1 MiB, and never discovers or grants operations from the remote service. A configured token is sent only as an `Authorization: Bearer` header.
 
-Calls have a bounded timeout and no automatic retry. Resident derives a stable opaque external `request_id` from the durable managed-tool identity. A timeout or transport failure from a mutating operation returns `unknown_outcome` with that ID; a separately configured reconciliation operation can query it. Authentication, rejection, conflict, unavailability, timeout, and invalid-response failures are classified without returning the URL, credential, headers, or upstream response body. An unavailable application does not prevent startup or remove its tools; calls fail deterministically until it is available. Catalog changes require a configuration restart and flow through the existing capability snapshot and Managed Agents rollover rules.
+Calls have a bounded timeout and no automatic retry. Resident derives a stable opaque external `request_id` from the durable Conversation/tool-call identity. A timeout or transport failure from a mutating operation returns `unknown_outcome` with that ID; a separately configured reconciliation operation can query it. Authentication, rejection, conflict, unavailability, timeout, and invalid-response failures are classified without returning the URL, credential, headers, or upstream response body. An unavailable application does not prevent startup or remove its tools; calls fail deterministically until it is available. Catalog changes require a configuration restart and are supplied on subsequent Responses; runtime authorization takes effect before execution.
 
-Granting `messaging` exposes `messaging_send`. It writes to the process-shared durable mailbox and returns immediately; it is not RPC and does not await a reply. Its tool schema enumerates the configured Resident IDs that can be addressed; Owner communication remains separate and requires an explicit `outputs: [notify_owner]` grant plus an available Owner route. Managed Agents uses the `notify_owner` final output; an already-active legacy Managed Agents session and the Responses fallback use the compatibility `send_owner_message` tool. Messages default to a five-minute TTL and move from `pending` to `delivered` only when handed to the recipient event queue; expiry and delivery do not imply that a recipient read, understood, acted, or replied. A reply is another independent message.
+Granting `messaging` exposes `messaging_send`. It writes to the process-shared durable mailbox and returns immediately; it is not RPC and does not await a reply. Its tool schema enumerates the configured Resident IDs that can be addressed; Owner communication remains separate and requires an explicit `outputs: [notify_owner]` grant plus an available Owner route. Owner messages use the `notify_owner` terminal output and background delivery. Messages default to a five-minute TTL and move from `pending` to `delivered` only when handed to the recipient event queue; expiry and delivery do not imply that a recipient read, understood, acted, or replied. A reply is another independent message.
 
-Legacy environment/CLI startup remains available when no definitions directory is supplied. To explicitly move an existing singleton database into the normal `resident` instance layout before declarative startup, stop the runtime and run:
-
-```powershell
-python -m resident --data-dir .resident --migrate-legacy
-```
-
-The live adapter uses the beta OpenAI Agents API and defaults to `gpt-5.6-luna`. Resident restores one long-lived managed session rather than creating a session on process restart, stores its binding and immutable protocol descriptor in local SQLite, and submits subsequent wakes with `Idempotency-Key` request headers. Local function actions are claimed before execution and completed results are retained, so a re-delivered action returns its recorded result instead of repeating a display or Owner-message side effect; an interrupted action with an unknown outcome is reported rather than repeated automatically. OpenAI owns episodic/working context; Resident owns identity and the local durable Memory Store. Set an API key and choose a persistent data directory:
+Environment/CLI startup remains available without a definitions directory. Set an API key and choose a persistent data directory:
 
 ```powershell
 $env:OPENAI_API_KEY = "..."
 python -m resident --data-dir .resident
 ```
 
-Enter an owner message at the prompt. New Managed Agents sessions return a structured final disposition and request Owner communication with `notify_owner`; Runtime durably queues and delivers it only after the model turn has completed. Replies are ordinary later Owner wakes. The older `send_owner_message` tool remains available only while recovering an already-active old-protocol session, and the Responses fallback retains its legacy tool protocol. Owner communication is rendered as `[Resident -> Owner] ...`. By default, the terminal otherwise shows only a small startup/shutdown status and actionable runtime failures, keeping routine spontaneous wakes nearly invisible. Pass `--verbose` or set `RESIDENT_VERBOSE=true` to show detailed diagnostics. Enter `/quit` to stop. Reusing the data directory reloads the same stable identities, local state, Agents binding, dispositions, and output queue. Display names and personality can be configured with `--resident-name`, `--owner-name`, and `--personality`; later configuration refreshes this metadata while retaining the same durable identity. `RESIDENT_MODEL`, `OPENAI_BASE_URL`, and the equivalent name/data environment variables may also be used. An existing saved Agent resource can be selected with `RESIDENT_OPENAI_AGENT_ID`; repository-defined instructions and local schemas remain authoritative session overrides. Set `RESIDENT_PROVIDER=openai-responses` (or the legacy alias `openai`) to use the temporary Responses fallback.
+Resident uses Responses + Conversations exclusively. A fresh instance establishes local identity and capability state, creates an empty OpenAI Conversation, and persists its ID before inference. Restart reuses that ID. Each request supplies current instructions, personality, role, standing guidance, model/reasoning/service tier, authorized tools and strict disposition schema. Only the new wake and observations enter initial request input; continuations submit function results to the same Conversation. No history replay or `previous_response_id` is used.
+
+Every wake ends in a locally validated `{"outputs": [...]}` disposition. Empty outputs mean intentional silence; refusal, incomplete Responses or invalid/missing dispositions fail the wake. Owner/display jobs are persisted before completion and delivered separately. Enter an Owner message at the prompt, or `/quit` to stop. Use `--verbose` for detailed diagnostics. Names/personality and model configuration refresh on restart without changing the local identity or Conversation binding. Set `RESIDENT_MODEL`, `OPENAI_BASE_URL`, `--reasoning-effort`, and `--service-tier` as appropriate.
 
 Before the sleeping prompt, normal output includes one concise readiness line for each enabled integration and an overall result. HomeOps is ready after its first valid latest-measurements poll; AgentController after its first valid snapshot and baseline handling; Telegram after webhook validation and a successful zero-wait `getUpdates` preflight; and ONVIF after every configured camera has either established a usable PullPoint subscription or failed its first attempt. Cameras are reported separately after the configured FFmpeg executable is found locally; startup does not connect to RTSP streams or capture frames. A `FAILED` line records the initial attempt and does not stop the existing background retry loop or provide continuous health monitoring. Detailed causes and later retry diagnostics remain available with `--verbose`.
 
-Agent identity precedence is explicit: `RESIDENT_OPENAI_AGENT_ID` selects a saved reusable Agent. Adopting a different saved Agent, changing immutable instructions, or adding/renaming/changing a function contract causes an intentional, audited rollover; a local tool revocation keeps a compatibility handler for the old contract. Model, `--reasoning-effort`, and `--service-tier` changes are patched on an idle existing session and their last successfully applied values are stored separately from the immutable protocol descriptor. An in-place edit of a saved Agent does not silently replace its existing session snapshot. Missing/expired remote sessions and `--new-chapter` are recorded rollover reasons. Resident state and identity survive every rollover. The exact replacement create request is persisted before POST and a successful replacement is bound transactionally. The current Agents contract exposes neither create idempotency nor lookup by Resident's rollover token; if Resident stops after an attempt may have reached the service but before the returned session ID is durable, restart reports that explicit uncertain state and does not risk creating another replacement automatically.
+### Disposable state and recovery
 
-### Recover a stuck managed session
+This schema has no upgrade path. Stop Resident and manually remove existing instance databases before running this implementation. Old Agents sessions, guidance, memories and history are abandoned. Resident never deletes a database automatically.
 
-Stop the affected Resident process before editing its database. Use the affected instance's `DATA_DIR/instances/<id>/resident.sqlite3` (or its configured singleton database), and back it up with `sqlite3 <database> ".backup '<backup-path>'"`. Open that database with `sqlite3`, then inspect the current binding and unresolved work:
+Responses are checkpointed before submission and after receipt. Completed tool results are replayable by Conversation/call ID without repeating effects; an interrupted tool execution returns an unknown outcome. A recorded final Response can be finalized locally after restart. Ambiguous HTTP submissions or interrupted tool loops block further inference: inspect the state, fix the code, or manually reset the disposable database. There is no remote reconciliation, automatic inference retry, bootstrap, handover or rollover subsystem.
 
-```sql
-SELECT provider,session_id,last_turn_id FROM agent_session_bindings
-WHERE provider='openai_agents';
-SELECT * FROM session_rollover_requests WHERE provider='openai_agents';
-SELECT id,old_session_id,reason,creation_state,status FROM session_rollovers
-WHERE provider='openai_agents' AND status='pending';
-```
-
-Proceed only when the binding is the exact session to abandon and both other queries return no rows. Substitute that exact session ID for `EXPECTED_OLD_SESSION_ID` below. Run this transaction while Resident remains stopped:
-
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO session_rollover_requests
-  (provider,old_session_id,reason,requested_by,created_at,updated_at)
-SELECT 'openai_agents',session_id,'operator_forced','operator',
-       strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')
-FROM agent_session_bindings AS binding
-WHERE binding.provider='openai_agents'
-  AND binding.session_id='EXPECTED_OLD_SESSION_ID'
-  AND NOT EXISTS (SELECT 1 FROM session_rollover_requests
-                  WHERE provider='openai_agents')
-  AND NOT EXISTS (SELECT 1 FROM session_rollovers
-                  WHERE provider='openai_agents' AND status='pending');
-SELECT changes();
-```
-
-Commit only if `changes()` returns `1`; otherwise `ROLLBACK` and investigate the binding or pending work. Restart Resident. The marker leaves the old binding intact and creates no remote session until the next real wake. That wake skips remote reads and final Curator catch-up for the abandoned session, bootstraps from durable local identity, guidance, intentions, memory and any already stored handover, then creates a replacement through normal rollover bookkeeping. Verify the new `agent_session_bindings.session_id` and a completed `session_rollovers` row with the expected old and new IDs, `reason='operator_forced'`, and `finalization_status='operator_forced'`. Pending Curator work for the old session remains recorded; recent remote history that was never curated is unavailable. If replacement creation becomes `create_uncertain`, reconcile it before any further attempt; do not insert another marker or clear the binding.
-
-Long-term memory is curated independently of the Resident model. Set `RESIDENT_CURATOR_MODEL` (and optionally `RESIDENT_CURATOR_API_KEY` / `RESIDENT_CURATOR_BASE_URL`) to enable startup catch-up and bounded incremental consolidation. Completed wakes durably coalesce exact turn watermarks for a per-Resident background Curator, so routine curation does not delay the next wake. Long-term-memory tool reads are therefore eventually consistent and can lag recent wakes; the managed Agents session remains the immediate episodic context. Startup and reachable session rollover retain awaited catch-up barriers, and shutdown gives active curation a bounded drain before leaving durable work for restart recovery. The Curator checkpoints session-item progress transactionally, never advances beyond the requested completed-turn boundary, and retries failures with capped exponential backoff and degraded-health journal events. Every durable memory revision requires source references verified against the fetched session page. The Resident receives bounded `search_long_term_memory` and `get_long_term_memory` tools instead of the whole store on every wake. A replacement session gets a compact memory index and a transient handover when available. Explicit lasting Owner instructions use `set_owner_guidance` / `remove_owner_guidance`; their revision history is retained while the active set has deterministic entry, count, and serialized-size bounds. New sessions receive that active set in bootstrap; existing sessions receive durable, versioned additions, revisions, and removals only when it changes. Curator input remains an explicit field projection: tool arguments/results, encrypted reasoning, attachment payloads, and unknown structured fields are excluded. Text in that projection and all Curator output are deterministically scrubbed of recognizable credential-bearing structures (including authorization values, password-bearing URLs, private-key blocks, credential assignments, and common service tokens) before crossing or being persisted. This is an enforceable structural boundary, not a claim that arbitrary natural language can be perfectly classified as secret or non-secret.
+Conversation history initially provides episodic continuity. Curator and semantic memory are removed. Standing guidance remains separate authoritative local state, changed only in an authenticated Owner wake and supplied on every request. Optional `agent.compact_threshold` (or `--compact-threshold` / `RESIDENT_COMPACT_THRESHOLD`) enables Responses server compaction; it is disabled by default and long-running Conversation behavior remains to be observed. Automatic truncation is disabled. Cached input remains part of total input accounting; growing history can reach the model's context limit.
 
 ## Optional Telegram Owner transport
 
@@ -177,51 +132,13 @@ The numeric user and private-chat IDs are an explicit Owner binding provisioned 
 
 When configured, Telegram is authoritative for `notify_owner` delivery and the terminal mirrors attempted messages for local observability; that rendering is not counted as delivery. An authorized inbound update is acknowledged only after its canonical Owner communication and de-duplication record are committed. Inbound Owner messages remain pending until their normal `owner_message` wake completes; pending messages are recreated through that same wake path after restart. A Telegram send failure remains in the durable output retry state machine and never falls back to model output. Messages longer than Telegram's 4,096-character limit are prevented by the output schema. Terminal input remains active in parallel. If standard input is absent or closes, Resident continues running remotely; `/quit` remains available from an attached terminal. Poll and request timeouts can be set with `RESIDENT_TELEGRAM_POLL_SECONDS` and `RESIDENT_TELEGRAM_REQUEST_TIMEOUT_SECONDS`.
 
-Resident can explicitly manage pending intentions, send owner messages, schedule a future wake, and invoke a read-only local time capability. An ongoing Agents session receives only the complete new trigger, correlation/recovery metadata, and any changed locally authoritative identity, capability, or standing-guidance state. Historical communication, intentions, handover, and memory awareness are not replayed on ordinary wakes. A new or replacement session instead receives one bootstrap containing identity and role, current capabilities, active guidance, pending intentions, bounded memory awareness, an available handover, and the trigger exactly once. When older context is useful, `search_communication` provides bounded newest-first message search by text, direction, and time, while `list_wake_history` provides bounded newest-first wake search by reason, source, status, and time. Both support offset pagination. Wake history exposes run metadata and an allowlisted projection of observable journal events; raw wake payloads, model content, tool arguments/results, provider continuation data, and ephemeral attachments are excluded at read time. These tools never alter intentions, delivery, or wake state, although their invocation is recorded like any other tool call. The runtime limits model tool use to eight rounds. Spontaneous messages (those outside an owner-initiated wake) default to three delivered messages per hour; excess messages are persisted as rejected and are never queued. Immediate replies during an owner wake do not consume that budget. Configure this policy with `--spontaneous-message-limit` and `--spontaneous-message-window-seconds` (or their `RESIDENT_...` environment-variable equivalents).
-
-Schema version 12 removes the former local `memories` table and the `remember`, `recall`, `update_memory`, and `forget` tools. Upgrading an existing database discards those legacy records; no compatibility API remains.
+Resident can manage intentions, schedule wakes and invoke authorized connectors. New input contains the trigger, timestamp, pending intentions and fresh Realm observations when configured; current instructions hold identity, role and guidance. Bounded `search_communication` and `list_wake_history` tools retrieve local history on demand. History search exposes safe journal summaries rather than raw prompts, tool payloads or images. Tool calls execute sequentially, with eight rounds by default and a bounded total call count. Spontaneous Owner messages have a configurable delivered-message budget; replies during Owner wakes do not consume it. Use `--spontaneous-message-limit` and `--spontaneous-message-window-seconds` to adjust this policy.
 
 The runtime persists a safe public snapshot of available capabilities. The first snapshot is silent; on later starts, or after an explicit programmatic registration/removal while running, additions, removals, and description/schema changes produce a normal `runtime` / `capabilities_changed` wake. Detection never invokes or tests a capability. Connectors may independently emit source-specific events when their visible world changes; Resident decides whether either kind of change warrants investigation or communication.
 
 ### Latency timeline diagnostics
 
-Pass `--timeline` or set `RESIDENT_TIMELINE=true` to record opt-in structured `timeline` journal events. The timeline separates host queue wait, wake processing, provider preflight and rounds, local tool execution, HomeOps/display requests, Agents/Responses default-executor queue and worker time, Curator batches and tail, and event-loop lag aggregated per active wake. The Agents adapter uses the live session event stream for healthy wake and tool-result waits; startup, initial session input, interrupted or malformed streams, timeouts, and other uncertain states retain exact HTTP reconciliation. Timeline records distinguish stream waits and explicit reconciliation fallbacks from submission, polling, and item retrieval. Stream observations are transient and are not used as a durable replay cursor. Payloads contain safe identifiers, operation classes, timings, counts, configured timeouts, and outcomes; they exclude prompts, tool arguments or results, credentials, headers, request URLs, and attachment contents. `--verbose` also renders the records. Instrumentation does not change per-Resident serialization or Curator placement.
-
-Agents `openai.agents_stream` finished records include `event_count`,
-`time_to_first_event_seconds` and `first_event_type`, and
-`largest_inter_event_gap_seconds`. When observed for the expected/correlated
-turn, they also include `time_to_first_model_activity_seconds`,
-`time_to_first_output_seconds`, and `time_to_completion_seconds`, each with a
-corresponding `first_model_activity_type`, `first_output_type`, or `completion_type`.
-All offsets use the monotonic clock from immediately before opening the stream;
-connection setup and the subsequent wake/tool-result submission are included.
-The duration ends when the stream connection closes. The largest gap measures
-consecutive decoded JSON events (including local handling between reads), not
-SSE comments, envelope lines, or the `[DONE]` sentinel. Zero means fewer than two
-events; absent phase fields mean that phase was not observed on this connection.
-A tool-action pause is not turn completion; later rounds have separate streams.
-
-The phase signals use the client's existing event contract:
-`agent.session.turn.item.added` / `.done` for an assistant message identify the
-first output **item**, even if its content is still empty. Assistant-message and
-function-call items, or a validated `agent.session.requires_action` function-call
-pause, establish observable model activity. These are not timestamps for the
-start of internal inference or the first text token. Lifecycle/in-progress events
-and unknown event families do not establish model activity. Only a validated,
-matching `agent.session.turn.completed` establishes completion; other turns and
-user input items cannot supply model/output milestones. Earlier reasoning and
-text-delta phases are deliberately omitted because this client's reducer does
-not define them. No model content is retained in these diagnostics.
-
-Agents token usage is already read from a completed event's `usage` or nested
-`turn.usage`, or from turn/session data received during existing reconciliation.
-`model.responded` now also includes `cached_input_tokens` when
-`usage.input_tokens_details.cached_tokens` is present (including zero).
-Input/output token fields remain null when usage is absent; no usage-only request
-is made. These are best-effort API counts and can be unavailable at completion.
-See [OpenAI usage documentation](https://developers.openai.com/api/docs/guides/agents-api/observability).
-
-Agents HTTP records also split header wait, response body read, and JSON parse time; stream records include header availability and time to the durable pre-submit checkpoint. Runtime preflight and lifecycle session GETs are distinguished by `request_phase`. See [the transport latency investigation](AGENTS_TRANSPORT_LATENCY.md) for field definitions, measured limits, and the proposed pooling A/B experiment.
+Use `--timeline` / `RESIDENT_TIMELINE=true` to record queue wait, model requests, tool execution, connector requests, executor queue/worker time and event-loop lag. Output delivery runs independently. Timing records exclude prompts, tool arguments/results, credentials, URLs and images. `--verbose` also renders these records.
 
 ## Experimental HomeOps connector
 
@@ -239,7 +156,7 @@ $env:RESIDENT_HOMEOPS_URL = "http://homeops.local"
 $env:RESIDENT_DISPLAYS = '[{"id":"display1","max_length":40}]'
 ```
 
-For new Managed Agents sessions, each configured action-only display is a target-specific `display` final output rather than a function tool. `max_length` is optional and becomes that target's exact schema constraint. The runtime persists the disposition and output job before completing the wake, then a background dispatcher submits it to HomeOps. HTTP 204 means accepted/queued by HomeOps, not physically displayed. Delivery uses bounded at-least-once retries, so an uncertain interrupted attempt may be duplicated. Permanent or exhausted failures create one safe `output_delivery_failed` wake. Display IDs must be unique, 1-64 characters, and contain only letters, digits, underscores, or hyphens. Resident-specific instructions decide when and what to display; the schema only grants targets and constraints. Old Managed sessions retain `<id>_show_text` only until audited rollover, and the Responses fallback retains the legacy tool.
+With Responses, each configured action-only display is a target-specific `display` final output rather than a function tool. `max_length` is optional and becomes that target's exact schema constraint. The runtime persists the disposition and output job before completing the wake, then a background dispatcher submits it to HomeOps. HTTP 204 means accepted/queued by HomeOps, not physically displayed. Delivery uses bounded at-least-once retries, so an uncertain interrupted attempt may be duplicated. Permanent or exhausted failures create one safe `output_delivery_failed` wake. Display IDs must be unique, 1-64 characters, and contain only letters, digits, underscores, or hyphens. Resident-specific instructions decide when and what to display; the schema only grants targets and constraints.
 
 ## Experimental AgentController connector
 
@@ -258,9 +175,9 @@ $env:RESIDENT_CAMERAS = '[{"id":"entry","name":"Entry camera","description":"Fro
 python -m resident --data-dir .resident
 ```
 
-Resident can list configured cameras with `camera_list` without connecting to them, and can request one current frame with `camera_capture_frame`. FFmpeg must be installed and available as `ffmpeg` (or configured with `--ffmpeg-executable`). Each request connects only long enough to capture one JPEG frame; unavailable cameras and timeouts are normal tool outcomes. Frames are passed in memory to the model and are never written to Resident state or its journal. Camera URLs, credentials, and FFmpeg error output are not exposed to the model, normal diagnostics, or journal. The temporary Responses fallback uses `store=false`, including image continuations; the Agents path sends a frame only as a managed-session function result.
+Resident can list configured cameras with `camera_list` without connecting to them, and can request one current frame with `camera_capture_frame`. FFmpeg must be installed and available as `ffmpeg` (or configured with `--ffmpeg-executable`). Each request connects only long enough to capture one JPEG frame; unavailable cameras and timeouts are normal tool outcomes. Frames are passed in memory to the model and are never written to Resident state or its journal. Camera URLs, credentials, and FFmpeg error output are not exposed to the model, normal diagnostics, or journal. Frames are sent as multimodal function results and become remote Conversation content; local SQLite retains only result metadata, not image bytes.
 
-Capture defaults to RTSP over TCP, an 8-second timeout, 1280x720 maximum output dimensions, and a 2 MB encoded-frame limit. These can be adjusted with `--camera-rtsp-transport`, `--camera-capture-timeout-seconds`, `--camera-max-width`, `--camera-max-height`, and `--camera-max-bytes`, or their corresponding `RESIDENT_...` environment variables. With the Agents adapter, frame bytes are submitted only as the corresponding function result and are not written to Resident's SQLite store.
+Capture defaults to RTSP over TCP, an 8-second timeout, 1280x720 maximum output dimensions, and a 2 MB encoded-frame limit. These can be adjusted with `--camera-rtsp-transport`, `--camera-capture-timeout-seconds`, `--camera-max-width`, `--camera-max-height`, and `--camera-max-bytes`, or their corresponding `RESIDENT_...` environment variables. Frame bytes are submitted only as the corresponding function result and are not written to Resident's SQLite store.
 
 `RESIDENT_CAMERAS` remains startup configuration. An embedding with a genuinely refreshable camera source can replace the connector's camera set explicitly; added, removed, or changed cameras then produce one `camera` / `cameras_changed` wake containing only safe IDs, names, and descriptions. Endpoint-only changes are detected but the endpoint and credentials are never included in the event.
 

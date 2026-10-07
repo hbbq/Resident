@@ -9,56 +9,9 @@ from resident.config import Config
 from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.outputs import (DeliveryPolicy, OutputCapability, output_schema,
                               schema_fingerprint, validate_disposition)
-from resident.provider import OpenAIAgentsProvider
+from runtime_support import RecordingProvider as StructuredProvider
 from resident.runtime import ResidentRuntime
 from resident.store import Store, utc_now
-
-
-class StructuredProvider:
-    uses_managed_session = True
-    supports_output_capabilities = True
-    session_protocol_known = True
-    rollover_ready = False
-
-    def __init__(self, messages=(), *, session_id="session-1", recovery=None):
-        self.session_id = session_id
-        self.messages = list(messages)
-        self.recovery = recovery
-        self.contexts = []
-        self.tool_sets = []
-        self.schema = None
-        self.fingerprint = None
-        self.descriptors = None
-        self.round = 0
-        self.applied_output_protocol = True
-
-    @property
-    def session_uses_output_capabilities(self):
-        return self.schema is not None and self.applied_output_protocol
-
-    @property
-    def active_output_protocol(self):
-        return {"schema": self.schema, "fingerprint": self.fingerprint,
-                "capabilities": self.descriptors}
-
-    def configure_output_protocol(self, schema, descriptors, fingerprint):
-        self.schema, self.descriptors, self.fingerprint = schema, descriptors, fingerprint
-
-    async def preflight_session(self):
-        return None
-
-    async def respond(self, context, tools, results, previous_response_id=None):
-        self.contexts.append(json.loads(context))
-        self.tool_sets.append([tool.name for tool in tools])
-        self.round += 1
-        value = self.messages.pop(0)
-        if isinstance(value, ModelTurn):
-            return value
-        return ModelTurn(f"turn-{self.round}", value)
-
-    async def recover_final_output(self, session_id, turn_id):
-        self.recovery = (session_id, turn_id, self.recovery)
-        return self.recovery[2]
 
 
 def display_capability(target, delivered, *, max_length=40, handler=None,
@@ -76,8 +29,7 @@ def display_capability(target, delivered, *, max_length=40, handler=None,
                 "type": "string", "minLength": 1, "maxLength": max_length}},
             "required": ["content"], "additionalProperties": False,
         }, f"homeops-display:{target}", deliver, target=target,
-        delivery_policy=DeliveryPolicy(max_attempts=max_attempts),
-        legacy_tool_name=f"{target}_show_text")
+        delivery_policy=DeliveryPolicy(max_attempts=max_attempts))
 
 
 def notify_owner_capability():
@@ -91,7 +43,7 @@ def notify_owner_capability():
             "properties": {"content": {
                 "type": "string", "minLength": 1, "maxLength": 4096}},
             "required": ["content"], "additionalProperties": False,
-        }, "owner", deliver, legacy_tool_name="send_owner_message")
+        }, "owner", deliver)
 
 
 class OwnerTransport:
@@ -201,69 +153,6 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT count(*) FROM scheduled_wakeups").fetchone()[0])
             runtime.close()
 
-    async def test_paginated_agents_dispositions_are_delivered_in_item_order(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            delivered = []
-            capability = display_capability("display1", delivered)
-            runtime = self.runtime(
-                temporary, StructuredProvider(), outputs=(capability,),
-                owner_communication_enabled=False)
-            adapter = OpenAIAgentsProvider("test-key", "model")
-            adapter.configure_output_protocol(
-                runtime._output_schema, [], schema_fingerprint(runtime._output_schema))
-            pages = iter(({
-                "data": [{"id": "new", "turn_id": "turn", "type": "message",
-                          "role": "assistant", "status": "completed", "content": [{
-                              "type": "output_text", "text": json.dumps({"outputs": [{
-                                  "type": "display", "target": "display1", "content": "second"}]})}] }],
-                "has_more": True, "last_id": "new",
-            }, {
-                "data": [{"id": "old", "turn_id": "turn", "type": "message",
-                          "role": "assistant", "status": "completed", "content": [{
-                              "type": "output_text", "text": json.dumps({"outputs": [{
-                                  "type": "display", "target": "display1", "content": "first"}]})}]},
-                         {"id": "prior", "turn_id": "prior", "type": "reasoning"}],
-                "has_more": True, "last_id": "prior",
-            }))
-            adapter._request = lambda *_args, **_kwargs: next(pages)
-            raw = adapter._turn_message("session", "turn")
-            runtime._persist_disposition(raw, "session", "turn", run_id=None, wake=None)
-            self.assertTrue(await runtime.dispatch_outputs_once())
-            self.assertTrue(await runtime.dispatch_outputs_once())
-            self.assertEqual([("display1", "first"), ("display1", "second")], delivered)
-            runtime.close()
-
-    async def test_invalid_agents_item_or_combined_limit_rejects_whole_disposition(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            runtime = self.runtime(
-                temporary, StructuredProvider(),
-                outputs=(display_capability("display1", []),),
-                owner_communication_enabled=False)
-            adapter = OpenAIAgentsProvider("test-key", "model")
-            adapter.configure_output_protocol(
-                runtime._output_schema, [], schema_fingerprint(runtime._output_schema))
-            valid = json.dumps({"outputs": [{
-                "type": "display", "target": "display1", "content": "ok"}]})
-            cases = (([valid, "not-json"], "invalid_json"),
-                     ([valid, " "], "invalid_json"),
-                     ([valid, '{"outputs":[],"extra":true}'], "invalid_json"),
-                     ([valid, '{"outputs":[{"type":"unknown"}]}'], "schema_invalid"),
-                     ([valid, json.dumps({"outputs": [{
-                         "type": "display", "target": "display1", "content": "x"
-                     }] * 8})], "schema_invalid"))
-            for ordinal, (items, expected) in enumerate(cases):
-                with self.subTest(expected=expected):
-                    raw = adapter._join_turn_messages([[item] for item in items], descending=False)
-                    with self.assertRaises(RuntimeError):
-                        runtime._persist_disposition(
-                            raw, "session", f"turn-{ordinal}", run_id=None, wake=None)
-                    row = runtime.store.connection.execute(
-                        "SELECT validation_state FROM final_dispositions WHERE turn_id=?",
-                        (f"turn-{ordinal}",)).fetchone()
-                    self.assertEqual(expected, row[0])
-            self.assertEqual(0, runtime.store.connection.execute(
-                "SELECT count(*) FROM output_requests").fetchone()[0])
-            runtime.close()
 
     async def test_target_specific_max_length_and_invalid_json_are_receipted(self):
         for raw, expected in (
@@ -331,117 +220,6 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT count(*) FROM output_requests").fetchone()[0])
             runtime.close()
 
-    async def test_restart_recovers_bound_completed_turn_without_duplicate(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "resident.sqlite3"
-            output = display_capability("display1", [])
-            schema = output_schema([output])
-            fingerprint = schema_fingerprint(schema)
-            store = Store(path)
-            store.provision("Resident", "Owner", "")
-            store.save_agent_session_binding("openai_agents", "session", None, "turn")
-            store.mark_agent_wake_submission_attempted(
-                "openai_agents", "session", "wake", "correlation",
-                wake_id="wake", wake_source="sensor", wake_reason="changed")
-            store.correlate_agent_wake_submission(
-                "openai_agents", "session", "wake", "turn")
-            store.settle_agent_wake_submission("openai_agents", "session", "turn")
-            store.save_session_protocol("openai_agents", "session", {
-                "version": 2, "output_schema": schema,
-                "output_schema_fingerprint": fingerprint,
-                "output_capabilities": [output.semantic_descriptor()]})
-            store.close()
-            raw = '{"outputs":[{"type":"display","target":"display1","content":"x"}]}'
-            provider = StructuredProvider(session_id="session", recovery=raw)
-            runtime = self.runtime(
-                temporary, provider, outputs=(output,), owner_communication_enabled=False)
-            self.assertTrue(await runtime.recover_missing_disposition())
-            self.assertFalse(await runtime.recover_missing_disposition())
-            self.assertEqual(1, runtime.store.connection.execute(
-                "SELECT count(*) FROM output_requests").fetchone()[0])
-            runtime.close()
-
-    async def test_recovered_owner_wake_retains_immediate_reply_semantics(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            initial = self.runtime(
-                temporary, StructuredProvider(), outputs=(), transport=OwnerTransport(),
-                spontaneous_message_limit=0)
-            initial.store.save_agent_session_binding(
-                "openai_agents", "session", None, "turn")
-            initial.store.save_session_protocol("openai_agents", "session", {
-                "version": 2, "output_schema": initial._output_schema,
-                "output_schema_fingerprint": initial._output_schema_fingerprint,
-                "output_capabilities": [
-                    output.semantic_descriptor() for output in initial._output_capabilities],
-            })
-            initial.store.mark_agent_wake_submission_attempted(
-                "openai_agents", "session", "message", "correlation",
-                wake_id="owner-wake", wake_source="owner", wake_reason="owner_message")
-            initial.store.correlate_agent_wake_submission(
-                "openai_agents", "session", "message", "turn")
-            initial.store.settle_agent_wake_submission(
-                "openai_agents", "session", "turn")
-            initial.close()
-
-            transport = OwnerTransport()
-            provider = StructuredProvider(
-                session_id="session",
-                recovery='{"outputs":[{"type":"notify_owner","content":"reply"}]}')
-            recovered = self.runtime(
-                temporary, provider, outputs=(), transport=transport,
-                spontaneous_message_limit=0)
-            self.assertTrue(await recovered.recover_missing_disposition())
-            request = recovered.store.connection.execute(
-                "SELECT delivery_state FROM output_requests").fetchone()
-            message = recovered.store.connection.execute(
-                "SELECT spontaneous,delivery_status FROM messages").fetchone()
-            self.assertEqual("queued", request["delivery_state"])
-            self.assertEqual((0, "pending_delivery"), tuple(message))
-            self.assertTrue(await recovered.dispatch_outputs_once())
-            self.assertEqual(["reply"], transport.messages)
-            recovered.close()
-
-    async def test_recovered_failure_wake_suppresses_recursive_failure_event(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            async def rejected(_):
-                raise ValueError("still unavailable")
-
-            output = display_capability("display1", [], handler=rejected)
-            initial = self.runtime(
-                temporary, StructuredProvider(), outputs=(output,),
-                owner_communication_enabled=False)
-            initial.store.save_agent_session_binding(
-                "openai_agents", "session", None, "turn")
-            initial.store.save_session_protocol("openai_agents", "session", {
-                "version": 2, "output_schema": initial._output_schema,
-                "output_schema_fingerprint": initial._output_schema_fingerprint,
-                "output_capabilities": [output.semantic_descriptor()],
-            })
-            initial.store.mark_agent_wake_submission_attempted(
-                "openai_agents", "session", "failure-schedule", "correlation",
-                wake_id="failure-wake", wake_source="scheduler",
-                wake_reason="output_delivery_failed")
-            initial.store.correlate_agent_wake_submission(
-                "openai_agents", "session", "failure-schedule", "turn")
-            initial.store.settle_agent_wake_submission(
-                "openai_agents", "session", "turn")
-            initial.close()
-
-            recovered = self.runtime(
-                temporary, StructuredProvider(
-                    session_id="session",
-                    recovery=('{"outputs":[{"type":"display","target":"display1",'
-                              '"content":"fallback"}]}')),
-                outputs=(output,), owner_communication_enabled=False)
-            self.assertTrue(await recovered.recover_missing_disposition())
-            self.assertEqual(1, recovered.store.connection.execute(
-                "SELECT failure_event_generated FROM output_requests").fetchone()[0])
-            self.assertTrue(await recovered.dispatch_outputs_once())
-            self.assertEqual("failed_permanent", recovered.store.connection.execute(
-                "SELECT delivery_state FROM output_requests").fetchone()[0])
-            self.assertEqual(0, recovered.store.connection.execute(
-                "SELECT count(*) FROM scheduled_wakeups").fetchone()[0])
-            recovered.close()
 
     async def test_retry_then_success_and_dispatcher_restart_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -619,180 +397,6 @@ class OutputCapabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, provider.round)
             self.assertEqual(1, runtime.store.connection.execute(
                 "SELECT count(*) FROM final_dispositions").fetchone()[0])
-            runtime.close()
-
-    def test_managed_agent_uses_validated_text_format_and_protocol_fingerprint(self):
-        from resident.provider import OpenAIAgentsProvider
-        from resident.store import _create_request_configuration
-        provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
-        capabilities = [
-            notify_owner_capability(),
-            display_capability("display1", [], max_length=40),
-        ]
-        schema = output_schema(capabilities)
-        fingerprint = schema_fingerprint(schema)
-        provider.configure_output_protocol(
-            schema, [cap.semantic_descriptor() for cap in capabilities], fingerprint)
-        agent = provider._agent_config([])
-        self.assertEqual({
-            "type": "json_schema", "schema": schema,
-        }, agent["text"]["format"])
-        self.assertEqual({"type", "schema"}, set(agent["text"]["format"]))
-        protocol = provider._agent_protocol(agent)
-        self.assertEqual(fingerprint, protocol["output_schema_fingerprint"])
-        reconstructed, _ = _create_request_configuration({
-            "environment": {"type": "none"}, "agent": agent})
-        self.assertEqual(protocol, reconstructed)
-
-    def test_managed_agent_supports_zero_output_protocol(self):
-        from resident.provider import OpenAIAgentsProvider
-        from resident.store import _create_request_configuration
-        empty_schema = output_schema([])
-        fingerprint = schema_fingerprint(empty_schema)
-        provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
-        provider.configure_output_protocol(
-            empty_schema, [], fingerprint)
-        empty_agent = provider._agent_config([])
-        self.assertEqual({
-            "type": "json_schema", "schema": empty_schema,
-        }, empty_agent["text"]["format"])
-        protocol = provider._agent_protocol(empty_agent)
-        self.assertEqual(fingerprint, protocol["output_schema_fingerprint"])
-        empty_reconstructed, _ = _create_request_configuration({
-            "environment": {"type": "none"}, "agent": empty_agent})
-        self.assertEqual(protocol, empty_reconstructed)
-
-    def test_managed_agent_instructions_require_authorized_owner_wake_reply(self):
-        from resident.provider import RESIDENT_AGENT_INSTRUCTIONS
-
-        self.assertIn(
-            "For an Owner-initiated wake, include a notify_owner output with the reply when that output is "
-            "authorized.", RESIDENT_AGENT_INSTRUCTIONS)
-        self.assertIn(
-            "Other terminal outputs, such as display outputs, do not constitute a reply to the Owner.",
-            RESIDENT_AGENT_INSTRUCTIONS)
-        self.assertIn(
-            "This requirement does not require notifying the Owner for spontaneous or other non-Owner wakes.",
-            RESIDENT_AGENT_INSTRUCTIONS)
-        self.assertIn(
-            "Structured outputs are terminal side-effect requests: Runtime delivers them only after the turn "
-            "has completed, and delivery results are not returned to this turn.",
-            RESIDENT_AGENT_INSTRUCTIONS)
-        self.assertIn(
-            "Follow Resident-specific instructions when choosing other authorized outputs.",
-            RESIDENT_AGENT_INSTRUCTIONS)
-
-    def test_managed_agent_session_create_uses_exact_structured_output_wire_shape(self):
-        from resident.provider import OpenAIAgentsProvider, RESIDENT_AGENT_INSTRUCTIONS
-        provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
-        capabilities = [
-            notify_owner_capability(),
-            display_capability("display1", [], max_length=40),
-        ]
-        schema = output_schema(capabilities)
-        provider.configure_output_protocol(
-            schema, [cap.semantic_descriptor() for cap in capabilities],
-            schema_fingerprint(schema))
-        requests = []
-
-        def fake_request(method, path, body=None, **_):
-            requests.append((method, path, body))
-            return {"id": "session-1", "status": "idle"}
-
-        provider._request = fake_request
-        provider._ensure_session([], initial_input="bootstrap")
-
-        self.assertEqual([("POST", "/agents/sessions", {
-            "environment": {"type": "none"},
-            "agent": {
-                "model": "gpt-5.6-luna",
-                "instructions": RESIDENT_AGENT_INSTRUCTIONS,
-                "tools": [],
-                "text": {"format": {
-                    "type": "json_schema", "schema": schema,
-                }},
-            },
-            "input": "bootstrap",
-            "metadata": {"managed_by": "resident"},
-        })], requests)
-
-    def test_managed_agent_schema_change_rollover_uses_exact_new_wire_shape(self):
-        from resident.provider import OpenAIAgentsProvider
-        provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
-        original = output_schema([display_capability("display1", [], max_length=40)])
-        provider.configure_output_protocol(original, [], schema_fingerprint(original))
-        requests = []
-
-        def fake_request(method, path, body=None, **_):
-            requests.append((method, path, body))
-            if method == "POST" and path == "/agents/sessions":
-                return {"id": f"session-{len(requests)}", "status": "idle"}
-            if method == "GET":
-                return {"id": "session-1", "status": "idle", "agent": {}}
-            raise AssertionError((method, path, body))
-
-        provider._request = fake_request
-        provider._ensure_session([], initial_input="first bootstrap")
-        replacement = output_schema([
-            notify_owner_capability(),
-            display_capability("display1", [], max_length=120),
-        ])
-        provider.configure_output_protocol(
-            replacement, [], schema_fingerprint(replacement))
-        provider.request_rollover("output_protocol_changed")
-        provider._ensure_session([], initial_input="replacement bootstrap")
-
-        creates = [body for method, path, body in requests
-                   if method == "POST" and path == "/agents/sessions"]
-        self.assertEqual(2, len(creates))
-        self.assertEqual({
-            "type": "json_schema", "schema": replacement,
-        }, creates[1]["agent"]["text"]["format"])
-        self.assertEqual("replacement bootstrap", creates[1]["input"])
-        self.assertEqual("output_protocol_changed",
-                         creates[1]["metadata"]["rollover_reason"])
-        self.assertFalse(any(
-            method == "POST" and path != "/agents/sessions"
-            for method, path, _ in requests))
-
-    def test_changing_output_grants_changes_fingerprint_and_requires_rollover(self):
-        from resident.provider import OpenAIAgentsProvider
-        provider = OpenAIAgentsProvider("key", "gpt-5.6-luna")
-        first = display_capability("display1", [])
-        first_schema = output_schema([first])
-        first_fingerprint = schema_fingerprint(first_schema)
-        provider.configure_output_protocol(
-            first_schema, [first.semantic_descriptor()], first_fingerprint)
-        provider._session_id = "session"
-        provider._protocol_descriptor = provider._agent_protocol(provider._agent_config([]))
-        second = display_capability("display2", [])
-        second_schema = output_schema([second])
-        second_fingerprint = schema_fingerprint(second_schema)
-        self.assertNotEqual(first_fingerprint, second_fingerprint)
-        provider.configure_output_protocol(
-            second_schema, [second.semantic_descriptor()], second_fingerprint)
-        self.assertTrue(provider.protocol_change_requires_rollover([]))
-
-    def test_busy_old_session_keeps_legacy_paths_for_recovery(self):
-        from resident.capabilities import Capability
-
-        async def legacy(_):
-            return {}
-
-        with tempfile.TemporaryDirectory() as temporary:
-            provider = StructuredProvider()
-            provider.applied_output_protocol = False
-            legacy_display = Capability(
-                "display", "legacy", "display1_show_text", "legacy",
-                {"type": "object", "properties": {"text": {"type": "string"}},
-                 "required": ["text"], "additionalProperties": False}, legacy)
-            runtime = ResidentRuntime(
-                Config(Path(temporary)), provider, capabilities=[legacy_display],
-                output_capabilities=(display_capability("display1", []),),
-                owner_output=lambda _: None, diagnostic_output=lambda _: None)
-            self.assertFalse(runtime._uses_structured_output_protocol())
-            names = [item.name for item in runtime._tool_capabilities_for_protocol(False)]
-            self.assertIn("display1_show_text", names)
             runtime.close()
 
 

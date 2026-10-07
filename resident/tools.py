@@ -12,9 +12,9 @@ from .store import Store
 
 
 CORE_TOOL_NAMES = frozenset({
-    "create_intention", "update_intention", "send_owner_message", "schedule_wakeup",
-    "search_communication", "list_wake_history", "search_long_term_memory",
-    "get_long_term_memory", "set_owner_guidance", "remove_owner_guidance",
+    "create_intention", "update_intention", "schedule_wakeup",
+    "search_communication", "list_wake_history",
+    "set_owner_guidance", "remove_owner_guidance",
 })
 
 
@@ -29,7 +29,6 @@ class OwnerGuidanceAuthorization:
     """Trusted provenance for one authenticated Owner-message processing context."""
 
     message_id: str
-    session_id: str | None = None
 
 
 def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[str, Any]:
@@ -38,9 +37,8 @@ def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[
 
 class ToolRegistry:
     def __init__(self, store: Store, capabilities: Sequence[Capability],
-                 send_message: Callable[[str], Awaitable[dict[str, Any]] | dict[str, Any]],
                  emit: Callable[[str, dict[str, Any]], None], *,
-                 current_run_id: str | None = None, owner_communication_enabled: bool = True,
+                 current_run_id: str | None = None,
                  owner_guidance_authorization: OwnerGuidanceAuthorization | None = None):
         self.store, self.emit, self.current_run_id = store, emit, current_run_id
         self.owner_guidance_authorization = owner_guidance_authorization
@@ -50,10 +48,6 @@ class ToolRegistry:
             "update_intention": Tool(ToolSpec("update_intention", "Change an intention's content or status.",
                 _schema(("id",), id={"type": "string"}, content={"type": ["string", "null"]},
                         status={"type": ["string", "null"], "enum": ["pending", "completed", "cancelled", None]})), self._update_intention),
-            "send_owner_message": Tool(ToolSpec("send_owner_message",
-                "Send intentional communication to your owner. This is the only Owner-facing output path, "
-                "including for replies to Owner-initiated wakes.",
-                _schema(("content",), content={"type": "string"})), lambda a: send_message(a["content"])),
             "schedule_wakeup": Tool(ToolSpec("schedule_wakeup", "Request a persistent future wakeup after a delay.",
                 _schema(("delay_seconds", "reason"), delay_seconds={"type": "integer", "minimum": 1, "maximum": 31536000},
                         reason={"type": "string"}, context={"type": "object"})), self._schedule),
@@ -75,15 +69,6 @@ class ToolRegistry:
                         limit={"type": "integer", "minimum": 1, "maximum": 20},
                         offset={"type": "integer", "minimum": 0, "maximum": 1000})),
                 self._list_wake_history),
-            "search_long_term_memory": Tool(ToolSpec("search_long_term_memory",
-                "Search curated durable memories when older knowledge is relevant. Returns bounded active records only.",
-                _schema(query={"type": "string"},
-                        limit={"type": "integer", "minimum": 1, "maximum": 20},
-                        offset={"type": "integer", "minimum": 0, "maximum": 1000})),
-                self._search_long_term_memory),
-            "get_long_term_memory": Tool(ToolSpec("get_long_term_memory",
-                "Read one active curated memory and its audit provenance by id. This is read-only.",
-                _schema(("id",), id={"type": "string"})), self._get_long_term_memory),
             "set_owner_guidance": Tool(ToolSpec("set_owner_guidance",
                 "Persist an instruction only when the authenticated Owner explicitly states that it "
                 "should remain in force across future wakes. Never infer standing guidance from a "
@@ -94,8 +79,6 @@ class ToolRegistry:
                 "Remove durable Owner guidance when the Owner explicitly revokes it.",
                 _schema(("id",), id={"type": "string"})), self._remove_owner_guidance),
         }
-        if not owner_communication_enabled:
-            self.tools.pop("send_owner_message")
         for capability in capabilities:
             if capability.name in self.tools:
                 raise ValueError(f"Duplicate tool name: {capability.name}")
@@ -238,27 +221,18 @@ class ToolRegistry:
         )
         return {"wake_runs": runs}
 
-    def _search_long_term_memory(self, a: dict[str, Any]) -> dict[str, Any]:
-        return {"memories": self.store.search_memories(
-            a.get("query", ""), limit=a.get("limit", 10), offset=a.get("offset", 0))}
-
-    def _get_long_term_memory(self, a: dict[str, Any]) -> dict[str, Any]:
-        memory = self.store.memory(a["id"])
-        return {"memory": memory if memory is not None and memory["status"] == "active" else None}
 
     def _set_owner_guidance(self, a: dict[str, Any]) -> dict[str, Any]:
         authorization = self._require_owner_guidance_authorization()
         guidance_id = self.store.set_owner_guidance(
             a["content"], guidance_id=a.get("id"),
-            source_session_id=authorization.session_id,
-            source_item_id=authorization.message_id)
+            source_message_id=authorization.message_id)
         return {"guidance_id": guidance_id}
 
     def _remove_owner_guidance(self, a: dict[str, Any]) -> dict[str, Any]:
         authorization = self._require_owner_guidance_authorization()
         return {"removed": self.store.remove_owner_guidance(
-            a["id"], source_session_id=authorization.session_id,
-            source_item_id=authorization.message_id)}
+            a["id"], source_message_id=authorization.message_id)}
 
     def _require_owner_guidance_authorization(self) -> OwnerGuidanceAuthorization:
         if self.owner_guidance_authorization is None:
@@ -266,4 +240,3 @@ class ToolRegistry:
                 "Standing Owner guidance may only be changed while processing an "
                 "authenticated Owner message")
         return self.owner_guidance_authorization
-

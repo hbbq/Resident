@@ -26,7 +26,6 @@ class OutputCapability:
     handler: OutputHandler
     target: str | None = None
     delivery_policy: DeliveryPolicy = DeliveryPolicy()
-    legacy_tool_name: str | None = None
 
     @property
     def grant_id(self) -> str:

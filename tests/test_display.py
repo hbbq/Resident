@@ -22,17 +22,6 @@ class FakeResponse:
 
 
 class DisplayConnectorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_each_display_exposes_a_named_show_text_capability(self):
-        connector = DisplayConnector("http://homeops.test", [
-            DisplayConfig("display1"), DisplayConfig("hall-panel"),
-        ])
-
-        self.assertEqual(
-            ["display1_show_text", "hall-panel_show_text"],
-            [capability.name for capability in connector.capabilities],
-        )
-        self.assertEqual(["text"], connector.capabilities[0].input_schema["required"])
-
     async def test_each_display_exposes_a_target_specific_output_capability(self):
         connector = DisplayConnector("http://homeops.test", [
             DisplayConfig("display1", 40), DisplayConfig("display2", 120),
@@ -68,16 +57,11 @@ class DisplayConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, timeout)
         self.assertEqual({"display_id": "display/one", "status": "queued"}, result)
 
-    async def test_unexpected_success_status_becomes_a_clear_tool_failure(self):
+    async def test_unexpected_success_status_fails_output_delivery(self):
         connector = DisplayConnector("http://homeops.test", [DisplayConfig("display1")])
-        registry = ToolRegistry(
-            None, connector.capabilities, lambda _: None, lambda *_: None)
-
         with patch("resident.display.urlopen", return_value=FakeResponse(200)):
-            result = await registry.execute("display1_show_text", {"text": "hello"})
-
-        self.assertFalse(result.output["ok"])
-        self.assertIn("HTTP status 200; expected 204", result.output["error"])
+            with self.assertRaisesRegex(RuntimeError, "HTTP status 200; expected 204"):
+                await connector.output_capabilities[0].handler({"content": "hello"})
 
 
 class DisplayConfigTests(unittest.TestCase):

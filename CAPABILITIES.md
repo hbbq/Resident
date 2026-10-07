@@ -18,17 +18,15 @@ A Resident definition grants connector IDs or individual tool names in `capabili
 
 ## Always-present built-in tools
 
-These are runtime tools, not `capabilities` grants. `send_owner_message` is a compatibility tool and is described below.
+These are runtime tools, not `capabilities` grants.
 
 | Tool | Availability |
 | --- | --- |
 | `create_intention` | Local runtime state; no extra connector configuration. |
-| `get_long_term_memory` | Local runtime state; no extra connector configuration. |
 | `list_wake_history` | Local runtime state; no extra connector configuration. |
 | `remove_owner_guidance` | Requires an authenticated Owner-message context to change guidance. |
 | `schedule_wakeup` | Local runtime state; no extra connector configuration. |
 | `search_communication` | Local runtime state; no extra connector configuration. |
-| `search_long_term_memory` | Local runtime state; no extra connector configuration. |
 | `set_owner_guidance` | Requires an authenticated Owner-message context to change guidance. |
 | `update_intention` | Local runtime state; no extra connector configuration. |
 
@@ -38,15 +36,6 @@ These are runtime tools, not `capabilities` grants. `send_owner_message` is a co
 | --- | --- |
 | `display/<display-id>` | Grant outputs: [display/<display-id>]; configure RESIDENT_DISPLAYS and RESIDENT_HOMEOPS_URL. Each target must exist and have a HomeOps display route. |
 | `notify_owner` | Grant outputs: [notify_owner]; use the default terminal Resident or configure an Owner Telegram transport with token_env, owner_user_id_env, and owner_chat_id_env. Requires an available Owner route. |
-
-## Non-grantable compatibility tools
-
-These tools serve the Responses fallback or already-active old Managed Agents sessions. New structured-output sessions use terminal outputs.
-
-| Tool | Configuration and dependency |
-| --- | --- |
-| `send_owner_message` | Owner route and `notify_owner` output authorization; not a `capabilities` grant. |
-| `<display-id>_show_text` | Set RESIDENT_DISPLAYS with unique display IDs and RESIDENT_HOMEOPS_URL; use a configured HomeOps display queue. Use the matching `display/<display-id>` output grant; not an independent capability grant. |
 
 ## Subscriptions
 

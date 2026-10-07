@@ -4,7 +4,6 @@ import json
 import math
 import os
 import re
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
                            {"*"})
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
-    "role", "role_prompt", "agent", "curator", "capabilities", "outputs",
+    "role", "role_prompt", "agent", "capabilities", "outputs",
     "subscriptions", "owner_transport", "external_applications", "realm", "keeper_history", "body",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
@@ -38,22 +37,13 @@ _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
 
 @dataclass(frozen=True)
 class AgentDefinition:
-    provider: str = "openai-agents"
+    provider: str = "openai-responses"
     model: str = "gpt-5.6-luna"
     api_key_env: str = "OPENAI_API_KEY"
     base_url_env: str = "OPENAI_BASE_URL"
-    agent_id_env: str | None = None
     reasoning_effort: str | None = None
     service_tier: str | None = None
-
-
-@dataclass(frozen=True)
-class CuratorDefinition:
-    model: str | None = None
-    api_key_env: str = "OPENAI_API_KEY"
-    base_url_env: str = "OPENAI_BASE_URL"
-    batch_size: int = 50
-    max_batches: int = 4
+    compact_threshold: int | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +90,6 @@ class ResidentDefinition:
     role: str = ""
     enabled: bool = True
     agent: AgentDefinition = field(default_factory=AgentDefinition)
-    curator: CuratorDefinition | None = None
     capabilities: tuple[str, ...] = ()
     outputs: tuple[str, ...] = ()
     subscriptions: tuple[str, ...] = ()
@@ -411,19 +400,20 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
             if "role_prompt" in data else _string(data["role"], "role"))
 
     agent_data = _mapping(data.get("agent", {}), f"{path.name}.agent")
-    agent_allowed = {"provider", "model", "api_key_env", "base_url_env", "agent_id_env",
-                     "reasoning_effort", "service_tier"}
+    agent_allowed = {"provider", "model", "api_key_env", "base_url_env",
+                     "reasoning_effort", "service_tier", "compact_threshold"}
     if set(agent_data) - agent_allowed:
         raise ValueError(f"Unknown agent fields in {path.name}: {', '.join(sorted(set(agent_data) - agent_allowed))}")
-    provider = _string(agent_data.get("provider", "openai-agents"), "agent.provider")
-    if provider not in {"openai-agents", "openai-responses", "openai"}:
+    provider = _string(agent_data.get("provider", "openai-responses"), "agent.provider")
+    if provider != "openai-responses":
         raise ValueError(f"Unsupported provider for {resident_id}: {provider}")
     agent = AgentDefinition(
         provider=provider,
+        compact_threshold=(_positive_integer(agent_data['compact_threshold'], 'agent.compact_threshold')
+                           if agent_data.get('compact_threshold') is not None else None),
         model=_string(agent_data.get("model", "gpt-5.6-luna"), "agent.model"),
         api_key_env=_env_name(agent_data.get("api_key_env", "OPENAI_API_KEY"), "agent.api_key_env"),
         base_url_env=_env_name(agent_data.get("base_url_env", "OPENAI_BASE_URL"), "agent.base_url_env"),
-        agent_id_env=_env_name(agent_data.get("agent_id_env"), "agent.agent_id_env", required=False),
         reasoning_effort=(
             _reasoning_effort(agent_data["reasoning_effort"], "agent.reasoning_effort")
             if agent_data.get("reasoning_effort") is not None else None),
@@ -431,29 +421,6 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
             _string(agent_data["service_tier"], "agent.service_tier")
             if agent_data.get("service_tier") is not None else None),
     )
-    curator = None
-    if data.get("curator") is not None:
-        curator_data = _mapping(data["curator"], f"{path.name}.curator")
-        curator_allowed = {"model", "api_key_env", "base_url_env", "batch_size", "max_batches"}
-        if set(curator_data) - curator_allowed:
-            raise ValueError(
-                f"Unknown curator fields in {path.name}: "
-                f"{', '.join(sorted(set(curator_data) - curator_allowed))}")
-        curator = CuratorDefinition(
-            model=(
-                _string(curator_data["model"], "curator.model")
-                if curator_data.get("model") is not None else None),
-            api_key_env=_env_name(
-                curator_data.get("api_key_env", "OPENAI_API_KEY"),
-                "curator.api_key_env"),
-            base_url_env=_env_name(
-                curator_data.get("base_url_env", "OPENAI_BASE_URL"),
-                "curator.base_url_env"),
-            batch_size=_positive_integer(
-                curator_data.get("batch_size", 50), "curator.batch_size", maximum=100),
-            max_batches=_positive_integer(
-                curator_data.get("max_batches", 4), "curator.max_batches"),
-        )
     transport = None
     if data.get("owner_transport") is not None:
         item = _mapping(data["owner_transport"], "owner_transport")
@@ -486,12 +453,12 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
     keeper_history = data.get("keeper_history", False)
     if not isinstance(keeper_history, bool):
         raise ValueError(f"{path.name}.keeper_history must be boolean")
-    if keeper_history and (realm is None or provider != "openai-agents"):
+    if keeper_history and realm is None:
         raise ValueError(
-            f"{path.name}.keeper_history requires realm and openai-agents")
+            f"{path.name}.keeper_history requires realm")
     return ResidentDefinition(
         id=resident_id, name=name, personality=personality, role=role, enabled=enabled,
-        agent=agent, curator=curator,
+        agent=agent,
         capabilities=_string_list(data.get("capabilities"), "capabilities"),
         outputs=_string_list(data.get("outputs"), "outputs"),
         subscriptions=_subscriptions(data.get("subscriptions"), "subscriptions"),
@@ -539,21 +506,3 @@ def resolve_environment(name: str, *, required: bool = True) -> str | None:
     if required and not value:
         raise ValueError(f"Required secret environment variable is not set: {name}")
     return value or None
-
-
-def migrate_legacy_state(data_dir: Path, instance_id: str = "resident") -> Path:
-    """Explicitly move the singleton database and SQLite sidecars to an instance directory."""
-    if not _ID.fullmatch(instance_id):
-        raise ValueError("Migration instance id is invalid")
-    source = data_dir / "resident.sqlite3"
-    target = data_dir / "instances" / instance_id / "resident.sqlite3"
-    if target.exists():
-        raise FileExistsError(f"Instance state already exists: {target}")
-    if not source.exists():
-        raise FileNotFoundError(f"Legacy Resident state does not exist: {source}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in ("", "-wal", "-shm"):
-        current = Path(f"{source}{suffix}")
-        if current.exists():
-            shutil.move(str(current), str(Path(f"{target}{suffix}")))
-    return target

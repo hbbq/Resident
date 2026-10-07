@@ -15,22 +15,13 @@ from .realm import RealmClient
 from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
-from .provider import ModelProvider, RemoteSessionUnavailable
-from .memory import FinalCatchUpIncomplete, MemoryCurator, SessionHistoryUnavailable
+from .provider import ModelProvider, ResponseInvalid, ResponseRejected
 from .observability import EventLoopLagProbe, ObservedQueue, emit_timeline, timeline_reporter
 from .outputs import (OutputCapability, capability_for_output, output_schema,
                       schema_fingerprint, validate_disposition)
 from .readiness import ReadinessItem, ReadinessResult
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
-
-
-_DEGRADED_HANDOVER = (
-    "The previous remote session was unavailable, so its final working context could not be "
-    "curated. Continue from the durable Resident identity, standing Owner guidance, pending "
-    "intentions, and long-term-memory index in this bootstrap. Older communication remains "
-    "available through bounded communication search."
-)
 
 
 class EventProducer(Protocol):
@@ -49,112 +40,8 @@ class CallbackOwnerTransport:
         self.callback(content)
 
 
-class CuratorCoordinator:
-    """One durable, coalescing routine-curation stream for a Resident."""
-
-    def __init__(self, runtime: "ResidentRuntime"):
-        self.runtime = runtime
-        self._signal = asyncio.Event()
-        self._stop = False
-        self._task: asyncio.Task[None] | None = None
-        self._run_lock = asyncio.Lock()
-
-    def start(self) -> None:
-        if self._task is None or self._task.done():
-            self._stop = False
-            self._task = asyncio.create_task(self._run(), name="resident-curator")
-
-    def signal(self) -> None:
-        self._signal.set()
-
-    async def barrier(self, *, final: bool = False) -> str | None:
-        curator = self.runtime.curator
-        if curator is None:
-            return None
-        async with self._run_lock:
-            session_id = getattr(getattr(curator, "source", None), "session_id", None)
-            handover = await curator.catch_up(final=final)
-            if session_id:
-                self.runtime.store.complete_curator_request("openai_agents", session_id)
-            return handover
-
-    async def stop(self, grace_seconds: float = 2.0) -> None:
-        self._stop = True
-        self._signal.set()
-        task = self._task
-        if task is None:
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=grace_seconds)
-        except TimeoutError:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        finally:
-            self._task = None
-
-    def cancel(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-
-    async def _run(self) -> None:
-        while not self._stop:
-            curator = self.runtime.curator
-            session_id = (getattr(getattr(curator, "source", None), "session_id", None)
-                          if curator else None)
-            request = (self.runtime.store.curator_request("openai_agents", session_id)
-                       if session_id else None)
-            if (session_id and self.runtime._forced_abandonment(session_id)):
-                self._signal.clear()
-                await self._signal.wait()
-                continue
-            if request is None:
-                self._signal.clear()
-                await self._signal.wait()
-                continue
-            retry_at = request.get("next_retry_at")
-            if retry_at:
-                delay = max(0.0, (datetime.fromisoformat(retry_at) - datetime.now(UTC)).total_seconds())
-                if delay:
-                    self._signal.clear()
-                    try:
-                        await asyncio.wait_for(self._signal.wait(), timeout=delay)
-                        continue
-                    except TimeoutError:
-                        pass
-            target = request["target_turn_id"]
-            attempt = self.runtime.store.start_curator_request(
-                "openai_agents", session_id, target)
-            if attempt is None:
-                continue
-            self.runtime._emit_background("curator.started", {"attempt": attempt})
-            try:
-                async with self._run_lock:
-                    await curator.catch_up(
-                        through_turn_id=target, session_id=session_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                retry_seconds = min(60.0, float(2 ** min(max(attempt - 1, 0), 6)))
-                if self.runtime.store.retry_curator_request(
-                        "openai_agents", session_id, target,
-                        type(exc).__name__, retry_seconds):
-                    event_type = "curator.degraded" if attempt > 1 else "curator.retry_scheduled"
-                    self.runtime._emit_background(event_type, {
-                        "attempt": attempt, "error_type": type(exc).__name__,
-                        "retry_seconds": retry_seconds})
-            else:
-                if self.runtime.store.complete_curator_request(
-                        "openai_agents", session_id, target):
-                    self.runtime._emit_background("curator.caught_up", {"attempt": attempt})
-
-
 class ResidentRuntime:
-    _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"communication.failed", "wake.failed"})
-    _STARTUP_CURATOR_MAX_ATTEMPTS = 100
-    _STARTUP_CURATOR_MAX_STALLED_ATTEMPTS = 3
-    _STARTUP_CURATOR_RETRY_BASE_SECONDS = 0.25
-
+    _NORMAL_DIAGNOSTIC_EVENTS = frozenset({"output.delivery_failed", "wake.failed"})
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: Sequence[Capability] | None = None,
                  realm_client: RealmClient | None = None,
@@ -164,9 +51,8 @@ class ResidentRuntime:
                  owner_output_enabled: bool | None = None,
                  owner_output: Callable[[str], None] | None = None,
                  diagnostic_output: Callable[[str], None] | None = None):
-        if config.keeper_history and (realm_client is None or not getattr(
-                provider, "uses_managed_session", False)):
-            raise ValueError("Keeper history requires Realm and a managed session")
+        if config.keeper_history and realm_client is None:
+            raise ValueError("Keeper history requires Realm")
         self.config, self.provider = config, provider
         self.realm_client = realm_client
         initial_capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
@@ -176,82 +62,7 @@ class ResidentRuntime:
             self.realm_client.bind_mutation_store(self.store.realm_mutation_request)
         self.resident, self.owner = self.store.provision(
             config.resident_name, config.owner_name, config.personality)
-        bind_session_store = getattr(provider, "bind_session_store", None)
-        if bind_session_store is not None:
-            bind_session_store(
-                lambda: self.store.agent_session_binding("openai_agents"),
-                lambda session_id, agent_id, last_turn_id: self.store.save_agent_session_binding(
-                    "openai_agents", session_id, agent_id, last_turn_id),
-            )
-        bind_action_store = getattr(provider, "bind_action_store", None)
-        if bind_action_store is not None:
-            bind_action_store(
-                self.store.begin_agent_tool_action,
-                self.store.complete_agent_tool_action,
-            )
-        bind_wake_store = getattr(provider, "bind_wake_submission_store", None)
-        if bind_wake_store is not None:
-            bind_wake_store(
-                lambda session_id, wake_key: self.store.agent_wake_submission(
-                    "openai_agents", session_id, wake_key),
-                lambda session_id, wake_key, correlation:
-                    self.store.mark_agent_wake_submission_attempted(
-                        "openai_agents", session_id, wake_key, correlation,
-                        wake_id=self._active_event.id if self._active_event else None,
-                        wake_source=self._active_event.source if self._active_event else None,
-                        wake_reason=self._active_event.reason if self._active_event else None),
-                lambda session_id, wake_key, turn_id:
-                    self.store.correlate_agent_wake_submission(
-                        "openai_agents", session_id, wake_key, turn_id),
-                lambda session_id, turn_id: self.store.settle_agent_wake_submission(
-                    "openai_agents", session_id, turn_id),
-                lambda session_id, wake_key: self.store.clear_agent_wake_submission(
-                    "openai_agents", session_id, wake_key),
-            )
-        bind_lifecycle_store = getattr(provider, "bind_lifecycle_store", None)
-        if bind_lifecycle_store is not None:
-            self.store.recover_session_rollovers("openai_agents")
-            bind_lifecycle_store(
-                lambda session_id: self.store.session_protocol("openai_agents", session_id),
-                lambda session_id, descriptor: self.store.save_session_protocol(
-                    "openai_agents", session_id, descriptor),
-                lambda session_id: self.store.session_mutable_settings(
-                    "openai_agents", session_id),
-                lambda session_id, settings: self.store.save_session_mutable_settings(
-                    "openai_agents", session_id, settings),
-                lambda: self.store.pending_session_rollover("openai_agents"),
-                lambda old, reason, requested_by, request, protocol, mutable:
-                    self.store.begin_session_rollover(
-                        "openai_agents", old, reason, requested_by, request,
-                        protocol, mutable),
-                self.store.mark_session_rollover_create_started,
-                self.store.bind_session_rollover,
-                self.store.complete_session_rollover,
-                self.store.fail_session_rollover,
-                lambda session_id, agent_id, request, protocol, mutable:
-                    self.store.bind_initial_agent_session(
-                        "openai_agents", session_id, agent_id, request,
-                        protocol, mutable),
-            )
-        deferred_request = self.store.pending_session_rollover_request("openai_agents")
-        restored_deferred_request = False
-        if deferred_request is not None and getattr(provider, "session_id", None) is not None:
-            if deferred_request["old_session_id"] != provider.session_id:
-                self.store.clear_session_rollover_request(
-                    "openai_agents", deferred_request["old_session_id"])
-            elif self.store.pending_session_rollover("openai_agents") is None:
-                request_rollover = getattr(provider, "request_rollover", None)
-                if request_rollover is not None:
-                    request_rollover(deferred_request["reason"])
-                    restored_deferred_request = True
-        if config.new_chapter and not restored_deferred_request:
-            request_rollover = getattr(provider, "request_rollover", None)
-            if request_rollover is not None:
-                request_rollover("explicit_new_chapter")
         self._event_queue: asyncio.Queue[WakeEvent | None] | None = None
-        self._capability_event_states: dict[
-            str, tuple[tuple[Capability, ...], dict[str, dict]]
-        ] = {}
         current_snapshot = self._capability_snapshot(self._capabilities)
         persisted_snapshot = self.store.observed_snapshot("runtime.capabilities")
         if persisted_snapshot is None:
@@ -268,14 +79,10 @@ class ResidentRuntime:
         self._remote_owner_transport = owner_transport is not None
         self._mirror_owner_output = self.owner_output if owner_transport is not None else None
         self.diagnostic_output = diagnostic_output or (lambda message: print(f"[runtime] {message}"))
-        self._output_protocol_enabled = (
-            output_capabilities is not None or owner_transport is not None)
         configured_outputs = list(output_capabilities or ())
         if owner_output_enabled is None:
             owner_output_enabled = config.owner_communication_enabled
-        if (self._output_protocol_enabled
-                and getattr(provider, "supports_output_capabilities", False)
-                and owner_output_enabled):
+        if owner_output_enabled:
             async def notify_owner(payload: dict[str, Any]) -> dict[str, Any]:
                 if self._mirror_owner_output is not None:
                     try:
@@ -295,25 +102,16 @@ class ResidentRuntime:
                     "required": ["content"], "additionalProperties": False,
                 },
                 route_identity="owner", handler=notify_owner,
-                legacy_tool_name="send_owner_message",
             ))
         self._output_capabilities = self._validated_output_capabilities(configured_outputs)
         self._output_schema = output_schema(self._output_capabilities)
         self._output_schema_fingerprint = schema_fingerprint(self._output_schema)
-        configure_outputs = getattr(provider, "configure_output_protocol", None)
-        if configure_outputs is not None and self._output_protocol_enabled:
-            configure_outputs(
-                self._output_schema,
-                [capability.semantic_descriptor() for capability in self._output_capabilities],
-                self._output_schema_fingerprint)
-        self.context_builder = ContextBuilder(
-            self.store, message_limit=config.context_messages,
-            role=config.role)
+        self.context_builder = ContextBuilder(self.store, role=config.role)
+        self.conversation_id = self.store.conversation_id()
+        self._initialized = False
         self._active_run_id: str | None = None
         self._active_event: WakeEvent | None = None
         self._owner_event_authorizations: dict[str, str] = {}
-        self.curator: MemoryCurator | None = None
-        self._curator_coordinator = CuratorCoordinator(self)
         self._enqueue_times: dict[str, float] = {}
         self._dequeue_observations: dict[str, tuple[float | None, int]] = {}
         self._active_max_loop_lag = 0.0
@@ -321,94 +119,6 @@ class ResidentRuntime:
         self._active_loop_lag_samples = 0
         self._event_loop_lag_checkpoint: Callable[[], Awaitable[None]] | None = None
 
-    def bind_curator(self, curator: MemoryCurator) -> None:
-        self.curator = curator
-
-    def _forced_abandonment(self, session_id: str | None = None) -> dict | None:
-        request = self.store.forced_session_abandonment("openai_agents")
-        if request is None:
-            return None
-        if session_id is not None and request["old_session_id"] != session_id:
-            return None
-        return request
-
-    async def _reconcile_startup_curator(self) -> None:
-        """Reach the durable completed-turn boundary before admitting wakes."""
-        curator = self.curator
-        if curator is None:
-            return
-        provider = "openai_agents"
-        session_id = getattr(getattr(curator, "source", None), "session_id", None)
-        if not session_id:
-            return
-        if self._forced_abandonment(session_id):
-            return
-
-        request = self.store.curator_request(provider, session_id)
-        binding = self.store.agent_session_binding(provider)
-        binding_target = None
-        if binding is not None and binding.get("last_turn_id"):
-            if binding["session_id"] != session_id:
-                raise SessionHistoryUnavailable(
-                    "Bound session does not match the Curator history source")
-            binding_target = binding["last_turn_id"]
-            if (request is None
-                    or request["target_turn_id"] != binding_target):
-                self.store.request_curator_catch_up(
-                    provider, session_id, binding_target)
-                request = self.store.curator_request(provider, session_id)
-        if request is None:
-            if (binding_target is None or self.store.curator_turn_consumed(
-                    provider, session_id, binding_target)):
-                return
-            raise RuntimeError("Startup Curator request could not be persisted")
-
-        target = request["target_turn_id"]
-        startup_attempts = 0
-        stalled_attempts = 0
-        legacy_upgrade_attempted = False
-        while True:
-            checkpoint = self.store.curator_checkpoint(provider, session_id)
-            before = None if checkpoint is None else (
-                checkpoint.get("cursor"), checkpoint.get("last_turn_id"))
-            attempt = self.store.start_curator_request(provider, session_id, target)
-            if attempt is None:
-                raise RuntimeError("Startup Curator request changed during reconciliation")
-            startup_attempts += 1
-            try:
-                upgraded = False
-                if not legacy_upgrade_attempted and isinstance(curator, MemoryCurator):
-                    legacy_upgrade_attempted = True
-                    upgraded = await curator.upgrade_legacy_checkpoint(session_id, target)
-                if not upgraded:
-                    await curator.catch_up(
-                        through_turn_id=target, session_id=session_id)
-                checkpoint = self.store.curator_checkpoint(provider, session_id)
-                if not self.store.curator_turn_consumed(provider, session_id, target):
-                    raise FinalCatchUpIncomplete(
-                        "Completed-turn Curator boundary was not reached")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                checkpoint = self.store.curator_checkpoint(provider, session_id)
-                after = None if checkpoint is None else (
-                    checkpoint.get("cursor"), checkpoint.get("last_turn_id"))
-                progressed = after is not None and after != before
-                stalled_attempts = 0 if progressed else stalled_attempts + 1
-                retry_seconds = (0.0 if progressed else min(
-                    1.0, self._STARTUP_CURATOR_RETRY_BASE_SECONDS
-                    * (2 ** (stalled_attempts - 1))))
-                self.store.retry_curator_request(
-                    provider, session_id, target, type(exc).__name__, retry_seconds)
-                if (stalled_attempts >= self._STARTUP_CURATOR_MAX_STALLED_ATTEMPTS
-                        or startup_attempts >= self._STARTUP_CURATOR_MAX_ATTEMPTS):
-                    raise RuntimeError(
-                        f"Startup Curator reconciliation failed before target {target!r}") from exc
-                if retry_seconds:
-                    await asyncio.sleep(retry_seconds)
-                continue
-            self.store.complete_curator_request(provider, session_id, target)
-            return
 
     @property
     def capabilities(self) -> tuple[Capability, ...]:
@@ -431,20 +141,6 @@ class ResidentRuntime:
                 raise ValueError("Output delivery max_attempts must be positive")
         return snapshot
 
-    def _uses_structured_output_protocol(self) -> bool:
-        return bool(
-            self._output_protocol_enabled
-            and getattr(self.provider, "supports_output_capabilities", False)
-            and (getattr(self.provider, "session_id", None) is None
-                 or getattr(self.provider, "session_uses_output_capabilities", False)
-                 or getattr(self.provider, "rollover_ready", False)))
-
-    def _tool_capabilities_for_protocol(self, structured: bool) -> tuple[Capability, ...]:
-        if not structured:
-            return self._capabilities
-        replaced = {item.legacy_tool_name for item in self._output_capabilities
-                    if item.legacy_tool_name}
-        return tuple(item for item in self._capabilities if item.name not in replaced)
 
     @staticmethod
     def _validated_capabilities(capabilities: Sequence[Capability]) -> tuple[Capability, ...]:
@@ -481,7 +177,6 @@ class ResidentRuntime:
         }
         event = WakeEvent(str(uuid.uuid4()), "runtime", "capabilities_changed", utc_now(), payload)
         self._observed_capability_snapshot = current
-        self._capability_event_states[event.id] = (capability_view, current)
         return event
 
     def replace_capabilities(self, capabilities: Sequence[Capability]) -> WakeEvent | None:
@@ -502,22 +197,7 @@ class ResidentRuntime:
             tuple(capability for capability in self._capabilities if capability.name not in removed))
 
     async def enqueue_startup_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
-        try:
-            await self.recover_missing_disposition()
-        except Exception as exc:
-            self._emit("wake.failed", {
-                "error_type": type(exc).__name__, "phase": "disposition_recovery"})
-        if self.curator is not None:
-            token = timeline_reporter.set(self._timeline) if self.config.timeline else None
-            try:
-                await self._reconcile_startup_curator()
-            except Exception as exc:
-                self._emit("curator.failed", {"phase": "startup", "error_type": type(exc).__name__})
-                raise
-            finally:
-                if token is not None:
-                    timeline_reporter.reset(token)
-            self._curator_coordinator.start()
+        await self.initialize()
         for message in self.store.pending_owner_messages():
             event = self._owner_message_wake(
                 message["id"], message["content"], message["created_at"])
@@ -527,7 +207,6 @@ class ResidentRuntime:
             self._pending_capability_event = None
 
     def close(self) -> None:
-        self._curator_coordinator.cancel()
         if self.realm_client is not None:
             self.realm_client.bind_mutation_store(None)
         close_provider = getattr(self.provider, "close", None)
@@ -536,9 +215,6 @@ class ResidentRuntime:
                 close_provider()
         finally:
             self.store.close()
-
-    async def stop_background_services(self) -> None:
-        await self._curator_coordinator.stop()
 
     def owner_message_event(self, content: str) -> WakeEvent:
         message_id = self.store.ingest_owner_message(self.owner.id, content)
@@ -608,55 +284,9 @@ class ResidentRuntime:
         if self.config.timeline:
             self._emit("timeline", data)
 
-    async def _send_owner_message(self, content: str) -> dict:
-        if not content.strip():
-            return {"delivered": False, "reason": "Message content is empty"}
-        immediate_response = self._active_event is not None and self._active_event.source == "owner"
-        spontaneous = not immediate_response
-        allowed = True
-        if spontaneous:
-            since = (datetime.now(UTC) - timedelta(
-                seconds=self.config.spontaneous_message_window_seconds)).isoformat()
-            allowed = self.store.spontaneous_count_since(since) < self.config.spontaneous_message_limit
-        status = "pending_delivery" if allowed else "rejected_attention_budget"
-        message_id = self.store.add_message(
-            "outbound", self.resident.id, content, spontaneous=spontaneous, delivery_status=status)
-        result = {"message_id": message_id, "delivered": False, "spontaneous": spontaneous}
-        if allowed:
-            if self._mirror_owner_output is not None:
-                try:
-                    self._mirror_owner_output(content)
-                except Exception:
-                    pass
-            try:
-                await self.owner_transport.send_text(content)
-            except Exception as exc:
-                self.store.update_message_delivery_status(message_id, "transport_failed")
-                result.update({
-                    "delivered": False,
-                    "reason": f"Owner transport failed: {type(exc).__name__}: {exc}",
-                })
-                self._emit("communication.failed", result)
-                return result
-            self.store.update_message_delivery_status(message_id, "delivered")
-            result["delivered"] = True
-            self._emit("communication.delivered", result)
-        else:
-            result["reason"] = "Spontaneous owner-message attention budget exceeded"
-            self._emit("communication.rejected", result)
-        return result
-
-    def _active_output_protocol(self) -> tuple[dict[str, Any], str]:
-        protocol = getattr(self.provider, "active_output_protocol", None)
-        if isinstance(protocol, dict):
-            schema = protocol.get("schema")
-            fingerprint = protocol.get("fingerprint")
-            if isinstance(schema, dict) and isinstance(fingerprint, str):
-                return schema, fingerprint
-        return self._output_schema, self._output_schema_fingerprint
 
     def _persist_disposition(
-            self, raw: str | None, session_id: str, turn_id: str, *,
+            self, raw: str | None, conversation_id: str, response_id: str, *,
             run_id: str | None, wake: WakeEvent | None,
             schema: dict[str, Any] | None = None,
             fingerprint: str | None = None) -> dict[str, Any]:
@@ -719,11 +349,11 @@ class ResidentRuntime:
                         wake is not None and wake.reason == "output_delivery_failed"),
                 })
         receipt = self.store.persist_final_disposition(
-            "openai_agents", session_id, turn_id, fingerprint, raw, normalized,
+            conversation_id, response_id, fingerprint, raw, normalized,
             validation_state, jobs, run_id=run_id, wake_id=wake.id if wake else None)
         if receipt["created"]:
             self._emit("disposition.generated", {
-                "disposition_id": receipt["id"], "turn_id": turn_id,
+                "disposition_id": receipt["id"], "response_id": response_id,
                 "validation_state": validation_state,
                 "output_count": len(normalized["outputs"]) if normalized else 0,
             })
@@ -738,37 +368,9 @@ class ResidentRuntime:
                         "target": request.get("target"),
                         "classification": request.get("failure_classification")})
         if validation_state != "valid":
-            raise RuntimeError(f"Managed Agents final disposition is {validation_state}")
+            raise RuntimeError(f"Response final disposition is {validation_state}")
         return receipt
 
-    async def recover_missing_disposition(self) -> bool:
-        if not getattr(self.provider, "supports_output_capabilities", False):
-            return False
-        binding = self.store.agent_session_binding("openai_agents")
-        if binding is None or not binding.get("last_turn_id"):
-            return False
-        session_id, turn_id = binding["session_id"], binding["last_turn_id"]
-        if self._forced_abandonment(session_id):
-            return False
-        protocol = self.store.session_protocol("openai_agents", session_id)
-        if not protocol or not protocol.get("output_schema_fingerprint"):
-            return False
-        if self.store.has_final_disposition("openai_agents", session_id, turn_id):
-            return False
-        recover = getattr(self.provider, "recover_final_output", None)
-        if recover is None:
-            return False
-        raw = await recover(session_id, turn_id)
-        wake_context = self.store.disposition_wake_context(
-            "openai_agents", session_id, turn_id)
-        wake = (None if wake_context is None else WakeEvent(
-            wake_context.get("wake_id") or f"recovered:{turn_id}",
-            wake_context["wake_source"], wake_context["wake_reason"], utc_now(), {}))
-        self._persist_disposition(
-            raw, session_id, turn_id, run_id=None, wake=wake,
-            schema=protocol["output_schema"],
-            fingerprint=protocol["output_schema_fingerprint"])
-        return True
 
     async def dispatch_outputs_once(self) -> bool:
         request = self.store.claim_output_request()
@@ -841,438 +443,176 @@ class ResidentRuntime:
             except TimeoutError:
                 pass
 
-    def _discard_continuation(self, continuation_id: str | None) -> None:
-        if not continuation_id:
+
+    async def initialize(self) -> None:
+        if self._initialized:
             return
-        discard = getattr(self.provider, "discard_continuation", None)
-        if discard is None:
-            return
-        try:
-            discard(continuation_id)
-        except Exception:
-            pass
+        if self.conversation_id is None:
+            conversation_id = await self.provider.create_conversation()
+            self.store.bind_conversation(conversation_id)
+            self.conversation_id = conversation_id
+        await self.recover_pending_responses()
+        self._initialized = True
 
-    def _authoritative_state_update(self, session_id: str,
-                                    current: dict) -> dict | None:
-        """Describe only externally owned state not yet synchronized to this session."""
-        previous = self.store.session_authoritative_state("openai_agents", session_id)
-        if previous is None:
-            return {"mode": "replace", **current}
+    async def recover_pending_responses(self) -> None:
+        # Recover only a locally recorded final Response. Ambiguous POSTs and
+        # interrupted tool loops require an operator fix/reset, not blind replay.
+        steps = self.store.unfinished_response_steps()
+        runs = {}
+        for step in steps:
+            runs.setdefault(step['run_id'], []).append(step)
+        for run_id, run_steps in runs.items():
+            latest = run_steps[-1]
+            turn = json.loads(latest['turn_json']) if latest['turn_json'] else None
+            if latest['status'] != 'returned' or not turn or turn['tool_calls']:
+                raise RuntimeError('Unfinished inference/tool loop; inspect or reset this disposable instance database')
+            wake = WakeEvent(**json.loads(latest['wake_json']))
+            schema = json.loads(latest['schema_json'])
+            self._persist_disposition(turn['message'], latest['conversation_id'], turn['response_id'],
+                                      run_id=run_id, wake=wake, schema=schema)
+            self.store.finish_run(run_id, 'completed', 0, len(run_steps),
+                                  wake.payload.get('schedule_id') if wake.source == 'scheduler' else None,
+                                  wake.payload.get('message_id') if wake.source == 'owner' else None)
 
-        update: dict = {"mode": "delta"}
-        for key in ("resident", "owner", "available_connectors"):
-            if previous.get(key) != current.get(key):
-                update[key] = current[key]
-
-        old_guidance = {
-            entry["id"]: entry for entry in previous.get("standing_owner_guidance", [])
-        }
-        new_guidance = {
-            entry["id"]: entry for entry in current.get("standing_owner_guidance", [])
-        }
-        changed = [entry for guidance_id, entry in new_guidance.items()
-                   if old_guidance.get(guidance_id) != entry]
-        removed = [{
-            "id": guidance_id,
-            "revision": self.store.owner_guidance_revision(guidance_id),
-        } for guidance_id in old_guidance.keys() - new_guidance.keys()]
-        if changed or removed:
-            update["standing_owner_guidance"] = {
-                "set": changed,
-                "removed": removed,
-            }
-        return update if len(update) > 1 else None
+    async def _execute_tool(self, call, response_id: str, registry: ToolRegistry) -> ToolResult:
+        action = self.store.begin_tool_execution(self.conversation_id, response_id,
+                                                 call.id, call.name, call.arguments)
+        if not action['claimed']:
+            if action['attachments_ephemeral']:
+                return ToolResult(call.id, {'ok': False, 'error_code': 'attachment_unavailable',
+                                           'error': 'Ephemeral result cannot be replayed; request a fresh observation'})
+            return ToolResult(call.id, action['output'] or {
+                'ok': False, 'error_code': 'unknown_outcome',
+                'error': 'Interrupted tool outcome is unknown; action was not repeated'})
+        invocation_id = hashlib.sha256(f'{self.conversation_id}\0{call.id}'.encode()).hexdigest()
+        execution = await registry.execute(call.name, call.arguments, invocation_id=invocation_id)
+        self.store.complete_tool_execution(self.conversation_id, call.id, execution.output,
+                                            bool(execution.attachments))
+        return ToolResult(call.id, execution.output, execution.attachments)
 
     async def process(self, event: WakeEvent) -> str:
+        await self.initialize()
+        await self.recover_pending_responses()
+        completed = self.store.completed_event_run(event.id)
+        if completed:
+            return completed
+        if event.source == 'owner' and event.reason == 'owner_message':
+            message_id = event.payload.get('message_id')
+            if (self._owner_event_authorizations.get(event.id) == message_id
+                    and not self.store.is_pending_owner_message(message_id, self.owner.id)):
+                return ''
         started = time.monotonic()
         run_id = self.store.start_run(event)
-        keeper_history = self.config.keeper_history
-        if keeper_history:
-            self.store.start_keeper_interaction(
-                run_id, event, self.realm_client.game_id, self.realm_client.actor_id)
+        if self.config.keeper_history:
+            self.store.start_keeper_interaction(run_id, event, self.realm_client.game_id, self.realm_client.actor_id)
         self._active_run_id, self._active_event = run_id, event
-        self._active_max_loop_lag = 0.0
-        self._active_total_loop_lag = 0.0
+        self._active_max_loop_lag = self._active_total_loop_lag = 0.0
         self._active_loop_lag_samples = 0
-        calls = 0
-        status = "failed"
-        continuation_id: str | None = None
-        capability_event_state = self._capability_event_states.get(event.id)
-        timeline_token = None
+        calls, status = 0, 'failed'
+        timeline_token = timeline_reporter.set(self._timeline) if self.config.timeline else None
         if self.config.timeline:
-            timeline_token = timeline_reporter.set(self._timeline)
-            queued_at, queue_depth = self._dequeue_observations.pop(
-                event.id, (None, 0))
-            self._timeline({
-                "operation": "host.dequeue", "moment": "finished",
-                "event_id": event.id, "queue_depth": queue_depth,
-                "queue_wait_seconds": (None if queued_at is None else started - queued_at),
-            })
-            self._timeline({"operation": "wake.process", "moment": "started"})
+            queued_at, queue_depth = self._dequeue_observations.pop(event.id, (None, 0))
+            self._timeline({'operation': 'host.dequeue', 'moment': 'finished', 'event_id': event.id,
+                            'queue_depth': queue_depth, 'queue_wait_seconds': None if queued_at is None
+                            else started - queued_at})
+            emit_timeline('wake.process', 'started')
         try:
-            self._emit("wake.started", {
-                "event_id": event.id, "source": event.source, "reason": event.reason,
-                "occurred_at": event.occurred_at, "payload": event.payload,
-            })
-            configured_capabilities = (
-                capability_event_state[0] if capability_event_state else self._capabilities)
-            preflight_session = getattr(self.provider, "preflight_session", None)
-            forced = self._forced_abandonment(getattr(self.provider, "session_id", None))
-            emit_timeline("provider.preflight", "started")
-            preflight_started = time.monotonic()
-            try:
-                if forced is not None:
-                    self.provider.abandon_bound_session(forced["old_session_id"])
-                    unavailable_reason = "operator_forced"
-                else:
-                    unavailable_reason = (
-                        await preflight_session() if preflight_session is not None else None)
-            finally:
-                emit_timeline("provider.preflight", "finished",
-                              duration_seconds=time.monotonic() - preflight_started)
-            managed_session = bool(getattr(self.provider, "uses_managed_session", False))
-            structured_outputs = self._uses_structured_output_protocol()
-            capabilities = (self._tool_capabilities_for_protocol(structured_outputs)
-                            if configured_capabilities is self._capabilities else
-                            tuple(item for item in configured_capabilities
-                                  if not structured_outputs or item.name not in {
-                                      output.legacy_tool_name
-                                      for output in self._output_capabilities
-                                      if output.legacy_tool_name}))
-            authoritative_state = self.context_builder.authoritative_state(
-                self.resident, self.owner, capabilities)
+            self._emit('wake.started', {'event_id': event.id, 'source': event.source,
+                                       'reason': event.reason, 'payload': event.payload})
+            context = self.context_builder.build(event)
             realm_state = await self.realm_client.read({}) if self.realm_client else None
-            existing_session_id = getattr(self.provider, "session_id", None)
-            if managed_session:
-                authoritative_update = (
-                    self._authoritative_state_update(existing_session_id, authoritative_state)
-                    if existing_session_id is not None else None)
-                context = self.context_builder.build_managed_wake(
-                    event, authoritative_update=authoritative_update)
-            else:
-                context = self.context_builder.build(
-                    self.resident, self.owner, event, capabilities)
             if realm_state is not None:
-                context_document = json.loads(context)
-                context_document["realm_state"] = realm_state
-                context = json.dumps(context_document, ensure_ascii=False, indent=2)
-            self._emit("context.assembled", {
-                "characters": len(context),
-                "pending_intentions": (
-                    0 if managed_session and existing_session_id is not None
-                    else len(self.store.pending_intentions())),
-                "recent_messages": (
-                    0 if managed_session
-                    else len(self.store.recent_messages(self.config.context_messages))),
-            })
-            owner_guidance_authorization = None
-            if event.source == "owner" and event.reason == "owner_message":
-                message_id = event.payload.get("message_id")
-                if (self._owner_event_authorizations.get(event.id) == message_id
-                        and self.store.is_pending_owner_message(message_id, self.owner.id)):
-                    owner_guidance_authorization = OwnerGuidanceAuthorization(
-                        message_id, getattr(self.provider, "session_id", None))
-            registry = ToolRegistry(
-                self.store, capabilities, self._send_owner_message, self._emit,
-                current_run_id=run_id,
-                owner_communication_enabled=(
-                    self.config.owner_communication_enabled and not structured_outputs),
-                owner_guidance_authorization=owner_guidance_authorization)
-            protocol_rollover = getattr(self.provider, "protocol_change_requires_rollover", None)
-            new_session = getattr(self.provider, "session_id", None) is None
-            handover = None
-            handover_id = None
-            unknown_restored_protocol = (
-                getattr(self.provider, "session_id", None) is not None and
-                not getattr(self.provider, "session_protocol_known", True))
-            needs_rollover = (
-                protocol_rollover is not None and protocol_rollover(registry.specs)
-            ) or unknown_restored_protocol
-            rollover_ready = bool(getattr(self.provider, "rollover_ready", True))
-            if needs_rollover and (rollover_ready or unavailable_reason is not None):
-                old_session_id = getattr(self.provider, "session_id", None)
-                pending_rollover = self.store.pending_session_rollover("openai_agents")
-                if old_session_id:
-                    rollover_reason = (
-                        pending_rollover["reason"] if pending_rollover is not None else
-                        getattr(self.provider, "requested_rollover_reason", None) or
-                        "function_or_immutable_protocol_changed")
-                    self.store.request_session_rollover(
-                        "openai_agents", old_session_id, rollover_reason)
-                pending_handover = self.store.pending_handover(old_session_id) if (
-                    old_session_id and (pending_rollover is not None or forced is not None)) else None
-                if pending_handover is not None:
-                    # This handover is already final for a durable create snapshot.
-                    handover = pending_handover["content"]
-                    handover_id = pending_handover["id"]
-                elif (self.curator is not None and unavailable_reason not in {
-                        "remote_session_missing", "operator_forced"}):
-                    try:
-                        handover = await self._curator_coordinator.barrier(final=True)
-                    except SessionHistoryUnavailable as exc:
-                        self._emit("curator.failed", {
-                            "phase": "final", "error_type": type(exc).__name__,
-                            "history_status": "unavailable"})
-                        handover = _DEGRADED_HANDOVER
-                    except Exception as exc:
-                        self._emit("curator.failed", {
-                            "phase": "final", "error_type": type(exc).__name__,
-                            "history_status": "reachable"})
-                        raise
-                elif unavailable_reason is not None:
-                    handover = _DEGRADED_HANDOVER
-                confirm_rollover = getattr(self.provider, "confirm_rollover_ready", None)
-                confirmed = (unavailable_reason is not None or confirm_rollover is None
-                             or await confirm_rollover())
-                if confirmed:
-                    new_session = True
-                    if old_session_id and handover and handover_id is None:
-                        handover_id = self.store.create_handover(
-                            old_session_id, handover,
-                            (datetime.now(UTC) + timedelta(hours=24)).isoformat())
-                else:
-                    handover = None
-            if new_session:
-                if managed_session:
-                    context = self.context_builder.build_managed_bootstrap(
-                        self.resident, self.owner, event, capabilities, handover=handover,
-                        keeper_recent_context=(self.store.keeper_recent_context(
-                            self.config.keeper_rollover_interactions,
-                            self.config.keeper_rollover_bytes,
-                            game_id=self.realm_client.game_id,
-                            actor_id=self.realm_client.actor_id) if keeper_history else None))
-                else:
-                    context_document = json.loads(context)
-                    context_document["new_session_bootstrap"] = {
-                        "durable_memory_awareness": self.store.memory_awareness(limit=8),
-                        "handover": handover,
-                        "note": "Long-term memory is selectively available through memory tools.",
-                    }
-                    context = json.dumps(context_document, ensure_ascii=False, indent=2)
-            if realm_state is not None:
-                context_document = json.loads(context)
-                context_document["realm_state"] = realm_state
-                context = json.dumps(context_document, ensure_ascii=False, indent=2)
-            if keeper_history:
-                self.store.set_keeper_input(
-                    run_id, getattr(self.provider, "session_id", None), context, realm_state)
-            results: list[ToolResult] = []
+                document = json.loads(context)
+                document['realm_state'] = realm_state
+                context = json.dumps(document, ensure_ascii=False)
+            self._emit('context.assembled', {'characters': len(context),
+                                            'pending_intentions': len(self.store.pending_intentions()),
+                                            'recent_messages': 0})
+            if self.config.keeper_history:
+                self.store.set_keeper_input(run_id, self.conversation_id, context, realm_state)
+            authorization = None
+            if (event.source == 'owner' and event.reason == 'owner_message'
+                    and self._owner_event_authorizations.get(event.id) == event.payload.get('message_id')
+                    and self.store.is_pending_owner_message(event.payload.get('message_id'), self.owner.id)):
+                authorization = OwnerGuidanceAuthorization(event.payload['message_id'])
+            results = []
+            tool_call_count = 0
             for round_number in range(self.config.max_tool_rounds + 1):
+                # Current local authority is resolved again after each tool batch.
+                registry = ToolRegistry(self.store, self._capabilities, self._emit,
+                                        current_run_id=run_id, owner_guidance_authorization=authorization)
+                instructions = self.context_builder.instructions(self.resident, self.owner, self._capabilities)
+                schema = self._output_schema
+                step_id = self.store.begin_response_step(run_id, self.conversation_id, round_number, event, schema)
                 calls += 1
-                response_session_id = getattr(self.provider, "session_id", None)
-                provider_operation = ("provider.tool_result_continuation" if results
-                                      else "provider.turn")
+                operation = 'provider.tool_result_continuation' if results else 'provider.turn'
                 provider_started = time.monotonic()
-                emit_timeline(provider_operation, "started", round=round_number,
-                              tool_result_count=len(results), turn_id=continuation_id)
+                emit_timeline(operation, 'started', round=round_number, tool_result_count=len(results))
                 try:
-                    turn = await self.provider.respond(
-                        context, registry.specs, results, continuation_id)
-                except RemoteSessionUnavailable:
-                    if results or continuation_id is not None:
-                        raise
-                    if keeper_history:
-                        self.store.add_keeper_activity(
-                            run_id, "unavailable_session_input", {"input": context},
-                            session_id=getattr(self.provider, "session_id", None))
-                    old_session_id = getattr(self.provider, "session_id", None)
-                    unavailable_reason = getattr(
-                        self.provider, "unavailable_session_reason", None)
-                    if old_session_id:
-                        self.store.request_session_rollover(
-                            "openai_agents", old_session_id,
-                            unavailable_reason or "remote_session_unavailable")
-                    if (self.curator is not None
-                            and unavailable_reason != "remote_session_missing"):
-                        try:
-                            handover = await self._curator_coordinator.barrier(final=True)
-                        except SessionHistoryUnavailable as exc:
-                            self._emit("curator.failed", {
-                                "phase": "final", "error_type": type(exc).__name__,
-                                "history_status": "unavailable"})
-                            handover = _DEGRADED_HANDOVER
-                        except Exception as exc:
-                            self._emit("curator.failed", {
-                                "phase": "final", "error_type": type(exc).__name__,
-                                "history_status": "reachable"})
-                            raise
-                    else:
-                        handover = _DEGRADED_HANDOVER
-                    if old_session_id:
-                        handover_id = self.store.create_handover(
-                            old_session_id, handover,
-                            (datetime.now(UTC) + timedelta(hours=24)).isoformat())
-                    context = self.context_builder.build_managed_bootstrap(
-                        self.resident, self.owner, event, capabilities, handover=handover,
-                        keeper_recent_context=(self.store.keeper_recent_context(
-                            self.config.keeper_rollover_interactions,
-                            self.config.keeper_rollover_bytes,
-                            game_id=self.realm_client.game_id,
-                            actor_id=self.realm_client.actor_id) if keeper_history else None))
-                    if realm_state is not None:
-                        context_document = json.loads(context)
-                        context_document["realm_state"] = realm_state
-                        context = json.dumps(context_document, ensure_ascii=False, indent=2)
-                    if keeper_history:
-                        self.store.set_keeper_input(run_id, None, context, realm_state)
-                    turn = await self.provider.respond(
-                        context, registry.specs, results, continuation_id)
+                    turn = await self.provider.respond(context, registry.specs, results,
+                                                       conversation_id=self.conversation_id,
+                                                       instructions=instructions, output_schema=schema,
+                                                       request_id=step_id)
+                except ResponseRejected:
+                    self.store.reject_response_step(step_id)
+                    raise
+                except ResponseInvalid as exc:
+                    if exc.response_id:
+                        self.store.note_response_id(step_id, exc.response_id)
+                    raise
                 finally:
-                    emit_timeline(
-                        provider_operation, "finished", round=round_number,
-                        tool_result_count=len(results), turn_id=continuation_id,
-                        outcome="error" if sys.exc_info()[0] is not None else "ok",
-                        duration_seconds=time.monotonic() - provider_started)
-                if handover_id is not None:
-                    replacement_id = getattr(self.provider, "session_id", None)
-                    if replacement_id and replacement_id != response_session_id:
-                        self.store.consume_handover(handover_id, replacement_id)
-                        handover_id = None
-                if (response_session_id is not None
-                        and getattr(self.provider, "session_id", None) != response_session_id):
-                    self.store.clear_session_rollover_request(
-                        "openai_agents", response_session_id)
-                    self._curator_coordinator.signal()
-                self._emit("model.responded", {
-                    "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
-                    "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
-                    "output_tokens": turn.output_tokens,
-                    **({"cached_input_tokens": turn.cached_input_tokens}
-                       if turn.cached_input_tokens is not None else {}),
-                })
-                if keeper_history:
-                    session_id = getattr(self.provider, "session_id", None)
-                    self.store.set_keeper_input(run_id, session_id, context, realm_state)
-                    self.store.add_keeper_activity(run_id, "model_turn", {
-                        "message": turn.message, "input_tokens": turn.input_tokens,
-                        "output_tokens": turn.output_tokens,
-                        "tool_calls": [{"id": call.id, "name": call.name,
-                                        "arguments": call.arguments} for call in turn.tool_calls],
-                    }, session_id=session_id, turn_id=turn.response_id)
-                    self.store.connection.execute("""
-                        UPDATE keeper_interactions SET input_tokens=input_tokens+?,
-                          output_tokens=output_tokens+? WHERE run_id=?
-                    """, (turn.input_tokens or 0, turn.output_tokens or 0, run_id))
-                active_structured_outputs = bool(
-                    getattr(self.provider, "session_uses_output_capabilities", False))
-                if turn.message and not active_structured_outputs:
-                    self._emit("model.message", {"content": turn.message})
+                    emit_timeline(operation, 'finished', round=round_number,
+                                  duration_seconds=time.monotonic() - provider_started,
+                                  outcome='error' if sys.exc_info()[0] else 'ok')
+                if not turn.response_id:
+                    raise RuntimeError('Response returned no ID')
+                self.store.record_response(step_id, turn)
+                self._emit('model.responded', {'response_id': turn.response_id,
+                    'tool_call_count': len(turn.tool_calls), 'has_message': bool(turn.message),
+                    'input_tokens': turn.input_tokens, 'output_tokens': turn.output_tokens,
+                    'cached_input_tokens': turn.cached_input_tokens})
+                if self.config.keeper_history:
+                    self.store.add_keeper_activity(run_id, 'model_turn', {
+                        'message': turn.message, 'tool_calls': [
+                            {'id': call.id, 'name': call.name, 'arguments': call.arguments} for call in turn.tool_calls]},
+                        conversation_id=self.conversation_id, response_id=turn.response_id)
                 if not turn.tool_calls:
-                    if active_structured_outputs:
-                        session_id = getattr(self.provider, "session_id", None)
-                        if not session_id or not turn.response_id:
-                            raise RuntimeError(
-                                "Structured final disposition lacks session or turn identity")
-                        schema, fingerprint = self._active_output_protocol()
-                        self._persist_disposition(
-                            turn.message, session_id, turn.response_id,
-                            run_id=run_id, wake=event, schema=schema,
-                            fingerprint=fingerprint)
-                    continuation_id = None
+                    self._persist_disposition(turn.message, self.conversation_id, turn.response_id,
+                                              run_id=run_id, wake=event, schema=schema)
+                    status = 'completed'
                     break
-                continuation_id = turn.response_id
                 if round_number >= self.config.max_tool_rounds:
-                    self._discard_continuation(continuation_id)
-                    raise RuntimeError("Model exceeded the configured tool-round limit")
+                    raise RuntimeError('Model exceeded tool-round limit; instance needs inspection/reset')
+                tool_call_count += len(turn.tool_calls)
+                if tool_call_count > self.config.max_tool_calls:
+                    raise RuntimeError('Model exceeded tool-call limit; instance needs inspection/reset')
                 results = []
                 for call in turn.tool_calls:
-                    invocation_id = hashlib.sha256(
-                        (f"{type(self.provider).__name__}\0"
-                         f"{getattr(self.provider, 'session_id', None) or ''}\0{call.id}")
-                        .encode("utf-8")).hexdigest()
-                    self._emit("tool.called", {"call_id": call.id, "name": call.name, "arguments": call.arguments})
+                    self._emit('tool.called', {'call_id': call.id, 'name': call.name, 'arguments': call.arguments})
                     tool_started = time.monotonic()
-                    emit_timeline("tool.execute", "started", call_id=call.id,
-                                  tool_name=call.name, round=round_number)
-                    tool_outcome = "error"
+                    emit_timeline('tool.execute', 'started', call_id=call.id, tool_name=call.name, round=round_number)
                     try:
-                        prepare = getattr(self.provider, "prepare_tool_call", None)
-                        action = prepare(call) if prepare is not None else None
-                        if action is not None and not action["claimed"]:
-                            ephemeral_result = action.get("ephemeral_result")
-                            if ephemeral_result is not None:
-                                result = ephemeral_result
-                            elif action.get("attachments_ephemeral"):
-                                # Attachment payloads (for example camera frames) are
-                                # intentionally not persisted. Reacquire them after a
-                                # restart instead of submitting an incomplete replay.
-                                execution = await registry.execute(
-                                    call.name, call.arguments, invocation_id=invocation_id)
-                                result = ToolResult(call.id, execution.output, execution.attachments)
-                                record = getattr(self.provider, "record_tool_result", None)
-                                if record is not None:
-                                    record(result)
-                            else:
-                                output = action["output"] or {
-                                    "ok": False,
-                                    "error": "Previous local action outcome is unknown; action was not repeated",
-                                    "error_code": "unknown_outcome",
-                                    "outcome": "unknown",
-                                    "request_id": invocation_id,
-                                }
-                                result = ToolResult(call.id, output)
-                        else:
-                            execution = await registry.execute(
-                                call.name, call.arguments, invocation_id=invocation_id)
-                            result = ToolResult(call.id, execution.output, execution.attachments)
-                            record = getattr(self.provider, "record_tool_result", None)
-                            if record is not None:
-                                record(result)
+                        # Revocation while inference is in flight must take effect before execution.
+                        current_registry = ToolRegistry(self.store, self._capabilities, self._emit,
+                            current_run_id=run_id, owner_guidance_authorization=authorization)
+                        result = await self._execute_tool(call, turn.response_id, current_registry)
                         results.append(result)
-                        completion = {"call_id": call.id, "name": call.name, "result": result.output}
-                        if result.attachments:
-                            completion["attachments"] = [{
-                                "type": "image", "mime_type": attachment.mime_type,
-                                "byte_count": len(attachment.data), "ephemeral": True,
-                            } for attachment in result.attachments]
-                        self._emit("tool.completed", completion)
-                        if keeper_history:
-                            self.store.add_keeper_activity(
-                                run_id, "tool_result", completion,
-                                session_id=getattr(self.provider, "session_id", None),
-                                turn_id=continuation_id, call_id=call.id)
-                        tool_outcome = (
-                            "ok" if result.output.get("ok") is not False else "error")
+                        self._emit('tool.completed', {'call_id': call.id, 'name': call.name, 'result': result.output,
+                            'attachments': [{'mime_type': a.mime_type, 'bytes': len(a.data),
+                                             'ephemeral': True} for a in result.attachments]})
+                        if self.config.keeper_history:
+                            self.store.add_keeper_activity(run_id, 'tool_result', result.output,
+                                conversation_id=self.conversation_id, response_id=turn.response_id, call_id=call.id)
                     finally:
-                        emit_timeline(
-                            "tool.execute", "finished", call_id=call.id,
-                            tool_name=call.name, round=round_number,
-                            outcome=tool_outcome,
-                            duration_seconds=time.monotonic() - tool_started)
-                if not continuation_id:
-                    raise RuntimeError("Provider did not return a response id for tool continuation")
-            if capability_event_state is not None:
-                self.store.save_observed_snapshot("runtime.capabilities", capability_event_state[1])
-                self._capability_event_states.pop(event.id, None)
-            if managed_session:
-                synchronized_session_id = getattr(self.provider, "session_id", None)
-                if synchronized_session_id is not None:
-                    # Tool calls in this completed turn also made their durable
-                    # state changes visible through the managed session history.
-                    synchronized_state = self.context_builder.authoritative_state(
-                        self.resident, self.owner, capabilities)
-                    self.store.save_session_authoritative_state(
-                        "openai_agents", synchronized_session_id, synchronized_state)
-            self._emit("wake.sleeping", {"status": "completed"})
-            status = "completed"
-            if keeper_history:
-                self.store.finish_keeper_interaction(run_id, status)
-            if self.curator is not None and managed_session:
-                session_id = getattr(self.provider, "session_id", None)
-                completed_turn_id = turn.response_id
-                if session_id and completed_turn_id:
-                    if self.store.request_curator_catch_up(
-                            "openai_agents", session_id, completed_turn_id):
-                        self._emit("curator.requested", {"status": "pending"})
-                        self._curator_coordinator.signal()
+                        emit_timeline('tool.execute', 'finished', call_id=call.id, tool_name=call.name,
+                                      round=round_number, duration_seconds=time.monotonic() - tool_started,
+                                      outcome='error' if sys.exc_info()[0] else 'ok')
+            self.store.save_observed_snapshot('runtime.capabilities', self._capability_snapshot(self._capabilities))
+            self._emit('wake.sleeping', {'status': 'completed'})
+            status = 'completed'
             return run_id
-        except asyncio.CancelledError as exc:
-            self._discard_continuation(continuation_id)
-            self._emit("wake.failed", {"error_type": type(exc).__name__, "error": str(exc)})
-            raise
-        except Exception as exc:
-            self._discard_continuation(continuation_id)
-            self._emit("wake.failed", {"error_type": type(exc).__name__, "error": str(exc)})
+        except (Exception, asyncio.CancelledError) as exc:
+            self._emit('wake.failed', {'error_type': type(exc).__name__, 'error': str(exc)})
             raise
         finally:
             duration = time.monotonic() - started
@@ -1288,7 +628,7 @@ class ResidentRuntime:
             )
             self.store.finish_run(
                 run_id, status, duration, calls, schedule_id, owner_message_id)
-            if keeper_history and status != "completed":
+            if self.config.keeper_history:
                 self.store.finish_keeper_interaction(run_id, status)
             # Finalization above is synchronous. Let the probe account for an
             # overdue sample before publishing and clearing this wake's summary.
@@ -1316,6 +656,7 @@ class ResidentRuntime:
             self._active_loop_lag_samples = 0
             if timeline_token is not None:
                 timeline_reporter.reset(timeline_token)
+
 
     async def enqueue_due_wakeups(self, queue: asyncio.Queue[WakeEvent]) -> None:
         for scheduled in self.store.claim_due_wakeups(utc_now()):
@@ -1448,7 +789,6 @@ class ResidentRuntime:
                 *(task for task in (scheduler, dispatcher, terminal, *producers)
                   if task is not None),
                 return_exceptions=True)
-            await self.stop_background_services()
             self.bind_event_loop_lag_checkpoint(None)
             await probe.stop()
             self.diagnostic_output(f"Resident {self.resident.address_name} stopped")

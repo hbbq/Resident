@@ -142,31 +142,21 @@ class Config:
     residents_dir: Path | None = None
     prompt_root: Path | None = None
     default_resident: str = "resident"
-    migrate_legacy: bool = False
     instance_id: str = "resident"
     resident_name: str = "Resident"
     owner_name: str = "Owner"
     personality: str = DEFAULT_PERSONALITY
     role: str = ""
     owner_communication_enabled: bool = True
-    provider: str = "openai-agents"
     model: str = "gpt-5.6-luna"
     reasoning_effort: str | None = None
     service_tier: str | None = None
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_agent_id: str | None = None
-    new_chapter: bool = False
-    curator_model: str | None = None
-    curator_api_key: str | None = field(default=None, repr=False)
-    curator_base_url: str = "https://api.openai.com/v1"
-    curator_batch_size: int = 50
-    curator_max_batches: int = 4
+    compact_threshold: int | None = None
     max_tool_rounds: int = 8
-    context_messages: int = 8
+    max_tool_calls: int = 64
     keeper_history: bool = False
-    keeper_rollover_interactions: int = 8
-    keeper_rollover_bytes: int = 16384
     spontaneous_message_limit: int = 3
     spontaneous_message_window_seconds: int = 180
     scheduler_poll_seconds: float = 1.0
@@ -202,8 +192,6 @@ class Config:
                             help="directory of startup-time Resident YAML definitions")
         parser.add_argument("--prompt-root", default=os.getenv("RESIDENT_PROMPT_ROOT"))
         parser.add_argument("--default-resident", default=os.getenv("RESIDENT_DEFAULT_ID", "resident"))
-        parser.add_argument("--migrate-legacy", action="store_true",
-                            help="move resident.sqlite3 into instances/resident and exit")
         parser.add_argument("--verbose", action="store_true", default=_environment_flag("RESIDENT_VERBOSE"),
                             help="show detailed runtime and connector diagnostics")
         parser.add_argument("--timeline", action="store_true",
@@ -212,25 +200,10 @@ class Config:
         parser.add_argument("--resident-name", default=os.getenv("RESIDENT_NAME", "Resident"))
         parser.add_argument("--owner-name", default=os.getenv("RESIDENT_OWNER_NAME", "Owner"))
         parser.add_argument("--personality", default=os.getenv("RESIDENT_PERSONALITY", DEFAULT_PERSONALITY))
-        parser.add_argument("--provider", choices=("openai-agents", "openai-responses", "openai"),
-                            default=os.getenv("RESIDENT_PROVIDER", "openai-agents"))
         parser.add_argument("--model", default=os.getenv("RESIDENT_MODEL", "gpt-5.6-luna"))
         parser.add_argument("--reasoning-effort", choices=SUPPORTED_REASONING_EFFORTS,
                             default=os.getenv("RESIDENT_REASONING_EFFORT"))
         parser.add_argument("--service-tier", default=os.getenv("RESIDENT_SERVICE_TIER"))
-        parser.add_argument("--curator-model", default=os.getenv("RESIDENT_CURATOR_MODEL"),
-                            help="separate model for durable memory consolidation; disabled when omitted")
-        parser.add_argument("--new-chapter", action="store_true",
-                            default=_environment_flag("RESIDENT_NEW_CHAPTER"),
-                            help="intentionally roll over the current Agents session at the next wake")
-        parser.add_argument("--curator-batch-size", type=int,
-                            default=int(os.getenv("RESIDENT_CURATOR_BATCH_SIZE", "50")))
-        parser.add_argument("--curator-max-batches", type=int,
-                            default=int(os.getenv("RESIDENT_CURATOR_MAX_BATCHES", "4")))
-        parser.add_argument("--keeper-rollover-interactions", type=int,
-                            default=int(os.getenv("KEEPER_ROLLOVER_INTERACTIONS", "8")))
-        parser.add_argument("--keeper-rollover-bytes", type=int,
-                            default=int(os.getenv("KEEPER_ROLLOVER_BYTES", "16384")))
         parser.add_argument("--spontaneous-message-limit", type=int,
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_LIMIT", "3")))
         parser.add_argument("--spontaneous-message-window-seconds", type=int,
@@ -265,7 +238,12 @@ class Config:
         parser.add_argument("--camera-onvif-retry-seconds", type=float,
                             default=float(os.getenv("RESIDENT_CAMERA_ONVIF_RETRY_SECONDS", "30")))
         parser.add_argument("--ffmpeg-executable", default=os.getenv("RESIDENT_FFMPEG_EXECUTABLE", "ffmpeg"))
+        parser.add_argument('--compact-threshold', type=int,
+                            default=os.getenv('RESIDENT_COMPACT_THRESHOLD'),
+                            help='optional server-side compaction threshold; disabled by default')
         args = parser.parse_args(argv)
+        if args.compact_threshold is not None and args.compact_threshold <= 0:
+            raise ValueError('compact threshold must be positive')
         telegram_token = os.getenv("RESIDENT_TELEGRAM_BOT_TOKEN", "").strip() or None
         telegram_user = os.getenv("RESIDENT_TELEGRAM_OWNER_USER_ID", "").strip() or None
         telegram_chat = os.getenv("RESIDENT_TELEGRAM_OWNER_CHAT_ID", "").strip() or None
@@ -289,22 +267,14 @@ class Config:
             timeline=args.timeline,
             residents_dir=Path(args.residents_dir).expanduser() if args.residents_dir else None,
             prompt_root=Path(args.prompt_root).expanduser() if args.prompt_root else None,
-            default_resident=args.default_resident, migrate_legacy=args.migrate_legacy,
+            default_resident=args.default_resident,
             resident_name=args.resident_name,
-            owner_name=args.owner_name, personality=args.personality, provider=args.provider,
-            model=args.model, openai_api_key=os.getenv("OPENAI_API_KEY"),
+            owner_name=args.owner_name, personality=args.personality,
+            compact_threshold=args.compact_threshold, model=args.model, openai_api_key=os.getenv("OPENAI_API_KEY"),
             reasoning_effort=args.reasoning_effort, service_tier=args.service_tier,
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
-            openai_agent_id=os.getenv("RESIDENT_OPENAI_AGENT_ID", "").strip() or None,
-            new_chapter=args.new_chapter,
-            curator_model=args.curator_model,
-            curator_api_key=os.getenv("RESIDENT_CURATOR_API_KEY") or os.getenv("OPENAI_API_KEY"),
-            curator_base_url=os.getenv("RESIDENT_CURATOR_BASE_URL",
-                                       os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/"),
-            curator_batch_size=max(1, min(args.curator_batch_size, 100)),
-            curator_max_batches=max(1, args.curator_max_batches),
-            keeper_rollover_interactions=max(0, args.keeper_rollover_interactions),
-            keeper_rollover_bytes=max(0, args.keeper_rollover_bytes),
+
+
             spontaneous_message_limit=max(0, args.spontaneous_message_limit),
             spontaneous_message_window_seconds=max(1, args.spontaneous_message_window_seconds),
             homeops_url=args.homeops_url.rstrip("/") if args.homeops_url else None,

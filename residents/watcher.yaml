@@ -11,13 +11,11 @@ role: >
   available to you.
 
 agent:
-  provider: openai-agents
+  provider: openai-responses
   model: gpt-5.6-luna
   reasoning_effort: none
   api_key_env: OPENAI_API_KEY
-  
-curator:
-  model: gpt-5.6-luna
+
 
 capabilities:
   - agentcontroller

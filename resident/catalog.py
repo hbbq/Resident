@@ -26,8 +26,6 @@ SETUP = {
               "Read or mutate the configured Realm game."),
     "messaging": ("Host multiple Residents with a shared durable mailbox; recipients are configured Resident IDs.",
                   "Send an asynchronous message to another Resident."),
-    "display": ("Set RESIDENT_DISPLAYS with unique display IDs and RESIDENT_HOMEOPS_URL; use a configured HomeOps display queue.",
-                "Enqueue text on a configured display (legacy tool protocol)."),
 }
 
 OUTPUT_SETUP = {
@@ -66,7 +64,6 @@ def _matches(node: ast.AST | None, expression: str) -> bool:
 def _dynamic_family(file: Path, call: ast.Call, connector: ast.AST | None,
                     name: ast.AST | None, parents: dict[ast.AST, ast.AST]) -> str:
     patterns = {
-        "display.py": ("'display'", "f'{display_id}_show_text'", "display"),
         "external_app.py": ("self.definition.id", "operation.name", "external_application"),
         "realm.py": ("'realm'", "name", "realm"),
     }
@@ -113,7 +110,7 @@ def _inventory() -> tuple[dict[str, set[str]], set[str], set[str], set[str]]:
     outputs: set[str] = set()
     core: set[str] = set()
     emitted: set[str] = set()
-    dynamic: dict[str, int] = {"display": 0, "external_application": 0, "realm": 0}
+    dynamic: dict[str, int] = {"external_application": 0, "realm": 0}
     files = tuple((ROOT / "resident").glob("*.py"))
     for file in files:
         tree = _tree(file.name)
@@ -151,11 +148,10 @@ def _inventory() -> tuple[dict[str, set[str]], set[str], set[str], set[str]]:
                     if reason is None:
                         raise ValueError(f"Uncataloged event reason in {file.name}:{node.lineno}")
                     emitted.add(f"{source}.{reason}")
-    if dynamic != {"display": 1, "external_application": 1, "realm": 1}:
+    if dynamic != {"external_application": 1, "realm": 1}:
         raise ValueError(f"Dynamic capability family inventory mismatch: {dynamic}")
     tools.setdefault("realm", set()).update(_realm_specs(_tree("realm.py")))
     # These are parameterized by a Resident definition or startup configuration.
-    tools.setdefault("display", set()).add("<display-id>_show_text")
     tools.setdefault("external_application", set()).add("<provider-id>_<operation-name>")
     return tools, outputs, core, emitted
 
@@ -181,15 +177,15 @@ def render() -> str:
              "A Resident definition grants connector IDs or individual tool names in `capabilities`, grants terminal side effects separately in `outputs`, and selects external events in `subscriptions`. Configuration makes a choice available; a grant authorizes its use. The default terminal Resident has an Owner route; other Residents need an Owner transport for `notify_owner`.", "",
              "## Grantable capabilities", "",
              "| Grant identifier | Available tools | Configuration and dependency | Purpose |", "| --- | --- | --- | --- |"]
-    for family in sorted(set(tools) - {"display", "external_application"}):
+    for family in sorted(set(tools) - {"external_application"}):
         setup, purpose = SETUP[family]
         grant = f"`{family}`" if family == "messaging" else f"`{family}` or individual tool name"
         lines.append(f"| {grant} | {', '.join(f'`{name}`' for name in sorted(tools[family]))} | {setup} | {purpose} |")
     lines.extend(["| `<provider-id>` or `<provider-id>_<operation-name>` | `<provider-id>_<operation-name>` | Add `external_applications` to the Resident definition: provider `id`, `description`, `base_url`, optional `bearer_token_env` and `bindings`, and pinned `operations` with names, descriptions, input schemas, and optional mutating flags. Run the matching HTTP service. | Only operations declared on that Resident are available; no remote discovery occurs. |", "",
                   "## Always-present built-in tools", "",
-                  "These are runtime tools, not `capabilities` grants. `send_owner_message` is a compatibility tool and is described below.", "",
+                  "These are runtime tools, not `capabilities` grants.", "",
                   "| Tool | Availability |", "| --- | --- |"])
-    for name in sorted(core - {"send_owner_message"}):
+    for name in sorted(core):
         note = ("Requires an authenticated Owner-message context to change guidance." if name in {"set_owner_guidance", "remove_owner_guidance"} else
                 "Local runtime state; no extra connector configuration.")
         lines.append(f"| `{name}` | {note} |")
@@ -197,12 +193,7 @@ def render() -> str:
     for name in sorted(outputs):
         grant = "display/<display-id>" if name == "display" else name
         lines.append(f"| `{grant}` | {OUTPUT_SETUP[name]} |")
-    lines.extend(["", "## Non-grantable compatibility tools", "",
-                  "These tools serve the Responses fallback or already-active old Managed Agents sessions. New structured-output sessions use terminal outputs.", "",
-                  "| Tool | Configuration and dependency |", "| --- | --- |",
-                  "| `send_owner_message` | Owner route and `notify_owner` output authorization; not a `capabilities` grant. |",
-                  f"| `{next(iter(tools['display']))}` | {SETUP['display'][0]} Use the matching `display/<display-id>` output grant; not an independent capability grant. |", "",
-                  "## Subscriptions", "",
+    lines.extend(["", "## Subscriptions", "",
                   "Selectors in a Resident definition observe events; they never grant tools. `*` selects every accepted external source event. A source selector selects all accepted reasons from that source. Internal Owner, scheduler, runtime, and output delivery wakes are separate from these declarative selectors.", "",
                   "| Selector | Event source and prerequisite |", "| --- | --- |"])
     for event in sorted(_SUBSCRIPTION_EVENTS):

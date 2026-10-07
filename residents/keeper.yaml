@@ -13,7 +13,7 @@ role: >
   consequences of the Owner's actions, and maintain narrative continuity.
 
 agent:
-  provider: openai-agents
+  provider: openai-responses
   model: gpt-5.6-luna
   reasoning_effort: medium
   api_key_env: OPENAI_API_KEY

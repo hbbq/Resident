@@ -12,7 +12,7 @@ from resident.__main__ import build_host
 from resident.config import Config, DisplayConfig, SUPPORTED_REASONING_EFFORTS
 from resident.domain import ModelTurn, WakeEvent
 from resident.host import InstancePolicy, RuntimeHost, messaging_capability
-from resident.instances import load_resident_catalog, migrate_legacy_state
+from resident.instances import load_resident_catalog
 from resident.mailbox import Mailbox
 from resident.observability import EventLoopLagProbe
 from resident.readiness import ReadinessItem, ReadinessResult
@@ -21,65 +21,15 @@ from resident.store import utc_now
 
 
 class IdleProvider:
-    async def respond(self, context, tools, results, continuation_id=None):
-        return ModelTurn("turn", None, ())
+    async def create_conversation(self):
+        return 'conversation-test'
 
-
-class OutputProvider(IdleProvider):
-    supports_output_capabilities = True
-
-    def configure_output_protocol(self, schema, descriptors, fingerprint):
-        self.schema = schema
-        self.descriptors = descriptors
-        self.fingerprint = fingerprint
+    async def respond(self, context, tools, results, **request):
+        return ModelTurn("turn", '{"outputs":[]}', ())
 
 
 class InstanceDefinitionTests(unittest.TestCase):
-    def test_keeper_history_requires_explicit_valid_opt_in(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            definitions = Path(temporary) / "residents"
-            definitions.mkdir()
-            path = definitions / "resident.yaml"
-            base = "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
-            realm = ("realm:\n  base_url: http://realm.test\n"
-                     "  game_id_env: GAME_ID\n  actor_id_env: ACTOR_ID\n")
-            path.write_text(base + realm, encoding="utf-8")
-            self.assertFalse(load_resident_catalog(definitions).residents[0].keeper_history)
-            path.write_text(base + realm + "keeper_history: true\n", encoding="utf-8")
-            self.assertTrue(load_resident_catalog(definitions).residents[0].keeper_history)
-            with patch.dict(os.environ, {
-                    "OPENAI_API_KEY": "test-key", "GAME_ID": "game", "ACTOR_ID": "hero"}):
-                host = build_host(Config(Path(temporary) / "data", residents_dir=definitions))
-            try:
-                self.assertTrue(host.runtimes["resident"].config.keeper_history)
-            finally:
-                host.close()
-            for content, error in (
-                    (base + realm + "keeper_history: yes-please\n", "must be boolean"),
-                    (base + "keeper_history: true\n", "requires realm and openai-agents"),
-                    (base + realm + "agent:\n  provider: openai-responses\n"
-                     "keeper_history: true\n", "requires realm and openai-agents")):
-                with self.subTest(error=error):
-                    path.write_text(content, encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, error):
-                        load_resident_catalog(definitions)
 
-    def test_legacy_curator_environment_and_cli_configuration_is_preserved(self):
-        with patch.dict(os.environ, {
-                "RESIDENT_CURATOR_API_KEY": "legacy-key",
-                "RESIDENT_CURATOR_BASE_URL": "https://legacy.example/v1/",
-        }, clear=True):
-            config = Config.from_env_and_args([
-                "--curator-model", "legacy-curator",
-                "--curator-batch-size", "17",
-                "--curator-max-batches", "3",
-            ])
-
-        self.assertEqual("legacy-curator", config.curator_model)
-        self.assertEqual("legacy-key", config.curator_api_key)
-        self.assertEqual("https://legacy.example/v1", config.curator_base_url)
-        self.assertEqual(17, config.curator_batch_size)
-        self.assertEqual(3, config.curator_max_batches)
 
     def test_declarative_reasoning_effort_matches_cli_values(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -126,49 +76,6 @@ class InstanceDefinitionTests(unittest.TestCase):
                     build_host(Config(root / "data", residents_dir=definitions))
                 provider.assert_not_called()
 
-    def test_catalog_runtimes_use_per_resident_curator_and_explicit_new_chapter(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            definitions = root / "residents"
-            definitions.mkdir()
-            (definitions / "resident.yaml").write_text(
-                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
-                "curator:\n  model: resident-curator\n  api_key_env: CURATOR_KEY\n"
-                "  base_url_env: CURATOR_URL\n  batch_size: 17\n  max_batches: 3\n",
-                encoding="utf-8")
-            (definitions / "helper.yaml").write_text(
-                "id: helper\nname: Helper\npersonality: Test.\nrole: Test.\n",
-                encoding="utf-8")
-            config = Config(
-                root / "data", residents_dir=definitions, new_chapter=True,
-                curator_model="legacy-curator", curator_api_key="legacy-key",
-                curator_base_url="https://curator.example/v1",
-                curator_batch_size=17, curator_max_batches=3)
-
-            with patch.dict(os.environ, {
-                    "OPENAI_API_KEY": "resident-key", "CURATOR_KEY": "curator-key",
-                    "CURATOR_URL": "https://per-resident.example/v1/"}):
-                host = build_host(config)
-            try:
-                self.assertEqual({"resident", "helper"}, set(host.runtimes))
-                resident = host.runtimes["resident"]
-                self.assertEqual("resident-curator", resident.config.curator_model)
-                self.assertEqual("curator-key", resident.config.curator_api_key)
-                self.assertEqual(
-                    "https://per-resident.example/v1", resident.config.curator_base_url)
-                self.assertEqual(17, resident.curator.batch_size)
-                self.assertEqual(3, resident.curator.max_batches)
-                self.assertEqual("resident-curator", resident.curator.model.model)
-                helper = host.runtimes["helper"]
-                self.assertIsNone(helper.config.curator_model)
-                self.assertIsNone(helper.config.curator_api_key)
-                self.assertIsNone(helper.curator)
-                for runtime in host.runtimes.values():
-                    self.assertEqual(
-                        "explicit_new_chapter",
-                        runtime.provider._requested_rollover_reason)
-            finally:
-                host.close()
 
     def test_loads_prompt_files_and_separates_policy(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -213,7 +120,7 @@ subscriptions: [homeops]
             definitions.mkdir()
             (definitions / "resident.yaml").write_text(
                 "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
-                "capabilities: [display]\noutputs: [notify_owner, display/display1]\n",
+                "outputs: [notify_owner, display/display1]\n",
                 encoding="utf-8")
             (definitions / "helper.yaml").write_text(
                 "id: helper\nname: Helper\npersonality: Test.\nrole: Test.\n"
@@ -223,7 +130,7 @@ subscriptions: [homeops]
                 homeops_url="http://homeops.test",
                 displays=(DisplayConfig("display1"), DisplayConfig("display2")))
 
-            with patch("resident.__main__._provider", side_effect=lambda _: OutputProvider()):
+            with patch("resident.__main__._provider", side_effect=lambda _: IdleProvider()):
                 host = build_host(config)
             try:
                 resident = host.runtimes["resident"]
@@ -239,12 +146,7 @@ subscriptions: [homeops]
                 self.assertNotEqual(
                     resident._output_schema_fingerprint,
                     helper._output_schema_fingerprint)
-                # The compatibility function is present for Responses/old-session
-                # protocols even though the new structured protocol filters it.
-                self.assertIn("display2_show_text", [item.name for item in helper.capabilities])
-                self.assertNotIn(
-                    "display2_show_text",
-                    [item.name for item in helper._tool_capabilities_for_protocol(True)])
+                self.assertNotIn("display2_show_text", [item.name for item in helper.capabilities])
             finally:
                 host.close()
 
@@ -256,13 +158,12 @@ subscriptions: [homeops]
             (definitions / "resident.yaml").write_text(
                 "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
                 "outputs: []\n", encoding="utf-8")
-            with patch("resident.__main__._provider", return_value=OutputProvider()):
+            with patch("resident.__main__._provider", return_value=IdleProvider()):
                 host = build_host(Config(root / "data", residents_dir=definitions))
             try:
                 runtime = host.runtimes["resident"]
                 self.assertEqual((), runtime.output_capabilities)
                 self.assertEqual(0, runtime._output_schema["properties"]["outputs"]["maxItems"])
-                self.assertEqual([], runtime.provider.descriptors)
             finally:
                 host.close()
 
@@ -280,7 +181,7 @@ subscriptions: [homeops]
                 "TEST_BOT_TOKEN": "token", "TEST_OWNER_USER": "1", "TEST_OWNER_CHAT": "1",
             }
             with (patch.dict(os.environ, environment, clear=True),
-                  patch("resident.__main__._provider", return_value=OutputProvider())):
+                  patch("resident.__main__._provider", return_value=IdleProvider())):
                 host = build_host(Config(root / "data", residents_dir=definitions))
             try:
                 runtime = host.runtimes["resident"]
@@ -297,16 +198,16 @@ subscriptions: [homeops]
             definitions.mkdir()
             (definitions / "resident.yaml").write_text(
                 "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
-                "capabilities: [display]\noutputs: []\n", encoding="utf-8")
+                "outputs: []\n", encoding="utf-8")
             config = Config(
                 root / "data", residents_dir=definitions,
                 homeops_url="http://homeops.test", displays=(DisplayConfig("display1"),))
-            with patch("resident.__main__._provider", return_value=OutputProvider()):
+            with patch("resident.__main__._provider", return_value=IdleProvider()):
                 host = build_host(config)
             try:
                 runtime = host.runtimes["resident"]
                 self.assertEqual((), runtime.output_capabilities)
-                self.assertIn("display1_show_text", [item.name for item in runtime.capabilities])
+                self.assertNotIn("display1_show_text", [item.name for item in runtime.capabilities])
             finally:
                 host.close()
 
@@ -335,7 +236,7 @@ subscriptions: [homeops]
             (definitions / "helper.yaml").write_text(
                 "id: helper\nname: Helper\npersonality: Test.\nrole: Test.\n"
                 "outputs: [notify_owner]\n", encoding="utf-8")
-            with patch("resident.__main__._provider", return_value=OutputProvider()):
+            with patch("resident.__main__._provider", return_value=IdleProvider()):
                 with self.assertRaisesRegex(
                         ValueError, "Unknown or unavailable output grants for helper: notify_owner"):
                     build_host(Config(root / "data", residents_dir=definitions))
@@ -366,45 +267,6 @@ subscriptions: [homeops]
             with self.assertRaisesRegex(ValueError, "Unknown fields"):
                 load_resident_catalog(definitions)
 
-    def test_validates_declarative_curator_fields(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            definitions = Path(temporary) / "residents"
-            definitions.mkdir()
-            definition = definitions / "resident.yaml"
-            base = "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\ncurator:\n"
-            cases = (
-                ("  api_key: inline\n", "Inline secret"),
-                ("  api_key_env: not-an-env\n", "must name an environment variable"),
-                ("  batch_size: 0\n", "must be a positive integer"),
-                ("  batch_size: 101\n", "must be at most 100"),
-                ("  max_batches: false\n", "must be a positive integer"),
-                ("  surprise: true\n", "Unknown curator fields"),
-            )
-            for body, message in cases:
-                with self.subTest(body=body):
-                    definition.write_text(base + body, encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, message):
-                        load_resident_catalog(definitions)
-
-    def test_curator_without_model_is_disabled_and_does_not_resolve_secret(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            definitions = root / "residents"
-            definitions.mkdir()
-            (definitions / "resident.yaml").write_text(
-                "id: resident\nname: Resident\npersonality: Test.\nrole: Test.\n"
-                "curator:\n  api_key_env: MISSING_CURATOR_KEY\n",
-                encoding="utf-8")
-
-            with patch.dict(os.environ, {"OPENAI_API_KEY": "resident-key"}, clear=True):
-                host = build_host(Config(root / "data", residents_dir=definitions))
-            try:
-                runtime = host.runtimes["resident"]
-                self.assertIsNone(runtime.config.curator_model)
-                self.assertIsNone(runtime.config.curator_api_key)
-                self.assertIsNone(runtime.curator)
-            finally:
-                host.close()
 
     def test_rejects_unknown_and_malformed_subscriptions(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -419,21 +281,6 @@ subscriptions: [homeops]
                         f"subscriptions: [{selector}]\n", encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, message):
                         load_resident_catalog(definitions)
-
-    def test_explicit_legacy_migration_preserves_database(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary)
-            source = data / "resident.sqlite3"
-            connection = sqlite3.connect(source)
-            connection.execute("CREATE TABLE marker(value TEXT)")
-            connection.execute("INSERT INTO marker VALUES('kept')")
-            connection.commit()
-            connection.close()
-            target = migrate_legacy_state(data)
-            self.assertFalse(source.exists())
-            connection = sqlite3.connect(target)
-            self.assertEqual("kept", connection.execute("SELECT value FROM marker").fetchone()[0])
-            connection.close()
 
 
 class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
@@ -513,9 +360,12 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_event_loop_lag_is_idle_silent_and_aggregated_per_wake(self):
         class WaitingProvider:
-            async def respond(self, context, tools, results, continuation_id=None):
+            async def create_conversation(self):
+                return 'conversation-test'
+
+            async def respond(self, context, tools, results, **request):
                 await asyncio.sleep(0.02)
-                return ModelTurn("turn", None, ())
+                return ModelTurn("turn", '{"outputs":[]}', ())
 
         root = Path(self.temporary.name)
         runtime = ResidentRuntime(

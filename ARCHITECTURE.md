@@ -2,11 +2,11 @@
 
 ## Instance and host boundary
 
-`RuntimeHost` is the process-level lifecycle and routing boundary. It loads a strict startup-time catalog, constructs one `ResidentRuntime`, provider, queue, and SQLite `Store` per stable declarative ID, and owns shared connector polling and the durable mailbox. Resident-owned state lives under `instances/<id>`; changing declarative prompts or policy refreshes metadata without replacing the durable Resident UUID or provider session binding.
+`RuntimeHost` is the process-level lifecycle and routing boundary. It loads a strict startup-time catalog, constructs one `ResidentRuntime`, provider, queue, and SQLite `Store` per stable declarative ID, and owns shared connector polling and the durable mailbox. Resident-owned state lives under `instances/<id>`; changing declarative prompts or policy refreshes metadata without replacing the durable Resident UUID or Conversation binding.
 
 Local policy is resolved before inference. Subscriptions decide which shared events enter an instance queue, while capability grants decide which executable tool schemas enter that instance's context and registry. Neither implies the other, and definitions cannot supply handlers, credentials, arbitrary schemas, or expand their own authority. Instance-private Telegram transports are bound to exactly one queue and store checkpoint. The default terminal route is explicit rather than broadcast.
 
-Generic inter-instance communication is a host-owned asynchronous mailbox, not direct runtime access or RPC. Messages contain logical sender/recipient addresses, content, timestamps, expiry, and `pending`/`delivered`/`expired` state. The tool schema enumerates configured Resident recipients, and handoff creates an ordinary messaging wake. Owner communication uses the separate Owner tool and transport. Delivery records handoff only, and replies are independent messages.
+Generic inter-instance communication is a host-owned asynchronous mailbox, not direct runtime access or RPC. Messages contain logical sender/recipient addresses, content, timestamps, expiry, and `pending`/`delivered`/`expired` state. The tool schema enumerates configured Resident recipients, and handoff creates an ordinary messaging wake. Owner communication uses terminal output jobs and the configured transport. Delivery records handoff only, and replies are independent messages.
 
 This document records architectural principles that have been decided so far. It intentionally avoids specifying implementation details that have not yet been justified by experience.
 
@@ -28,7 +28,7 @@ Resident instance
 │   ├── Identity
 │   └── Address name
 ├── Runtime
-├── Managed conversational session
+├── Persistent OpenAI Conversation
 ├── Pending intentions
 ├── Journal
 ├── Model provider(s)
@@ -59,7 +59,7 @@ A wake event should remain deliberately small and general, conceptually containi
 
 Runtime compares a durable, public capability snapshot at startup and whenever capabilities are explicitly replaced, registered, or removed. A newly provisioned Resident records its first baseline silently. Later additions, removals, and public descriptor changes produce a normal `capabilities_changed` wake; executable handlers and connector secrets are outside the snapshot. Each wake uses one capability snapshot for both context and tool registration. There is no capability polling loop, and detection never exercises a capability.
 
-During a wakeup Resident receives an appropriate working context, reasons and possibly acts, and may then sleep again. The durable managed-agent session supplies episodic continuity, so ordinary wakes add the new trigger without replaying prior communication or working context. New sessions receive bounded bootstrap state and handover; changed locally authoritative identity, capability, and standing-guidance state is synchronized durably to existing sessions. Pending intentions, standing Owner guidance, and curated long-term memory remain explicit local state.
+During a wake Resident receives the new event, timestamp, pending intentions and current observations. Durable Conversation history provides episodic continuity. Current instructions supply identity/personality, role and standing Owner guidance; request settings supply the model, tools and output schema. Historical content never becomes authoritative configuration.
 
 Scheduling is a mechanism, not a collection of hard-coded behaviors. Resident should be able to request a future wakeup with a reason/context rather than requiring dedicated classes such as `TemperatureMonitor` or `RobotExplorationBehavior`.
 
@@ -71,13 +71,19 @@ Resident decides what observations mean, what is interesting, what it wants to d
 
 > Runtime enables Resident's life; it should not live it on Resident's behalf.
 
-### Managed agent boundary
+### Responses boundary
 
-The initial managed-agent integration uses one long-lived OpenAI Agents session per Resident instance. The binding is local and durable. Losing or deliberately rolling over that remote session must not change Resident identity or erase schedules, pending intentions, connector checkpoints, communication records, or the local journal, but conversational context in that session is not recoverable from those local records.
+Resident owns the agent loop. OpenAI supplies inference and durable conversational state through Responses + Conversations. Each instance creates one empty Conversation and persists its ID before inference; restarts reuse it without routine remote reconciliation. There are no managed sessions, settings synchronization, stream subscription, turn correlation, handovers or rollovers.
 
-OpenAI owns conversational session history and the managed turn loop. Resident remains an outbound-only environment bridge: it selects and coalesces wakes, submits factual wake envelopes, executes requested function actions locally, validates every argument, applies deterministic policy, records observable outcomes, and returns results. Function calls are durably claimed before execution; completed results can be replayed without repeating local effects, while an action interrupted before its outcome is recorded is not automatically repeated. HomeOps and other integrated systems remain unaware of OpenAI. Ordinary connector events are processed by the local queue and cannot directly interrupt active work; Owner ingress retains local priority semantics as the runtime evolves.
+A normal wake records a request checkpoint, sends current configuration plus new input to Responses, records the returned Response, validates its final disposition, and atomically persists output jobs and wake completion. Inference uses ordinary HTTP Responses requests. Function-call batches are validated against current authorization and argument schemas, durably claimed, executed sequentially, and persisted before `function_call_output` continuations on the same Conversation. Several batches are supported; rounds and total calls are bounded. `previous_response_id` is never used with a Conversation.
 
-Agent behavior is declared in repository code and supplied as session configuration, optionally layered over a saved Agent resource. Machine endpoints, device identifiers, credentials, rate and attention limits, and integration policy remain local configuration. Direct function actions are the initial capability bridge; an authenticated MCP/tool-search surface may be considered later if the capability set becomes too large.
+Instructions and tool/schema configuration are supplied on every request, including continuations. Configuration changes require no replacement Conversation. Runtime rechecks authorization before executing a function and before admitting terminal outputs. Connector secrets and machine endpoints remain local.
+
+### Small recovery boundary
+
+Local request records retain wake, schema, Response ID and parsed result. A final Response recorded before a crash can be ingested without repeating inference. Completed tool results replay by Conversation/call ID; pending executions have an unknown outcome and are never executed twice automatically. Ephemeral image results cannot be replayed after restart and require a fresh observation.
+
+There is no automatic inference POST retry or remote history scan. A definitively rejected request fails its wake. An ambiguous submission or interrupted tool loop blocks further inference for the instance; operator inspection/fix or a manual disposable-database reset is acceptable. Conversation creation can orphan an empty remote Conversation if the process stops before binding its ID; a subsequent start creates another empty one. Output transport retries remain independent and at least once.
 
 ## Wake context
 
@@ -99,13 +105,13 @@ The journal and communication history are exposed through bounded read-only sear
 
 Pending intentions can initially be included generously while their number is small. More selective retrieval should only be introduced when there is evidence that it is needed.
 
-A separate persistent `working_state` concept is not required initially; the managed session and pending intentions should be allowed to demonstrate whether another form of continuity is actually necessary.
+A separate persistent `working_state` concept is not required initially; the Conversation and pending intentions provide continuity.
 
 > ContextBuilder provides enough context to begin thinking, not everything Resident might possibly need.
 
-Long-term memory is an append-only revision graph in the per-Resident store. Active records are retrieved selectively through bounded read-only tools. No durable Curator memory revision is accepted without at least one verified reference to an item in the fetched source page; mixed valid/invalid evidence rejects that mutation, and provenance excerpts and hashes are derived only from the Resident's credential-scrubbed source projection. A separately configured Curator reads that explicit allowlisted projection after a durable cursor and commits accepted decisions plus checkpoint in one transaction. Tool arguments/results and unknown structured fields never enter the projection. Recognizable credential-bearing text structures are deterministically removed both before Curator inference and before its memories or handovers are persisted; arbitrary natural-language secret classification is intentionally not claimed. Each completed managed-session wake durably requests curation through its exact completed-turn ID. A per-Resident coordinator coalesces newer watermarks, serializes execution, bounds pages at that turn, and retries failures with capped exponential backoff; ordinary long-term-memory reads are intentionally eventual-consistent while it lags. Startup reconciliation and reachable rollover/final-handover paths remain awaited barriers. Clean shutdown drains briefly and otherwise leaves the request durable for restart, so correctness does not depend on graceful shutdown. Standing Owner guidance has its own complete revision history and is always present in wake context, subject to deterministic per-entry, active-count, and total serialized-size bounds enforced on each set or replacement.
+Standing Owner guidance has explicit local revision history and deterministic size bounds. Only authenticated Owner-message processing can change it; every inference request reads the current active set. Historical guidance in the Conversation is superseded by this current configuration.
 
-Session compatibility is field-based. Mutable model settings are patched between turns and their last successfully applied values are persisted independently of the immutable protocol descriptor, so a partial remote representation cannot erase a configured change after restart. Local configuration and capability grants that do not alter the advertised function protocol continue unchanged; revocation can retain an unavailable compatibility handler. Function additions/renames, descriptions or schemas, immutable instructions, saved-Agent ID adoption, explicit new chapters, unrecoverable remote sessions, and security contract revisions use an explicit rollover record. Before a reachable intentional rollover the Curator performs final catch-up; the replacement bootstrap contains bounded memory awareness and a short-lived handover, never the complete store. Rollover persists its exact create request and token before crossing the remote boundary, records the attempt before POST, and atomically binds the returned replacement ID with its protocol and mutable settings. Because the current Agents API has no supported create-idempotency or lookup-by-token contract, an attempted create whose returned ID was not durably bound remains explicitly uncertain and blocks automatic re-creation; a durably bound replacement is completed on restart without another POST.
+Responses context management can be enabled with a compaction threshold. It is disabled by default; automatic truncation is disabled. Conversation persistence is distinct from the model context window, and cached tokens still count as input. Long-running compaction behavior is a future observation rather than an implementation prerequisite. Semantic memory can be added later if Conversation continuity is insufficient.
 
 ## Pending intentions
 
@@ -147,9 +153,9 @@ Metrics should be extensible. v0 only needs to require elapsed runtime, but futu
 
 ### Terminal output capabilities
 
-Managed Agents sessions distinguish observations, interactive capabilities, and terminal `OutputCapability` requests. Every completed turn emits `{"outputs": [...]}`; an empty array is intentional silence. The exact authorized Owner/display branches are installed through `agent.text.format` and fingerprinted as immutable session protocol. When a turn contains multiple assistant message items, the Agents adapter combines their complete disposition objects in item order into one turn disposition, both for live streaming and REST recovery. Runtime parses and validates that disposition against the session snapshot and current local authorization, including the combined output limit. An invalid item fails the whole disposition; schema validity never overrides a revoked local grant. The Agents JSON-schema text format is not treated as a guarantee of local schema compliance.
+Responses uses strict `text.format` JSON schema for the exact authorized terminal outputs. Every final result must contain `{"outputs": [...]}`; an empty array is intentional silence. Runtime still validates locally and checks current grants. Refusal, incomplete Response, malformed JSON or a missing disposition fails the wake.
 
-The completed remote turn and binding checkpoint precede local disposition ingestion. `final_dispositions`, `output_requests`, and `output_attempts` then record the receipt and jobs atomically before the wake completes. A missing receipt for the bound completed turn is recovered from that exact assistant item after restart. Stable disposition/output IDs make stream replay, REST reconciliation, and repeated processing idempotent.
+`final_dispositions`, `output_requests`, `output_attempts` and wake completion are persisted atomically before delivery. IDs derive from Conversation/Response and output ordinal, making repeated receipt ingestion idempotent. A locally checkpointed final result can be ingested after restart.
 
 Delivery is owned by a background dispatcher, not the model wake. Jobs move through queued, attempting, retry-wait, accepted-by-transport, permanent-failure, uncertain, and policy/unavailable rejection states. V1 retries retryable and interrupted uncertain attempts up to three times with bounded backoff. Telegram and HomeOps do not provide a complete exactly-once contract, so this is deliberately at-least-once and may duplicate an uncertain delivery. HomeOps acknowledgement means accepted into its queue, not physically rendered. A terminal failure durably schedules one safe `output_delivery_failed` event; failures produced while handling that event cannot recursively schedule another. Operational journal events contain identifiers, states, classifications, targets, and counts but never output content or raw transport errors.
 
@@ -169,41 +175,9 @@ wake event
 
 Runtime activity should be emitted as structured observable events. Interactive console output, persistent journal storage, and future observability interfaces should consume the same event stream rather than implement separate views of Resident activity.
 
-The runtime concurrency model is one asyncio event loop with one unbounded FIFO queue and worker task per Resident. Each worker awaits the wake itself before dequeuing its next event, while routine completed wakes durably signal an asynchronous per-Resident Curator coordinator and do not wait for incremental curation. The coordinator coalesces requested completed-turn boundaries and serializes Curator work for that Resident; different Residents, shared routing, connector producers, mailbox delivery, schedulers, and terminal input use independent asyncio tasks. Tool calls in one provider action batch execute sequentially. Blocking Agents, Responses, HomeOps, display, Telegram, Curator-model, file-input, and similar operations use `asyncio.to_thread` and therefore share the loop's default executor; Agents polling occupies its worker for the complete remote lifecycle. Camera capture uses an async subprocess and ONVIF uses async HTTP. Ordinary SQLite store, mailbox, journal, JSON/context, and core-tool work is synchronous on the event-loop thread. Consequently, a long wake serializes later wake work for that Resident, default-executor saturation can delay otherwise independent offloads, and a slow synchronous store or CPU operation can stall all loop tasks.
+The runtime uses one asyncio event loop, one FIFO queue and one serial wake worker per Resident. Connectors, schedulers, mailbox routing, terminal ingress and output dispatch run independently. Tool calls execute sequentially. Blocking Responses, HomeOps, display, Telegram and file operations use `asyncio.to_thread`; camera capture uses an async subprocess and ONVIF uses async HTTP. SQLite and ordinary local bookkeeping are synchronous on the loop thread.
 
-Opt-in timeline journaling (`--timeline` / `RESIDENT_TIMELINE=true`) measures these boundaries without changing them. It records host enqueue/dequeue and queue wait, provider preflight and each turn or tool-result continuation, local tools, HomeOps/display acknowledgement, executor queue versus worker time for model and connector requests, Curator batches, total durable wake time, and event-loop lag aggregated in memory for each active wake with its maximum. Separate `curator.requested`, `curator.started`, `curator.caught_up`, retry, and degraded events distinguish durable wake completion from background lag without attributing delayed work to a later wake. For ordinary wake and tool-result submissions, the Agents adapter opens a live session event stream before submitting and uses exact correlated item, required-action, completed-item, and completed-turn events as the healthy waiting path. A durable per-session wake ledger is committed immediately before each wake POST: absence means fresh, `possibly_accepted` forces exact correlation before any retry, and `settled` retains the exact correlated turn. This lets a fresh wake correlate from its already-open stream without scanning historical items while preserving conservative crash recovery. Turn-wide reducer state is transient but retained across `requires_action` and tool-result streams, so output indexes and verified assistant content remain continuous across tool rounds; completion, terminal failure, fallback, abandonment, and rollover discard it. Initial session input and any stream disconnect, timeout, parser failure, semantic uncertainty, mismatched state, or incomplete output return to exact session/turn/item reconciliation; stream events have no assumed durable replay semantics. Agents stream, fallback, and HTTP spans retain monotonic placement within the enclosing lifecycle so streaming wait, submission, polling/reconciliation, item retrieval, and continuation latency can be reconstructed separately. Fallback spans classify parser, reducer-semantic, and transport uncertainty with safe reason codes, phase, correlation-known state, and unknown-event counts. Records intentionally exclude prompts, arguments, results, credentials, headers, full URLs, event payloads, raw unknown event types, and all session, turn, and event identifiers.
-
-Conceptually:
-
-```text
-Runtime event
-    ├── Console observer
-    ├── Journal observer
-    └── future observers (web UI, metrics, etc.)
-```
-
-When Resident is run interactively in a terminal, the console observer should make its activity visible as it happens. Useful output includes wake reason, context assembly, observable Resident decisions/rationale, capability/tool calls and results, intention changes, communication, sleep, and run metrics.
-
-Messages that Resident intentionally sends to its owner are communication, not merely diagnostic output. The terminal transport must therefore render them in a clearly distinguishable format so they cannot easily be confused with runtime logs, model diagnostics, or tool output. The exact visual style is an implementation detail, but the distinction should be obvious at a glance.
-
-A model turn's returned text is a wake/model result, not communication. It remains available to the structured journal and verbose/debug observers, but normal terminal presentation and future Owner transports must not interpret it as an Owner-facing message.
-
-The goal is to provide a useful window into Resident's behavior during development and experimentation. This does not require storing or exposing a model's private/internal chain-of-thought. Observable decisions, rationale supplied for actions, model outputs, tool interactions, and state changes are sufficient for debugging and analysis.
-
-## Models
-
-Resident must not depend on a specific AI model or provider.
-
-Intelligence is a runtime capability; identity and continuity belong to Resident.
-
-Capability results may include narrowly typed, ephemeral content such as an image in addition to safe structured
-metadata. Providers translate that content into their own model-input representation. Ephemeral content is available
-only to the active model continuation: it is not written to the journal or another Resident store, which records only
-safe result and attachment metadata.
-
-A future implementation may use local models, cloud models, several capability/cost tiers, or escalation between them. The exact policy is deliberately unspecified for now.
-
-Model calls should eventually be observable enough to measure workload, latency, token usage, and cost. This will allow model choices to be based on actual Resident workloads rather than guesses made before the system exists.
+Opt-in timeline journaling measures queue wait, Response requests and continuations, local tools, connector acknowledgement, executor queue/worker time and event-loop lag. It excludes prompt content, arguments/results, credentials, URLs and attachments.
 
 ## Connectors
 
@@ -265,19 +239,17 @@ Resident-specific endpoints should generally not be added to external systems me
 
 A future generic connector may allow Resident to use sufficiently self-describing APIs without requiring a custom adapter for every service. This is an extension point rather than a v0 requirement.
 
-The first generic external-application connector keeps its operation catalog locally pinned in each Resident definition. It adapts a narrow HTTP invocation endpoint into ordinary `Capability` objects, supplies immutable instance bindings outside model-controlled arguments, and leaves validation and domain authority with the external application. Existing capability grants and managed-session descriptor snapshots remain the authorization and protocol boundaries. Remote metadata cannot expand the catalog in v0.
+The first generic external-application connector keeps its operation catalog locally pinned in each Resident definition. It adapts a narrow HTTP invocation endpoint into ordinary `Capability` objects, supplies immutable instance bindings outside model-controlled arguments, and leaves validation and domain authority with the external application. Current local capability grants and pinned schemas define the authorization boundary. Remote metadata cannot expand the catalog in v0.
 
 Physical co-location does not require logical integration. For example, a camera and microphone mounted on a robot may remain separate connector/device identities. Relationships such as `mounted_on`, `powered_by`, or correlated availability may later be declared or inferred by Resident.
 
-## Long-term memory
+## Continuity and local state
 
-Long-term memory is deliberately separate from the OpenAI Agents session. The session is working context; curated memory, Owner guidance, provenance, curator checkpoints, handovers, and rollover lineage are local durable subsystems with distinct retention and retrieval semantics.
+Conversation history provides episodic continuity. Context-window management, optional server compaction, semantic memory, current guidance and identity are distinct concerns. Curator and semantic-memory code/tables are removed; neither is required for startup, ordinary wakes or context management. There is no bootstrap, rollover or handover mechanism. A simpler asynchronous semantic-memory mechanism can be introduced later from local history if experiments justify it.
 
-The former SQLite `memories` table, automatic recall and standing-guidance context lanes, and `remember`/`recall`/`update_memory`/`forget` tools were removed rather than retained as a competing compatibility system. A Resident definition with `keeper_history: true` separately persists one versioned interaction per Realm-backed managed wake in its per-instance SQLite store. The flag requires Realm and the managed Agents provider; its default is false. The record contains the exact submitted input, the player and trusted Realm views actually read, trigger metadata, session/turn identifiers, model text and tool calls/results in order, token and byte counts, and explicit completion or failure. Raw trusted views and tool outcomes are restricted to this local history; the normal journal projection and future player-facing journal consumers must not expose trusted GM data by default. There is currently no automatic expiry, so operators must account for this data in database access and backups.
+The fresh SQLite schema retains identity, intentions/schedules, messages and ingress deduplication, guidance/revisions, wake/journal records, capability/connector snapshots, connector mutation keys, dispositions and output jobs/attempts. Three small inference tables hold the Conversation binding, Response steps and tool executions. Existing databases are unsupported and are manually discarded; there is no migration or old-provider compatibility.
 
-On a new managed session with Keeper history enabled, the bootstrap includes recent completed interactions across prior sessions, bounded by `KEEPER_ROLLOVER_INTERACTIONS` (default 8) and `KEEPER_ROLLOVER_BYTES` (default 16384). The projection includes triggers, Keeper text, explicitly player-facing tool-call content, and action outcome status, in chronological order. It omits old Realm snapshots, trusted tool-call fields, and tool-returned world data; the current wake's fresh Realm state remains authoritative. The byte limit measures the history field as indented in the bootstrap, and an interaction too large for the remaining budget stops selection. These limits are configurable, while rollover itself remains driven by the existing reasons. The retained input/snapshot byte counts and token totals provide volume observations for a later policy decision. Keeper history does not enter ordinary Curator memory.
-
-Runtime still maintains an append-only journal of what happened. The journal supports debugging, auditability, and later analysis; it is not long-term memory and must not automatically become the reasoning context for every wakeup.
+Optional `keeper_history` archives exact submitted input, Realm views, ordered model/tool activity and token/byte counts for local inspection. It requires Realm and does not replay into the Conversation. Trusted game information in this archive must remain local; safe public journal projections omit it. No automatic expiry is implemented.
 
 ### World model
 
@@ -293,9 +265,9 @@ The runtime treats communication as messages between a Resident instance and its
 
 Conceptually, a persisted message needs only general communication metadata such as an identity, timestamp, direction/sender, content, and optional attachments. The exact schema should remain small until experience demonstrates additional requirements.
 
-Incoming owner messages wake Resident and are delivered once as part of the corresponding `WakeEvent`. Communication history is persisted independently of conversational context and long-term memory, and is retrieved on demand rather than replayed into a surviving managed session or normal bootstrap.
+Incoming owner messages wake Resident and are delivered once as part of the corresponding `WakeEvent`. Communication history is persisted independently of conversational context and long-term memory, and is retrieved on demand rather than replayed into the Conversation.
 
-All intentional outgoing Resident communication, including replies during Owner-initiated wakes, uses the communication capability. That path persists the message and delivers it through the currently configured transport. Model-returned result text is not a fallback transport: if communication is rejected by attention policy or fails in transport, the failure is journaled and the result text is not delivered in its place. Resident may send a question and go back to sleep without waiting for an answer. A later owner message is simply another message and wake event; Resident is responsible for understanding whether it answers something earlier.
+All intentional outgoing Resident communication, including replies during Owner-initiated wakes, uses a terminal `notify_owner` output job. That path persists the message and delivers it through the currently configured transport. Model-returned result text is not a fallback transport: if communication is rejected by attention policy or fails in transport, the failure is journaled and the result text is not delivered in its place. Resident may send a question and go back to sleep without waiting for an answer. A later owner message is simply another message and wake event; Resident is responsible for understanding whether it answers something earlier.
 
 If Resident considers an unresolved exchange important enough to revisit, it can create a pending intention. Runtime should not manufacture a pending-question record on Resident's behalf.
 

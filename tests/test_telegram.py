@@ -1,4 +1,6 @@
 from __future__ import annotations
+from runtime_support import RecordingProvider
+from resident.provider import ResponseRejected
 
 import asyncio
 import os
@@ -39,7 +41,7 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_ingest_is_durable_and_offset_advances_before_wake_processing(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(
-                Config(Path(temporary)), object(), owner_output=lambda _: None,
+                Config(Path(temporary)), RecordingProvider(), owner_output=lambda _: None,
                 diagnostic_output=lambda _: None,
             )
             transport = FakeTelegramTransport([{"ok": True, "result": [{
@@ -69,7 +71,7 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))
             runtime = ResidentRuntime(
-                config, object(), owner_output=lambda _: None,
+                config, RecordingProvider(), owner_output=lambda _: None,
                 diagnostic_output=lambda _: None,
             )
             response = {"ok": True, "result": [{
@@ -99,7 +101,10 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_wake_does_not_block_later_updates(self):
         with tempfile.TemporaryDirectory() as temporary:
             class FailingProvider:
-                async def respond(self, *_):
+                async def create_conversation(self):
+                    return 'conversation-test'
+
+                async def respond(self, *_, **request):
                     raise RuntimeError("provider failed")
 
             runtime = ResidentRuntime(
@@ -137,7 +142,7 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_after_offset_checkpoint_failure_recreates_pending_wake(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(
-                Config(Path(temporary)), object(), owner_output=lambda _: None,
+                Config(Path(temporary)), RecordingProvider(), owner_output=lambda _: None,
                 diagnostic_output=lambda _: None)
             response = {"ok": True, "result": [{
                 "update_id": 7,
@@ -221,12 +226,15 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
                 return result
 
         class RecordingProvider:
+            async def create_conversation(self):
+                return 'conversation-test'
+
             def __init__(self):
                 self.calls = 0
 
-            async def respond(self, *_):
+            async def respond(self, *_, **request):
                 self.calls += 1
-                return ModelTurn("done")
+                return ModelTurn("done", message='{"outputs":[]}')
 
         with tempfile.TemporaryDirectory() as temporary:
             provider = RecordingProvider()
@@ -287,8 +295,11 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refetched_completed_update_does_not_recreate_wake(self):
         class CompleteProvider:
-            async def respond(self, *_):
-                return ModelTurn("done")
+            async def create_conversation(self):
+                return 'conversation-test'
+
+            async def respond(self, *_, **request):
+                return ModelTurn("done", message='{"outputs":[]}')
 
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(
@@ -318,7 +329,7 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))
             first_runtime = ResidentRuntime(
-                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+                config, RecordingProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
             transport = FakeTelegramTransport([{"ok": True, "result": [{
                 "update_id": 7,
                 "message": {"chat": {"id": 202, "type": "private"},
@@ -333,7 +344,7 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             first_runtime.close()
 
             restarted = ResidentRuntime(
-                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+                config, RecordingProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
             queue = asyncio.Queue()
             await restarted.enqueue_startup_wakeups(queue)
 
@@ -345,8 +356,11 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_successful_owner_wake_is_not_recreated_after_restart(self):
         class CompleteProvider:
-            async def respond(self, *_):
-                return ModelTurn("done")
+            async def create_conversation(self):
+                return 'conversation-test'
+
+            async def respond(self, *_, **request):
+                return ModelTurn("done", message='{"outputs":[]}')
 
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))
@@ -365,10 +379,13 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(queue.empty())
             restarted.close()
 
-    async def test_failed_owner_wake_is_recoverable_after_restart(self):
+    async def test_rejected_owner_wake_is_recoverable_after_restart(self):
         class FailingProvider:
-            async def respond(self, *_):
-                raise RuntimeError("interrupted")
+            async def create_conversation(self):
+                return 'conversation-test'
+
+            async def respond(self, *_, **request):
+                raise ResponseRejected("interrupted")
 
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))
@@ -381,7 +398,7 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             runtime.close()
 
             restarted = ResidentRuntime(
-                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+                config, RecordingProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
             queue = asyncio.Queue()
             await restarted.enqueue_startup_wakeups(queue)
 
@@ -390,9 +407,12 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("try again", recovered.payload["content"])
             restarted.close()
 
-    async def test_interrupted_owner_wake_is_recoverable_after_restart(self):
+    async def test_interrupted_owner_wake_blocks_restart(self):
         class InterruptedProvider:
-            async def respond(self, *_):
+            async def create_conversation(self):
+                return 'conversation-test'
+
+            async def respond(self, *_, **request):
                 raise asyncio.CancelledError
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -406,16 +426,17 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             runtime.close()
 
             restarted = ResidentRuntime(
-                config, object(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
+                config, RecordingProvider(), owner_output=lambda _: None, diagnostic_output=lambda _: None)
             queue = asyncio.Queue()
-            await restarted.enqueue_startup_wakeups(queue)
-            self.assertEqual("resume me", queue.get_nowait().payload["content"])
+            with self.assertRaisesRegex(RuntimeError, "Unfinished inference"):
+                await restarted.enqueue_startup_wakeups(queue)
+            self.assertTrue(queue.empty())
             restarted.close()
 
     async def test_same_update_id_from_different_bots_is_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = ResidentRuntime(
-                Config(Path(temporary)), object(), owner_output=lambda _: None,
+                Config(Path(temporary)), RecordingProvider(), owner_output=lambda _: None,
                 diagnostic_output=lambda _: None)
             update = {"ok": True, "result": [{
                 "update_id": 7,
@@ -621,70 +642,9 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("456:second-super-secret", second.offset_checkpoint_scope)
             store.close()
 
-    def test_legacy_global_update_mapping_migrates_without_cross_bot_collision(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "resident.sqlite3"
-            connection = sqlite3.connect(path)
-            connection.executescript("""
-                CREATE TABLE schema_version(version INTEGER NOT NULL);
-                INSERT INTO schema_version VALUES(4);
-                CREATE TABLE messages(
-                  id TEXT PRIMARY KEY, direction TEXT NOT NULL,
-                  sender_id TEXT NOT NULL, content TEXT NOT NULL,
-                  spontaneous INTEGER NOT NULL DEFAULT 0,
-                  delivery_status TEXT NOT NULL, created_at TEXT NOT NULL);
-                CREATE TABLE telegram_owner_updates(
-                  update_id INTEGER PRIMARY KEY,
-                  message_id TEXT NOT NULL UNIQUE REFERENCES messages(id));
-                INSERT INTO messages VALUES(
-                  'old-message','inbound','owner','old',0,'delivered','2026-01-01T00:00:00+00:00');
-                INSERT INTO telegram_owner_updates VALUES(7,'old-message');
-            """)
-            connection.close()
-
-            store = Store(path)
-            new_message = store.ingest_telegram_owner_message(
-                "new-bot-identity", 7, "owner", "new")
-
-            self.assertIsNotNone(new_message)
-            self.assertEqual(2, store.connection.execute(
-                "SELECT count(*) FROM telegram_owner_updates WHERE update_id=7").fetchone()[0])
-            store.close()
-
 
 class TelegramRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_telegram_is_authoritative_and_terminal_is_only_a_successful_mirror(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            mirror = []
-            transport = FakeTelegramTransport([{"ok": True, "result": {}}])
-            runtime = ResidentRuntime(
-                Config(Path(temporary)), object(), owner_transport=transport,
-                owner_output=mirror.append, diagnostic_output=lambda _: None,
-            )
 
-            result = await runtime._send_owner_message("remote message")
-
-            self.assertTrue(result["delivered"])
-            self.assertEqual(["remote message"], mirror)
-            runtime.close()
-
-    async def test_telegram_failure_is_persisted_while_terminal_remains_a_local_mirror(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            mirror = []
-            transport = FakeTelegramTransport([TelegramTransportError("Telegram sendMessage request failed")])
-            runtime = ResidentRuntime(
-                Config(Path(temporary)), object(), owner_transport=transport,
-                owner_output=mirror.append, diagnostic_output=lambda _: None,
-            )
-
-            result = await runtime._send_owner_message("remote message")
-
-            self.assertFalse(result["delivered"])
-            self.assertEqual(["remote message"], mirror)
-            status = runtime.store.connection.execute(
-                "SELECT delivery_status FROM messages WHERE direction='outbound'").fetchone()[0]
-            self.assertEqual("transport_failed", status)
-            runtime.close()
 
     async def test_closed_terminal_does_not_stop_remote_runtime(self):
         terminal_closed = asyncio.Event()
@@ -705,7 +665,7 @@ class TelegramRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             transport = FakeTelegramTransport()
             runtime = ResidentRuntime(
-                Config(Path(temporary)), object(), owner_transport=transport,
+                Config(Path(temporary)), RecordingProvider(), owner_transport=transport,
                 event_producers=[StopAfterTerminalCloses()], owner_output=lambda _: None,
                 diagnostic_output=lambda _: None,
             )

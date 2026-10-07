@@ -60,8 +60,11 @@ external_applications:
 
 
 class IdleProvider:
-    async def respond(self, context, tools, results, continuation_id=None):
-        return ModelTurn("turn", None, ())
+    async def create_conversation(self):
+        return 'conversation-test'
+
+    async def respond(self, context, tools, results, **request):
+        return ModelTurn("turn", '{"outputs":[]}', ())
 
 
 class ExternalApplicationDefinitionTests(unittest.TestCase):
@@ -313,10 +316,10 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
                                         (connector.definition.operations[1], "invalid_response")):
                 with self.subTest(raw=raw[:16], mutating=operation.mutating):
                     with patch("resident.external_app.current_invocation_id",
-                               return_value="managed-call-42"):
+                               return_value="response-call-42"):
                         result = await connector.invoke(operation, {})
                     self.assertEqual(expected, result["error_code"])
-                    self.assertEqual("managed-call-42", captured["request_id"])
+                    self.assertEqual("response-call-42", captured["request_id"])
                     self.assertEqual(captured["request_id"], result["request_id"])
                     self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
             server.shutdown()
@@ -325,7 +328,8 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deep_json_response_is_sanitized_for_both_operation_types(self):
         connector = self.connector()
-        raw = b"[" * 2000 + b"0" + b"]" * 2000
+        depth = 100000  # Exceed Python 3.14 C-stack limits as well as older recursion guards.
+        raw = b"[" * depth + b"0" + b"]" * depth
         captured = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -353,13 +357,13 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
                      "reconcile by request_id")):
                 with self.subTest(mutating=operation.mutating), patch(
                         "resident.external_app.current_invocation_id",
-                        return_value="managed-call-42"):
+                        return_value="response-call-42"):
                     result = await connector.invoke(operation, {})
                     self.assertEqual(expected_code, result["error_code"])
                     self.assertEqual(expected_message, result["error"])
-                    self.assertEqual("managed-call-42", result["request_id"])
+                    self.assertEqual("response-call-42", result["request_id"])
                     self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
-            self.assertEqual(["managed-call-42"] * 2, captured)
+            self.assertEqual(["response-call-42"] * 2, captured)
         finally:
             server.shutdown()
             server.server_close()
@@ -378,16 +382,16 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
             store = Store(Path(temporary) / "state.sqlite3")
             try:
                 registry = ToolRegistry(
-                    store, connector.capabilities, lambda _: {}, lambda *_: None)
+                    store, connector.capabilities, lambda *_: None)
                 result = await registry.execute(
                     "realm_apply_damage", {"character_id": "c1", "amount": 3},
-                    invocation_id="managed-call-42")
+                    invocation_id="response-call-42")
             finally:
                 store.close()
 
         self.assertTrue(result.output["ok"])
-        self.assertEqual("managed-call-42", result.output["request_id"])
-        self.assertEqual("managed-call-42", captured["request_id"])
+        self.assertEqual("response-call-42", result.output["request_id"])
+        self.assertEqual("response-call-42", captured["request_id"])
         self.assertEqual({"game_id": "game-7"}, captured["bindings"])
         self.assertNotIn("bindings", captured["arguments"])
 
@@ -452,12 +456,12 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
                     (connector.definition.operations[1], "timeout")):
                 with self.subTest(mutating=operation.mutating), patch(
                         "resident.external_app.current_invocation_id",
-                        return_value="managed-call-42"):
+                        return_value="response-call-42"):
                     started = time.monotonic()
                     result = await connector.invoke(operation, {})
                     self.assertLess(time.monotonic() - started, 0.5)
                     self.assertEqual(expected, result["error_code"])
-                    self.assertEqual("managed-call-42", result["request_id"])
+                    self.assertEqual("response-call-42", result["request_id"])
                     self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
                     self.assertTrue(worker_done.is_set(), "HTTP worker remained active after invoke")
         finally:
@@ -482,7 +486,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("resident.external_app.AsyncResolver.resolve", stalled_resolution), patch(
                 "resident.external_app.current_invocation_id",
-                return_value="managed-call-42"):
+                return_value="response-call-42"):
             for operation, expected in (
                     (connector.definition.operations[0], "unknown_outcome"),
                     (connector.definition.operations[1], "timeout")):
@@ -491,7 +495,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
                 result = await connector.invoke(operation, {})
                 self.assertLess(time.monotonic() - started, 0.5)
                 self.assertEqual(expected, result["error_code"])
-                self.assertEqual("managed-call-42", result["request_id"])
+                self.assertEqual("response-call-42", result["request_id"])
                 self.assertTrue(cancelled.is_set(), "DNS resolution remained active")
                 self.assertEqual(0, active)
 
@@ -505,15 +509,15 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(exception=type(exception).__name__,
                                   mutating=operation.mutating), patch(
                         "resident.external_app.current_invocation_id",
-                        return_value="managed-call-42"):
+                        return_value="response-call-42"):
                     async def fail(payload):
-                        self.assertEqual("managed-call-42", json.loads(payload)["request_id"])
+                        self.assertEqual("response-call-42", json.loads(payload)["request_id"])
                         raise exception
 
                     connector._post = fail
                     result = await connector.invoke(operation, {})
                     self.assertEqual(expected, result["error_code"])
-                    self.assertEqual("managed-call-42", result["request_id"])
+                    self.assertEqual("response-call-42", result["request_id"])
                     self.assertEqual(operation.mutating, result.get("outcome") == "unknown")
                     self.assertNotIn("secret upstream", json.dumps(result))
 
@@ -534,7 +538,7 @@ class ExternalApplicationConnectorTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "state.sqlite3")
             try:
-                registry = ToolRegistry(store, [capability], lambda _: {}, lambda *_: None)
+                registry = ToolRegistry(store, [capability], lambda *_: None)
                 result = await registry.execute(capability.name, {"items": [1, 0]})
             finally:
                 store.close()

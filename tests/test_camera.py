@@ -262,33 +262,18 @@ class CameraConfigTests(unittest.TestCase):
 
 
 class CaptureProvider:
+    async def create_conversation(self):
+        return 'conversation-test'
+
     def __init__(self):
         self.results = None
 
-    async def respond(self, context, tools, results, previous_response_id=None):
-        if previous_response_id is None:
+    async def respond(self, context, tools, results, **request):
+        if not results:
             return ModelTurn("capture", tool_calls=(ToolCall(
                 "call", "camera_capture_frame", {"camera_id": "entry"}),))
         self.results = results
-        return ModelTurn("done", message="done")
-
-
-class RecoveringCaptureProvider(CaptureProvider):
-    def bind_action_store(self, begin, complete):
-        self._begin_action = begin
-        self._complete_action = complete
-
-    def prepare_tool_call(self, call):
-        action = self._begin_action(
-            "openai_agents", "session", "capture", call.id, call.name, call.arguments)
-        if not action["claimed"] and action.get("attachments_ephemeral"):
-            action["ephemeral_result"] = None
-        return action
-
-    def record_tool_result(self, result):
-        self._complete_action(
-            "openai_agents", "session", result.call_id, result.output,
-            bool(result.attachments))
+        return ModelTurn("done", message='{"outputs":[]}')
 
 
 class CameraRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -317,39 +302,6 @@ class CameraRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"ephemeral":true', journal)
         self.assertNotIn(SECRET_URL, journal)
         self.assertNotIn("frame-data", journal)
-
-    async def test_completed_camera_action_is_reacquired_after_ephemeral_frame_is_lost(self):
-        captures = 0
-        connector = CameraConnector([CameraConfig("entry", "Entry", SECRET_URL)])
-
-        async def capture(_):
-            nonlocal captures
-            captures += 1
-            from resident.domain import ImageAttachment, ToolOutput
-            return ToolOutput(
-                {"status": "captured", "camera_id": "entry"},
-                (ImageAttachment(JPEG),))
-
-        connector.capabilities[1] = connector.capabilities[1].__class__(
-            **{**connector.capabilities[1].__dict__, "handler": capture})
-        provider = RecoveringCaptureProvider()
-        with tempfile.TemporaryDirectory() as temporary:
-            runtime = ResidentRuntime(
-                Config(Path(temporary)), provider, capabilities=connector.capabilities,
-                owner_output=lambda _: None, diagnostic_output=lambda _: None,
-            )
-            runtime.store.begin_agent_tool_action(
-                "openai_agents", "session", "capture", "call",
-                "camera_capture_frame", {"camera_id": "entry"})
-            runtime.store.complete_agent_tool_action(
-                "openai_agents", "session", "call",
-                {"ok": True, "status": "captured", "camera_id": "entry"}, True)
-
-            await runtime.process(WakeEvent("event", "test", "capture", utc_now(), {}))
-            runtime.close()
-
-        self.assertEqual(1, captures)
-        self.assertEqual(JPEG, provider.results[0].attachments[0].data)
 
 
 if __name__ == "__main__":
