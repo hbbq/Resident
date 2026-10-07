@@ -3,6 +3,8 @@ version: 1
 id: keeper
 name: Keeper
 
+enabled: false
+
 personality_prompt: keeper.md
 
 role: >

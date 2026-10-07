@@ -3,6 +3,8 @@ version: 1
 id: oracle
 name: Oracle
 
+enabled: false
+
 personality_prompt: oracle.md
 
 role: >
