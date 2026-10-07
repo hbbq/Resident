@@ -1132,6 +1132,8 @@ class ResidentRuntime:
                     "response_id": turn.response_id, "tool_call_count": len(turn.tool_calls),
                     "has_message": bool(turn.message), "input_tokens": turn.input_tokens,
                     "output_tokens": turn.output_tokens,
+                    **({"cached_input_tokens": turn.cached_input_tokens}
+                       if turn.cached_input_tokens is not None else {}),
                 })
                 if keeper_history:
                     session_id = getattr(self.provider, "session_id", None)

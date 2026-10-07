@@ -54,6 +54,7 @@ class ModelTurn:
     tool_calls: tuple[ToolCall, ...] = ()
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cached_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)

@@ -14,13 +14,46 @@ from typing import Any, Callable, Iterator, Protocol, Sequence
 
 from .domain import ModelTurn, ToolCall, ToolResult, ToolSpec
 from .memory import SessionHistoryUnavailable, SessionItemPage
-from .observability import to_thread_timed
+from .observability import timeline_reporter, to_thread_timed
 
 
 _agents_http_trace: ContextVar[dict[str, Any] | None] = ContextVar(
     "agents_http_trace", default=None)
 
 _STREAM_MESSAGE_MISSING = object()
+
+
+@dataclass
+class _AgentsStreamTiming:
+    """Bounded, payload-free observations for one live stream connection."""
+
+    started: float
+    previous: float | None = None
+    fields: dict[str, Any] = field(default_factory=lambda: {
+        "largest_inter_event_gap_seconds": 0.0})
+
+    def received(self, event: dict) -> None:
+        now = time.monotonic()
+        if self.previous is not None:
+            self.fields["largest_inter_event_gap_seconds"] = max(
+                self.fields["largest_inter_event_gap_seconds"], now - self.previous)
+        self.previous = now
+        self.mark("first_event", event.get("type"))
+
+    def mark(self, phase: str, event_type: object) -> None:
+        key = f"time_to_{phase}_seconds"
+        if key not in self.fields and self.previous is not None:
+            self.fields[key] = self.previous - self.started
+            # Keep a bounded event name; never retain IDs or payload content.
+            self.fields[f"{phase}_type"] = (
+                event_type if isinstance(event_type, str)
+                and len(event_type) <= 100
+                and all(c.isascii() and (c.isalnum() or c in "._") for c in event_type)
+                else "unknown")
+
+
+_agents_stream_timing: ContextVar[_AgentsStreamTiming | None] = ContextVar(
+    "agents_stream_timing", default=None)
 
 
 class _AgentsStreamTerminalError(RuntimeError):
@@ -567,7 +600,8 @@ class OpenAIAgentsProvider:
         lifecycle_token = self._lifecycle_writer.set(lifecycle_on_event_loop)
         http_trace: dict[str, Any] = {
             "lifecycle_started": time.monotonic(), "events": []}
-        trace_token = _agents_http_trace.set(http_trace)
+        trace_token = _agents_http_trace.set(
+            http_trace if timeline_reporter.get() is not None else None)
 
         def flush_http_trace() -> None:
             from .observability import emit_timeline
@@ -934,6 +968,13 @@ class OpenAIAgentsProvider:
                         self._mark_wake_correlated, session_id, wake_key, turn_id)
                 if item_event_turn_id != turn_id:
                     continue
+                timing = _agents_stream_timing.get()
+                if timing is not None and turn_id is not None:
+                    if item.get("type") == "message" and item.get("role") == "assistant":
+                        timing.mark("first_model_activity", event_type)
+                        timing.mark("first_output", event_type)
+                    elif item.get("type") == "function_call":
+                        timing.mark("first_model_activity", event_type)
                 output_index = event.get("output_index")
                 if output_index is None:
                     if item.get("role") == "assistant":
@@ -972,6 +1013,9 @@ class OpenAIAgentsProvider:
                     continue
                 turn = self._required_actions_turn(session)
                 if turn.tool_calls:
+                    timing = _agents_stream_timing.get()
+                    if timing is not None and turn_id is not None:
+                        timing.mark("first_model_activity", event_type)
                     if turn_id is not None:
                         self._stream_states[turn_id] = state
                     return turn
@@ -990,6 +1034,13 @@ class OpenAIAgentsProvider:
                                       if event_turn_id is not None else item_turn_id)
                 if item_event_turn_id != turn_id:
                     continue
+                timing = _agents_stream_timing.get()
+                if timing is not None and turn_id is not None:
+                    if item.get("type") == "message" and item.get("role") == "assistant":
+                        timing.mark("first_model_activity", event_type)
+                        timing.mark("first_output", event_type)
+                    elif item.get("type") == "function_call":
+                        timing.mark("first_model_activity", event_type)
                 output_index = event.get("output_index")
                 if output_index is None:
                     raise _AgentsStreamSemanticError("output_item_done_without_added")
@@ -1040,6 +1091,9 @@ class OpenAIAgentsProvider:
                 if (not isinstance(turn, dict) or turn.get("id") != turn_id
                         or turn.get("status") != "completed"):
                     raise _AgentsStreamSemanticError("terminal_shape_invalid")
+                timing = _agents_stream_timing.get()
+                if timing is not None and turn_id is not None:
+                    timing.mark("completion", event_type)
                 if event.get("usage") is not None:
                     turn = {**turn, "usage": event["usage"]}
                 message: object = _STREAM_MESSAGE_MISSING
@@ -1614,7 +1668,9 @@ class OpenAIAgentsProvider:
         usage = turn.get("usage") or session.get("usage") or {}
         return ModelTurn(turn_id, message=message if isinstance(message, str) else None,
                          input_tokens=usage.get("input_tokens"),
-                         output_tokens=usage.get("output_tokens"))
+                         output_tokens=usage.get("output_tokens"),
+                         cached_input_tokens=(usage.get("input_tokens_details") or {}).get(
+                             "cached_tokens"))
 
     def _required_actions_turn(self, session: dict) -> ModelTurn:
         actions = [action for action in session.get("required_actions", [])
@@ -1633,7 +1689,9 @@ class OpenAIAgentsProvider:
         usage = session.get("usage") or {}
         return ModelTurn(turn_id, tool_calls=calls,
                          input_tokens=usage.get("input_tokens"),
-                         output_tokens=usage.get("output_tokens"))
+                         output_tokens=usage.get("output_tokens"),
+                         cached_input_tokens=(usage.get("input_tokens_details") or {}).get(
+                             "cached_tokens"))
 
     def _latest_turn(self, session_id: str) -> dict | None:
         page = self._request("GET", f"/agents/sessions/{session_id}/turns?order=desc&limit=1")
@@ -1781,6 +1839,9 @@ class OpenAIAgentsProvider:
         outcome = "ok"
         event_count = 0
         response = None
+        timing = (_AgentsStreamTiming(started)
+                  if timeline_reporter.get() is not None else None)
+        timing_token = _agents_stream_timing.set(timing)
         try:
             response = urllib.request.urlopen(request, timeout=self.timeout_seconds)
 
@@ -1815,6 +1876,8 @@ class OpenAIAgentsProvider:
                         if not isinstance(event, dict):
                             raise _AgentsSSEError("sse_non_object")
                         event_count += 1
+                        if timing is not None:
+                            timing.received(event)
                         yield event
                     elif line.startswith("data:"):
                         data_lines.append(line[5:].lstrip(" "))
@@ -1830,6 +1893,8 @@ class OpenAIAgentsProvider:
                         if not isinstance(event, dict):
                             raise _AgentsSSEError("sse_non_object")
                         event_count += 1
+                        if timing is not None:
+                            timing.received(event)
                         yield event
 
             yield events()
@@ -1847,7 +1912,9 @@ class OpenAIAgentsProvider:
             self._trace_span(
                 "openai.agents_stream", started, outcome,
                 event_count=event_count,
-                request_timeout_seconds=self.timeout_seconds)
+                request_timeout_seconds=self.timeout_seconds,
+                **(timing.fields if timing is not None else {}))
+            _agents_stream_timing.reset(timing_token)
 
     def _trace_span(self, operation: str, started: float, outcome: str, **details: Any) -> None:
         trace = _agents_http_trace.get()

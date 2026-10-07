@@ -187,11 +187,46 @@ The runtime persists a safe public snapshot of available capabilities. The first
 
 Pass `--timeline` or set `RESIDENT_TIMELINE=true` to record opt-in structured `timeline` journal events. The timeline separates host queue wait, wake processing, provider preflight and rounds, local tool execution, HomeOps/display requests, Agents/Responses default-executor queue and worker time, Curator batches and tail, and event-loop lag aggregated per active wake. The Agents adapter uses the live session event stream for healthy wake and tool-result waits; startup, initial session input, interrupted or malformed streams, timeouts, and other uncertain states retain exact HTTP reconciliation. Timeline records distinguish stream waits and explicit reconciliation fallbacks from submission, polling, and item retrieval. Stream observations are transient and are not used as a durable replay cursor. Payloads contain safe identifiers, operation classes, timings, counts, configured timeouts, and outcomes; they exclude prompts, tool arguments or results, credentials, headers, request URLs, and attachment contents. `--verbose` also renders the records. Instrumentation does not change per-Resident serialization or Curator placement.
 
+Agents `openai.agents_stream` finished records include `event_count`,
+`time_to_first_event_seconds` and `first_event_type`, and
+`largest_inter_event_gap_seconds`. When observed for the expected/correlated
+turn, they also include `time_to_first_model_activity_seconds`,
+`time_to_first_output_seconds`, and `time_to_completion_seconds`, each with a
+corresponding `first_model_activity_type`, `first_output_type`, or `completion_type`.
+All offsets use the monotonic clock from immediately before opening the stream;
+connection setup and the subsequent wake/tool-result submission are included.
+The duration ends when the stream connection closes. The largest gap measures
+consecutive decoded JSON events (including local handling between reads), not
+SSE comments, envelope lines, or the `[DONE]` sentinel. Zero means fewer than two
+events; absent phase fields mean that phase was not observed on this connection.
+A tool-action pause is not turn completion; later rounds have separate streams.
+
+The phase signals use the client's existing event contract:
+`agent.session.turn.item.added` / `.done` for an assistant message identify the
+first output **item**, even if its content is still empty. Assistant-message and
+function-call items, or a validated `agent.session.requires_action` function-call
+pause, establish observable model activity. These are not timestamps for the
+start of internal inference or the first text token. Lifecycle/in-progress events
+and unknown event families do not establish model activity. Only a validated,
+matching `agent.session.turn.completed` establishes completion; other turns and
+user input items cannot supply model/output milestones. Earlier reasoning and
+text-delta phases are deliberately omitted because this client's reducer does
+not define them. No model content is retained in these diagnostics.
+
+Agents token usage is already read from a completed event's `usage` or nested
+`turn.usage`, or from turn/session data received during existing reconciliation.
+`model.responded` now also includes `cached_input_tokens` when
+`usage.input_tokens_details.cached_tokens` is present (including zero).
+Input/output token fields remain null when usage is absent; no usage-only request
+is made. These are best-effort API counts and can be unavailable at completion.
+See [OpenAI usage documentation](https://developers.openai.com/api/docs/guides/agents-api/observability).
+
 ## Experimental HomeOps connector
 
 Set `RESIDENT_HOMEOPS_URL` (or pass `--homeops-url`) to opt into read-only HomeOps observation. With no URL configured, Resident makes no HomeOps requests. The connector silently establishes a baseline from `GET /api/measurements/latest`, then polls every 30 seconds and emits one wake containing all values changed during that poll. New measurement points count as changes; timestamp-only updates do not. Polling failures are retried without waking Resident or discarding the last successful baseline. These recoverable failures are shown with verbose diagnostics and suppressed in the default terminal mode.
 
 Resident can use `homeops_get_current_measurements` and `homeops_get_measurement_history` to investigate. History accepts a measurement `point_id`, optional ISO-8601 `from_time` and `to_time`, and an optional `limit` from 1 to 5,000. The argument-free `homeops_get_weather_forecast` calls `GET /api/forecast` only when invoked for forward-looking weather. It returns the HomeOps forecast object with its metadata, periods in source order, and freshness/stale fields intact. An unavailable or disabled forecast produces a tool error without affecting measurement access or polling; forecasts do not generate measurement wakes. Grant `homeops` to include all three tools (as Watcher does), or grant `homeops_get_weather_forecast` by name. Configure polling and HTTP timeout with `--homeops-poll-seconds` / `RESIDENT_HOMEOPS_POLL_SECONDS` and `--homeops-request-timeout-seconds` / `RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS`.
+
 
 ### HomeOps-backed displays
 
