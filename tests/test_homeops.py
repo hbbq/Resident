@@ -73,6 +73,57 @@ class HomeOpsConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(queue.empty())
         self.assertEqual("2026-09-15T08:01:00Z", connector._snapshot["1"]["timestamp"])
 
+    async def test_contact_cycle_wakes_when_current_state_and_status_timestamp_are_unchanged(self):
+        opened = "2026-10-08T17:21:11.463+00:00"
+        closed = "2026-10-08T17:21:16.322+00:00"
+        baseline = measurement("1", 0, "status-time", pointKey="main/contactSensor/contact",
+                               kind="boolean", lastOpened=None, lastClosed=None)
+        current = dict(baseline, lastOpened=opened, lastClosed=closed)
+        connector = FakeHomeOpsConnector([[baseline], [current], [current]])
+        queue = asyncio.Queue()
+        await connector.poll_once(queue)
+        self.assertTrue(queue.empty())
+        await connector.poll_once(queue)
+        event = queue.get_nowait()
+        self.assertEqual(("homeops", "measurement_changed"), (event.source, event.reason))
+        self.assertEqual(1, event.payload["change_count"])
+        change = event.payload["changes"][0]
+        self.assertEqual(0, change["old_value"])
+        self.assertEqual(0, change["new_value"])
+        self.assertIsNone(change["old_last_opened"])
+        self.assertIsNone(change["old_last_closed"])
+        self.assertEqual(opened, change["new_last_opened"])
+        self.assertEqual(closed, change["new_last_closed"])
+        await connector.poll_once(queue)
+        self.assertTrue(queue.empty())
+
+    async def test_each_contact_timestamp_can_independently_trigger_existing_wake(self):
+        baseline = measurement("1", 0, "status-time", pointKey="secondary/contactSensor/contact",
+                               lastOpened="old-open", lastClosed="old-close")
+        for field, payload_name in (("lastOpened", "last_opened"), ("lastClosed", "last_closed")):
+            with self.subTest(field=field):
+                connector = FakeHomeOpsConnector([[baseline], [dict(baseline, **{field: "new-event"})]])
+                queue = asyncio.Queue()
+                await connector.poll_once(queue)
+                await connector.poll_once(queue)
+                change = queue.get_nowait().payload["changes"][0]
+                self.assertEqual(baseline[field], change[f"old_{payload_name}"])
+                self.assertEqual("new-event", change[f"new_{payload_name}"])
+                self.assertTrue(queue.empty())
+
+    async def test_contact_initial_known_times_and_missing_or_null_unknown_times_are_silent(self):
+        for fields in ({}, {"lastOpened": "known-open", "lastClosed": "known-close"}):
+            with self.subTest(fields=fields):
+                baseline = measurement("1", 0, "old", pointKey="main/contactSensor/contact", **fields)
+                current = dict(baseline, timestamp="new")
+                if not fields:
+                    current.update(lastOpened=None, lastClosed=None)
+                connector = FakeHomeOpsConnector([[baseline], [current]])
+                queue = asyncio.Queue()
+                await connector.poll_once(queue)
+                await connector.poll_once(queue)
+                self.assertTrue(queue.empty())
+
     async def test_changed_and_new_points_are_batched_in_one_wake(self):
         connector = FakeHomeOpsConnector([
             [measurement("1", 20, "old")],

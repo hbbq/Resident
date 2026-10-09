@@ -130,7 +130,7 @@ class HomeOpsConnector:
 
     @staticmethod
     def _change(previous: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, Any]:
-        return {
+        change = {
             "point_id": current["pointId"],
             "point_key": current.get("pointKey"),
             "point_name": current.get("pointName"),
@@ -143,6 +143,24 @@ class HomeOpsConnector:
             "old_timestamp": previous.get("timestamp") if previous is not None else None,
             "new_timestamp": current.get("timestamp"),
         }
+        if HomeOpsConnector._is_contact(current):
+            for api_name, payload_name in (("lastOpened", "last_opened"),
+                                           ("lastClosed", "last_closed")):
+                change[f"old_{payload_name}"] = previous.get(api_name) if previous is not None else None
+                change[f"new_{payload_name}"] = current.get(api_name)
+        return change
+
+    @staticmethod
+    def _is_contact(measurement: dict[str, Any]) -> bool:
+        return str(measurement.get("pointKey", "")).endswith("/contactSensor/contact")
+
+    @staticmethod
+    def _changed(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+        if previous.get("value") != current.get("value"):
+            return True
+        return HomeOpsConnector._is_contact(current) and any(
+            previous.get(field) != current.get(field) for field in ("lastOpened", "lastClosed")
+        )
 
     async def poll_once(self, queue: asyncio.Queue[WakeEvent]) -> None:
         measurements = self._measurement_list(await self._request("/api/measurements/latest"))
@@ -154,7 +172,7 @@ class HomeOpsConnector:
         changes = [
             self._change(previous.get(point_id), measurement)
             for point_id, measurement in current.items()
-            if point_id not in previous or previous[point_id].get("value") != measurement.get("value")
+            if point_id not in previous or self._changed(previous[point_id], measurement)
         ]
         if changes:
             await queue.put(WakeEvent(
