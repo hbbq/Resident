@@ -21,7 +21,6 @@ capabilities:
   - agentcontroller
   - diagnostics
   - homeops
-  - messaging
   - camera
 
 outputs:
