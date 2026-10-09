@@ -19,7 +19,7 @@ class HomeOpsConnector:
 
     readiness_items = (ReadinessItem("homeops", "HomeOps"),)
 
-    def __init__(self, base_url: str, *, poll_seconds: float = 30.0,
+    def __init__(self, base_url: str, *, poll_seconds: float = 60.0,
                  request_timeout_seconds: float = 10.0,
                  diagnostic_output: Callable[[str], None] | None = None):
         parsed = urlsplit(base_url)

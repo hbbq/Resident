@@ -161,7 +161,7 @@ class Config:
     spontaneous_message_window_seconds: int = 180
     scheduler_poll_seconds: float = 1.0
     homeops_url: str | None = None
-    homeops_poll_seconds: float = 30.0
+    homeops_poll_seconds: float = 60.0
     homeops_request_timeout_seconds: float = 10.0
     displays: tuple[DisplayConfig, ...] = ()
     agentcontroller_snapshot_path: Path | None = None
@@ -210,7 +210,7 @@ class Config:
                             default=int(os.getenv("RESIDENT_SPONTANEOUS_MESSAGE_WINDOW_SECONDS", "180")))
         parser.add_argument("--homeops-url", default=os.getenv("RESIDENT_HOMEOPS_URL"))
         parser.add_argument("--homeops-poll-seconds", type=float,
-                            default=float(os.getenv("RESIDENT_HOMEOPS_POLL_SECONDS", "30")))
+                            default=float(os.getenv("RESIDENT_HOMEOPS_POLL_SECONDS", "60")))
         parser.add_argument("--homeops-request-timeout-seconds", type=float,
                             default=float(os.getenv("RESIDENT_HOMEOPS_REQUEST_TIMEOUT_SECONDS", "10")))
         parser.add_argument("--agentcontroller-snapshot-path",
