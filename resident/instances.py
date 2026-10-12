@@ -30,7 +30,7 @@ _SUBSCRIPTION_SELECTORS = (_SUBSCRIPTION_EVENTS |
 _ALLOWED = {
     "version", "id", "name", "enabled", "personality", "personality_prompt",
     "role", "role_prompt", "agent", "capabilities", "outputs",
-    "subscriptions", "owner_transport", "external_applications", "realm", "keeper_history", "body",
+    "subscriptions", "owner_transport", "external_applications", "realm", "keeper_history", "body", "projectdelve",
 }
 _SECRET_WORDS = ("token", "password", "api_key", "secret", "credential")
 
@@ -83,6 +83,15 @@ class RealmDefinition:
 
 
 @dataclass(frozen=True)
+class ProjectDelveDefinition:
+    base_url: str
+    bearer_token_env: str
+    binding_id: str = "gambit"
+    poll_seconds: float = 1.0
+    request_timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
 class ResidentDefinition:
     id: str
     name: str
@@ -96,6 +105,7 @@ class ResidentDefinition:
     owner_transport: OwnerTransportDefinition | None = None
     external_applications: tuple[ExternalApplicationDefinition, ...] = ()
     realm: RealmDefinition | None = None
+    projectdelve: ProjectDelveDefinition | None = None
     keeper_history: bool = False
     body: dict[str, Any] | None = None
 
@@ -450,6 +460,28 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
             _positive_number(item.get("request_timeout_seconds", 10),
                              "realm.request_timeout_seconds", maximum=120),
         )
+    projectdelve = None
+    if "projectdelve" in data:
+        item = _mapping(data["projectdelve"], "projectdelve")
+        allowed = {"base_url", "bearer_token_env", "binding_id", "poll_seconds", "request_timeout_seconds"}
+        if set(item) - allowed:
+            raise ValueError("Unknown ProjectDelve configuration fields")
+        binding_id = _string(item.get("binding_id", "gambit"), "projectdelve.binding_id")
+        if binding_id != "gambit" or resident_id != "gambit":
+            raise ValueError("ProjectDelve v1 requires the dedicated gambit instance/binding")
+        if realm is not None or data.get("external_applications") or data.get("subscriptions"):
+            raise ValueError("Gambit requires private ProjectDelve delivery without other subscriptions/connectors")
+        if "projectdelve_decision" not in _string_list(data.get("outputs"), "outputs"):
+            raise ValueError("ProjectDelve requires the projectdelve_decision output grant")
+        projectdelve = ProjectDelveDefinition(
+            base_url=_string(item.get("base_url"), "projectdelve.base_url"),
+            bearer_token_env=_env_name(item.get("bearer_token_env"), "projectdelve.bearer_token_env"),
+            binding_id=binding_id,
+            poll_seconds=_positive_number(item.get("poll_seconds", 1), "projectdelve.poll_seconds", maximum=60),
+            request_timeout_seconds=_positive_number(item.get("request_timeout_seconds", 10),
+                                                     "projectdelve.request_timeout_seconds", maximum=120))
+    elif "projectdelve_decision" in _string_list(data.get("outputs"), "outputs"):
+        raise ValueError("projectdelve_decision output requires a ProjectDelve configuration")
     keeper_history = data.get("keeper_history", False)
     if not isinstance(keeper_history, bool):
         raise ValueError(f"{path.name}.keeper_history must be boolean")
@@ -466,6 +498,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
         external_applications=_external_applications(
             data.get("external_applications"), "external_applications"),
         realm=realm,
+        projectdelve=projectdelve,
         keeper_history=keeper_history,
         body=body,
     )

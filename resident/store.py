@@ -215,6 +215,18 @@ class Store:
         """).fetchall()
         with self.connection:
             for row in interrupted:
+                if row["output_type"] == "projectdelve_decision":
+                    self.connection.execute("""
+                        UPDATE output_attempts SET finished_at=?,outcome='delivery_uncertain',
+                          failure_classification='interrupted_attempt'
+                        WHERE output_request_id=? AND attempt_number=? AND outcome='attempting'
+                    """, (now, row["id"], row["attempt_count"]))
+                    self.connection.execute("""
+                        UPDATE output_requests SET delivery_state='retry_wait',next_attempt_at=?,
+                          failure_event_generated=1,last_failure_classification='interrupted_attempt',
+                          updated_at=? WHERE id=?
+                    """, (now, now, row["id"]))
+                    continue
                 exhausted = int(row["attempt_count"]) >= int(row["max_attempts"])
                 self.connection.execute("""
                     UPDATE output_attempts SET finished_at=?,outcome='delivery_uncertain',
@@ -450,6 +462,11 @@ class Store:
                         if wake['source'] == 'scheduler':
                             self.connection.execute("UPDATE scheduled_wakeups SET status='completed' WHERE id=?", (wake['payload'].get('schedule_id'),))
         return {"id": disposition_id, "created": True, "requests": created_requests}
+
+    def projectdelve_finalized(self, wake_id: str) -> bool:
+        """Valid and invalid terminal choices both prohibit unrequested re-inference."""
+        return self.connection.execute(
+            "SELECT 1 FROM final_dispositions WHERE wake_id=? LIMIT 1", (wake_id,)).fetchone() is not None
 
     def claim_output_request(self, now: str | None = None) -> dict[str, Any] | None:
         now = now or utc_now()

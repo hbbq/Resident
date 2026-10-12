@@ -29,6 +29,7 @@ SETUP = {
 }
 
 OUTPUT_SETUP = {
+    "projectdelve_decision": "Grant only to the dedicated gambit instance with a projectdelve block (base_url, bearer_token_env, binding_id: gambit). Private polling delivers decisions; game wakes have exactly one legal output and no tools. Delivery reconciles durable output IDs; no model failure wakes.",
     "notify_owner": "Grant outputs: [notify_owner]; use the default terminal Resident or configure an Owner Telegram transport with token_env, owner_user_id_env, and owner_chat_id_env. Requires an available Owner route.",
     "display": "Grant outputs: [display/<display-id>]; configure RESIDENT_DISPLAYS and RESIDENT_HOMEOPS_URL. Each target must exist and have a HomeOps display route.",
 }
@@ -183,7 +184,7 @@ def render() -> str:
         lines.append(f"| {grant} | {', '.join(f'`{name}`' for name in sorted(tools[family]))} | {setup} | {purpose} |")
     lines.extend(["| `<provider-id>` or `<provider-id>_<operation-name>` | `<provider-id>_<operation-name>` | Add `external_applications` to the Resident definition: provider `id`, `description`, `base_url`, optional `bearer_token_env` and `bindings`, and pinned `operations` with names, descriptions, input schemas, and optional mutating flags. Run the matching HTTP service. | Only operations declared on that Resident are available; no remote discovery occurs. |", "",
                   "## Always-present built-in tools", "",
-                  "These are runtime tools, not `capabilities` grants.", "",
+                  "These are runtime tools, not `capabilities` grants. ProjectDelve game decision wakes expose no tools.", "",
                   "| Tool | Availability |", "| --- | --- |"])
     for name in sorted(core):
         note = ("Requires an authenticated Owner-message context to change guidance." if name in {"set_owner_guidance", "remove_owner_guidance"} else

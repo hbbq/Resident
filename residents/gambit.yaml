@@ -1,0 +1,20 @@
+version: 1
+id: gambit
+name: Gambit
+enabled: true
+personality_prompt: gambit.md
+role: Play one authoritative ProjectDelve Side against a human browser player.
+agent:
+  provider: openai-responses
+  model: gpt-5.6-luna
+  reasoning_effort: medium
+  api_key_env: OPENAI_API_KEY
+projectdelve:
+  base_url: http://127.0.0.1:5080
+  bearer_token_env: PROJECTDELVE_GAMBIT_TOKEN
+  binding_id: gambit
+  poll_seconds: 1
+  request_timeout_seconds: 10
+capabilities: []
+outputs: [projectdelve_decision]
+subscriptions: []

@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from .capabilities import Capability, diagnostic_capabilities
 from .realm import RealmClient
+from .projectdelve import ProjectDelveConnector
 from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
@@ -46,6 +47,7 @@ class ResidentRuntime:
     def __init__(self, config: Config, provider: ModelProvider, *, store: Store | None = None,
                  capabilities: Sequence[Capability] | None = None,
                  realm_client: RealmClient | None = None,
+                 projectdelve_client: ProjectDelveConnector | None = None,
                  output_capabilities: Sequence[OutputCapability] | None = None,
                  event_producers: list[EventProducer] | None = None,
                  owner_transport: OwnerTransport | None = None,
@@ -56,9 +58,12 @@ class ResidentRuntime:
             raise ValueError("Keeper history requires Realm")
         self.config, self.provider = config, provider
         self.realm_client = realm_client
+        self.projectdelve_client = projectdelve_client
         initial_capabilities = capabilities if capabilities is not None else diagnostic_capabilities()
         self._capabilities = self._validated_capabilities(initial_capabilities)
         self.store = store or Store(config.data_dir / "resident.sqlite3")
+        if self.projectdelve_client is not None:
+            self.projectdelve_client.bind_store(self.store)
         if self.realm_client is not None:
             self.realm_client.bind_mutation_store(self.store.realm_mutation_request)
         self.resident, self.owner = self.store.provision(
@@ -291,7 +296,9 @@ class ResidentRuntime:
             run_id: str | None, wake: WakeEvent | None,
             schema: dict[str, Any] | None = None,
             fingerprint: str | None = None) -> dict[str, Any]:
-        schema = schema or self._output_schema
+        game_wake = wake is not None and wake.source == "projectdelve" and wake.reason == "decision"
+        schema = schema or (self.projectdelve_client.decision_schema(wake)
+                            if game_wake and self.projectdelve_client else self._ordinary_output_schema())
         fingerprint = fingerprint or schema_fingerprint(schema)
         normalized: dict[str, Any] | None = None
         validation_state = "valid"
@@ -302,6 +309,9 @@ class ResidentRuntime:
             validation_state = "invalid_json"
         if validation_state == "valid":
             error = validate_disposition(parsed, schema)
+            if (not error and game_wake):
+                error = (self.projectdelve_client.validate_choice(wake, parsed)
+                         if self.projectdelve_client else "Controller unavailable")
             if error:
                 validation_state = "schema_invalid"
             else:
@@ -322,7 +332,12 @@ class ResidentRuntime:
                                      {"outputs": [output]}, output_schema([capability])))
                 state = "queued"
                 classification = None
-                if capability is None:
+                if output["type"] == "projectdelve_decision" and not game_wake:
+                    state, classification = "rejected_policy", "game_wake_required"
+                elif game_wake and (self.projectdelve_client is None
+                                    or not self.projectdelve_client.matches_transport(wake)):
+                    state, classification = "rejected_unavailable", "controller_binding_changed"
+                elif capability is None:
                     state, classification = "rejected_unavailable", "capability_revoked"
                 elif current_error:
                     state, classification = "rejected_policy", "current_policy_rejected"
@@ -333,6 +348,8 @@ class ResidentRuntime:
                         attention_used += 1
                 payload = {key: value for key, value in output.items()
                            if key not in {"type", "target"}}
+                if game_wake and output["type"] == "projectdelve_decision":
+                    payload["binding"] = dict(wake.payload["observation"]["binding"])
                 jobs.append({
                     "output_type": output["type"], "target": output.get("target"),
                     "payload": payload,
@@ -347,7 +364,7 @@ class ResidentRuntime:
                         else "pending_delivery" if state == "queued"
                         else state),
                     "suppress_failure_event": bool(
-                        wake is not None and wake.reason == "output_delivery_failed"),
+                        game_wake or (wake is not None and wake.reason == "output_delivery_failed")),
                 })
         receipt = self.store.persist_final_disposition(
             conversation_id, response_id, fingerprint, raw, normalized,
@@ -373,10 +390,44 @@ class ResidentRuntime:
         return receipt
 
 
+    def _ordinary_output_schema(self):
+        return output_schema([capability for capability in self._output_capabilities
+                              if capability.output_type != "projectdelve_decision"])
+
+    async def _dispatch_projectdelve(self, request):
+        output_id, attempt = request["id"], request["attempt_count"]
+        if self.projectdelve_client is None:
+            self.store.finish_output_attempt(output_id, attempt, "rejected_unavailable",
+                                             classification="controller_unavailable")
+            return
+        capability = self.projectdelve_client.output_capabilities[0]
+        if (request.get("route_identity") != capability.route_identity
+                or request.get("capability_fingerprint") != capability.fingerprint):
+            self.store.finish_output_attempt(output_id, attempt, "rejected_unavailable",
+                                             classification="controller_binding_changed")
+            return
+        try:
+            state = await self.projectdelve_client.deliver(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            state = "unknown"
+            self.store.save_observed_snapshot("projectdelve.delivery." + output_id,
+                {"status": "unknown", "binding": request["payload"]["binding"]})
+        # Poll receipts after uncertain sends; no generic delivery failure wake or
+        # model retry. Durable state distinguishes acknowledgement from execution.
+        self.store.finish_output_attempt(
+            output_id, attempt, state if state in {"applied", "rejected"} else "retry_wait",
+            classification=None if state in {"applied", "rejected"} else state,
+            retry_delay_seconds=2 if state not in {"applied", "rejected"} else None)
+
     async def dispatch_outputs_once(self) -> bool:
         request = self.store.claim_output_request()
         if request is None:
             return False
+        if request["output_type"] == "projectdelve_decision":
+            await self._dispatch_projectdelve(request)
+            return True
         output_id, attempt = request["id"], request["attempt_count"]
         self._emit("output.delivery_attempted", {
             "output_id": output_id, "output_type": request["output_type"],
@@ -468,9 +519,16 @@ class ResidentRuntime:
             if latest['status'] != 'returned' or not turn or turn['tool_calls']:
                 raise RuntimeError('Unfinished inference/tool loop; inspect or reset this disposable instance database')
             wake = WakeEvent(**json.loads(latest['wake_json']))
+            if wake.source == "projectdelve" and self.projectdelve_client is not None:
+                self.projectdelve_client.record_seen_session(wake)
             schema = json.loads(latest['schema_json'])
-            self._persist_disposition(turn['message'], latest['conversation_id'], turn['response_id'],
-                                      run_id=run_id, wake=wake, schema=schema)
+            try:
+                self._persist_disposition(turn['message'], latest['conversation_id'], turn['response_id'],
+                                          run_id=run_id, wake=wake, schema=schema)
+            except RuntimeError:
+                if wake.source == "projectdelve" and self.projectdelve_client is not None:
+                    await self.projectdelve_client.report_error(wake)
+                raise
             self.store.finish_run(run_id, 'completed', 0, len(run_steps),
                                   wake.payload.get('schedule_id') if wake.source == 'scheduler' else None,
                                   wake.payload.get('message_id') if wake.source == 'owner' else None)
@@ -497,6 +555,15 @@ class ResidentRuntime:
         completed = self.store.completed_event_run(event.id)
         if completed:
             return completed
+        game_wake = event.source == "projectdelve" and event.reason == "decision"
+        if event.source == "projectdelve" and (not game_wake or self.projectdelve_client is None):
+            return ""
+        # Dedicated game player's scheduler carries no match admission. Tactical
+        # context cannot wake inference outside a live, bound decision.
+        if self.projectdelve_client is not None and event.source == "scheduler":
+            return ""
+        if game_wake and self.store.projectdelve_finalized(event.id):
+            return ""
         if event.source == 'owner' and event.reason == 'owner_message':
             message_id = event.payload.get('message_id')
             if (self._owner_event_authorizations.get(event.id) == message_id
@@ -521,6 +588,11 @@ class ResidentRuntime:
             self._emit('wake.started', {'event_id': event.id, 'source': event.source,
                                        'reason': event.reason, 'payload': event.payload})
             context = self.context_builder.build(event)
+            if game_wake:
+                document = json.loads(context)
+                document["pending_intentions"] = []
+                document["wake_event"]["payload"] = {"observation": event.payload["observation"]}
+                context = json.dumps(document, ensure_ascii=False)
             realm_state = await self.realm_client.read({}) if self.realm_client else None
             if realm_state is not None:
                 document = json.loads(context)
@@ -543,14 +615,27 @@ class ResidentRuntime:
                 registry = ToolRegistry(self.store, self._capabilities, self._emit,
                                         current_run_id=run_id, owner_guidance_authorization=authorization)
                 instructions = self.context_builder.instructions(self.resident, self.owner, self._capabilities)
-                schema = self._output_schema
+                schema = (self.projectdelve_client.decision_schema(event) if game_wake
+                          else self._ordinary_output_schema())
+                if game_wake:
+                    # Admission is serialized with reset/completion by ProjectDelve,
+                    # immediately before the only inference call. A reset after
+                    # admission is in-flight work and cannot authorize a late choice.
+                    if not await self.projectdelve_client.admit(event):
+                        status = "completed"
+                        return run_id
+                    document = json.loads(context)
+                    document["wake_event"]["payload"] = {
+                        "observation": event.payload["observation"],
+                        "newSession": event.payload["newSession"]}
+                    context = json.dumps(document, ensure_ascii=False)
                 step_id = self.store.begin_response_step(run_id, self.conversation_id, round_number, event, schema)
                 calls += 1
                 operation = 'provider.tool_result_continuation' if results else 'provider.turn'
                 provider_started = time.monotonic()
                 emit_timeline(operation, 'started', round=round_number, tool_result_count=len(results))
                 try:
-                    turn = await self.provider.respond(context, registry.specs, results,
+                    turn = await self.provider.respond(context, [] if game_wake else registry.specs, results,
                                                        conversation_id=self.conversation_id,
                                                        instructions=instructions, output_schema=schema,
                                                        request_id=step_id)
@@ -568,6 +653,8 @@ class ResidentRuntime:
                 if not turn.response_id:
                     raise RuntimeError('Response returned no ID')
                 self.store.record_response(step_id, turn)
+                if game_wake:
+                    self.projectdelve_client.record_seen_session(event)
                 self._emit('model.responded', {'response_id': turn.response_id,
                     'tool_call_count': len(turn.tool_calls), 'has_message': bool(turn.message),
                     'input_tokens': turn.input_tokens, 'output_tokens': turn.output_tokens,
@@ -577,6 +664,10 @@ class ResidentRuntime:
                         'message': turn.message, 'tool_calls': [
                             {'id': call.id, 'name': call.name, 'arguments': call.arguments} for call in turn.tool_calls]},
                         conversation_id=self.conversation_id, response_id=turn.response_id)
+                if game_wake and turn.tool_calls:
+                    # Preserve the native interrupted-tool-loop checkpoint for
+                    # operator recovery; never execute or continue a game tool call.
+                    raise RuntimeError("ProjectDelve decisions do not permit model tools")
                 if not turn.tool_calls:
                     self._persist_disposition(turn.message, self.conversation_id, turn.response_id,
                                               run_id=run_id, wake=event, schema=schema)
@@ -613,9 +704,13 @@ class ResidentRuntime:
             status = 'completed'
             return run_id
         except (Exception, asyncio.CancelledError) as exc:
+            if game_wake:
+                await self.projectdelve_client.report_error(event)
             self._emit('wake.failed', {'error_type': type(exc).__name__, 'error': str(exc)})
             raise
         finally:
+            if game_wake:
+                self.projectdelve_client.release_queued(event)
             duration = time.monotonic() - started
             self._emit("wake.finished", {
                 "status": status, "duration_seconds": duration, "model_calls": calls,

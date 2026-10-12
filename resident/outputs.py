@@ -113,6 +113,8 @@ def validate_disposition(value: Any, schema: dict[str, Any]) -> str | None:
     outputs = value["outputs"]
     if not isinstance(outputs, list):
         return "Final disposition outputs must be an array"
+    if len(outputs) < schema["properties"]["outputs"].get("minItems", 0):
+        return "Final disposition has too few outputs"
     if len(outputs) > schema["properties"]["outputs"]["maxItems"]:
         return "Final disposition has too many outputs"
     branches = schema["properties"]["outputs"]["items"]["anyOf"]
@@ -134,9 +136,15 @@ def _validate_object(value: Any, schema: dict[str, Any]) -> str | None:
     for key, item in value.items():
         constraint = properties[key]
         expected = constraint.get("type")
-        if expected == "string" and not isinstance(item, str):
-            return "wrong type"
-        if expected == "integer" and (not isinstance(item, int) or isinstance(item, bool)):
+        types = expected if isinstance(expected, list) else [expected]
+        matches = {
+            "string": isinstance(item, str), "null": item is None,
+            "integer": isinstance(item, int) and not isinstance(item, bool),
+            "number": isinstance(item, (int, float)) and not isinstance(item, bool),
+            "boolean": isinstance(item, bool), "object": isinstance(item, dict),
+            "array": isinstance(item, list),
+        }
+        if expected is not None and not any(matches.get(kind, False) for kind in types):
             return "wrong type"
         if "enum" in constraint and item not in constraint["enum"]:
             return "enum mismatch"

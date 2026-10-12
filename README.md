@@ -202,3 +202,68 @@ Run the deterministic offline lifecycle suite without credentials:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+
+## Gambit: ProjectDelve player
+
+Gambit is a persistent instance for one actual ProjectDelve Side against one
+human, hosted alongside the other configured Residents. The enabled
+`residents/gambit.yaml` uses `gpt-5.6-luna` with `medium` reasoning; these settings
+are independent of every other instance. From this repository, with
+`OPENAI_API_KEY` and `PROJECTDELVE_GAMBIT_TOKEN` set, run the normal catalog:
+
+```powershell
+python -m resident --residents-dir residents --default-resident watcher --data-dir .resident
+```
+
+The workspace `bq.ps1 start resident` loads local DPAPI-protected credentials
+through `.bq/gambit/start-resident.ps1`, retaining the normal inherited catalog
+and default Resident. `bq.ps1 start projectdelve` loads the matching controller
+token. The browser never receives that secret. Keep
+`.resident/instances/gambit/resident.sqlite3` and its Conversation across decisions,
+resets and restarts; the existing Gambit state was moved here from the dedicated
+`.resident-gambit` data directory. Do not start another host over this database.
+Definition changes apply at startup. `examples/gambit/` remains a standalone
+example for a separately configured environment; it must not run alongside this
+local Gambit instance.
+
+Select Gambit for either scenario Side in browser setup and Human for its opponent.
+ProjectDelve resolves Gambit's dice and genuinely forced choices, supplies every
+legal alternative and committed rules event, and keeps Start Next Round manual.
+The player receives a detached private observation and its own objective/status.
+Commentary is optional browser-visible presentation from all players, shown with
+the off-by-default **Show decision commentary** toggle and synchronized with event
+playback. It must never contain private chain-of-thought. Opponent commentary is
+excluded by ProjectDelve before Resident receives input.
+
+Game decisions use exactly one native `projectdelve_decision` output with exact
+`candidateKey` (nullable only for authorized decline) and nullable `commentary`
+(up to 280 characters). They expose no tools. Owner wakes cannot produce this
+output, scheduled wakes cannot authorize game inference, and pending intentions
+are excluded from game context. New sessions are explicit while the persistent
+Conversation remains intact; rebinding one session to the opposing Side is refused.
+
+The runtime admits each immutable binding immediately before inference, finalizes
+the model response and bound output atomically, then submits with the persisted
+output ID. It records the send boundary before transmission. Receipt-read failures
+before that boundary can recover; uncertain delivery after it only reconciles the
+original ID. There is no new model call after submission, delivery-failure model
+wake, guessed fallback, or blind inference retry. A missing/expired receipt means
+unknown outcome. Local `output_requests.delivery_state`,
+`last_failure_classification` and observed snapshots named
+`projectdelve.delivery.<output-id>` expose queued/applied/rejected/unknown state in
+the instance SQLite database for operator inspection. Receipt polling itself
+continues without inference. Applied/rejected receipts terminate delivery.
+
+Invalid final output pauses the browser boundary for explicit Retry/Cancel; Retry
+creates a fresh attempt rather than reusing the old model output. A locally recorded
+tool-free final response can be finalized after restart without inference. An
+ambiguous inference POST or interrupted model tool loop retains existing operator
+recovery blocking: inspect the checkpoint; browser Retry does not repair it. Do not
+delete the persistent database to disguise unknown inference/delivery outcomes.
+Reset/cancel/completion invalidate old bindings and late choices. Already admitted
+inference may finish, but its answer cannot mutate an invalidated session.
+
+Focused automated acceptance uses fake providers and loopback services. Local
+playtesting uses the normal Resident service and ProjectDelve browser; real model
+acceptance requires the configured credentials and an explicit game session.

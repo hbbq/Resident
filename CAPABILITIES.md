@@ -18,7 +18,7 @@ A Resident definition grants connector IDs or individual tool names in `capabili
 
 ## Always-present built-in tools
 
-These are runtime tools, not `capabilities` grants.
+These are runtime tools, not `capabilities` grants. ProjectDelve game decision wakes expose no tools.
 
 | Tool | Availability |
 | --- | --- |
@@ -36,6 +36,7 @@ These are runtime tools, not `capabilities` grants.
 | --- | --- |
 | `display/<display-id>` | Grant outputs: [display/<display-id>]; configure RESIDENT_DISPLAYS and RESIDENT_HOMEOPS_URL. Each target must exist and have a HomeOps display route. |
 | `notify_owner` | Grant outputs: [notify_owner]; use the default terminal Resident or configure an Owner Telegram transport with token_env, owner_user_id_env, and owner_chat_id_env. Requires an available Owner route. |
+| `projectdelve_decision` | Grant only to the dedicated gambit instance with a projectdelve block (base_url, bearer_token_env, binding_id: gambit). Private polling delivers decisions; game wakes have exactly one legal output and no tools. Delivery reconciles durable output IDs; no model failure wakes. |
 
 ## Subscriptions
 

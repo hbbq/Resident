@@ -11,6 +11,7 @@ from .config import Config
 from .display import DisplayConnector
 from .external_app import ExternalApplicationConnector
 from .realm import RealmClient
+from .projectdelve import ProjectDelveConnector
 from .homeops import HomeOpsConnector
 from .host import InstancePolicy, RuntimeHost, messaging_capability
 from .instances import (ResidentDefinition, load_resident_catalog,
@@ -233,8 +234,18 @@ def build_host(config: Config) -> RuntimeHost:
                     f"Duplicate available capability names for {definition.id}: "
                     f"{', '.join(duplicate_names)}")
             grants = _select_capabilities(definition.capabilities, instance_available)
+            projectdelve_client = None
+            instance_outputs = list(available_outputs)
+            if definition.projectdelve is not None:
+                item = definition.projectdelve
+                projectdelve_client = ProjectDelveConnector(
+                    item.base_url, resolve_environment(item.bearer_token_env),
+                    binding_id=item.binding_id, poll_seconds=item.poll_seconds,
+                    request_timeout_seconds=item.request_timeout_seconds)
+                instance_outputs.extend(projectdelve_client.output_capabilities)
+                private_producers.setdefault(definition.id, []).append(projectdelve_client)
             output_grants, owner_output_enabled = _select_outputs(
-                definition.id, definition.outputs, available_outputs,
+                definition.id, definition.outputs, instance_outputs,
                 owner_available=(
                     definition.owner_transport is not None
                     or definition.id == catalog.default_id))
@@ -243,6 +254,7 @@ def build_host(config: Config) -> RuntimeHost:
             runtime = ResidentRuntime(
                 instance_config, _provider(definition), capabilities=grants,
                 realm_client=realm_client,
+                projectdelve_client=projectdelve_client,
                 output_capabilities=output_grants,
                 owner_transport=transport,
                 owner_output_enabled=owner_output_enabled,
