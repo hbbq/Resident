@@ -12,6 +12,7 @@ from .mailbox import DEFAULT_TTL_SECONDS, Mailbox
 from .observability import EventLoopLagProbe, ObservedQueue, timeline_reporter
 from .readiness import ReadinessItem, ReadinessResult
 from .runtime import EventProducer, ResidentRuntime
+from .terminal import read_input
 from .store import utc_now
 
 
@@ -245,7 +246,7 @@ class RuntimeHost:
             runtime = self.runtimes[self.default_id]
             while not stop.is_set():
                 try:
-                    text = await asyncio.to_thread(input, f"{runtime.owner.address_name}> ")
+                    text = await read_input(f"{runtime.owner.address_name}> ")
                 except (EOFError, KeyboardInterrupt):
                     text = "/quit"
                 if text.strip() == "/quit":

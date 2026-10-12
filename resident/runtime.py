@@ -20,6 +20,7 @@ from .observability import EventLoopLagProbe, ObservedQueue, emit_timeline, time
 from .outputs import (OutputCapability, capability_for_output, output_schema,
                       schema_fingerprint, validate_disposition)
 from .readiness import ReadinessItem, ReadinessResult
+from .terminal import read_input
 from .store import Store, utc_now
 from .tools import CORE_TOOL_NAMES, OwnerGuidanceAuthorization, ToolRegistry
 
@@ -743,7 +744,7 @@ class ResidentRuntime:
         async def terminal_input() -> None:
             while not stop.is_set():
                 try:
-                    text = await asyncio.to_thread(input, f"{self.owner.address_name}> ")
+                    text = await read_input(f"{self.owner.address_name}> ")
                 except (EOFError, KeyboardInterrupt):
                     if self._remote_owner_transport:
                         return

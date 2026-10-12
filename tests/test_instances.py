@@ -503,7 +503,7 @@ class RuntimeHostTests(unittest.IsolatedAsyncioTestCase):
         self.host.event_producers = (producer,)
         self.host.diagnostic_output = output.append
         terminal = AsyncMock(return_value="/quit")
-        with patch("resident.host.asyncio.to_thread", new=terminal):
+        with patch("resident.host.read_input", new=terminal):
             run = asyncio.create_task(self.host.run())
             await producer.started.wait()
             await asyncio.sleep(0)

@@ -669,7 +669,7 @@ class TelegramRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 event_producers=[StopAfterTerminalCloses()], owner_output=lambda _: None,
                 diagnostic_output=lambda _: None,
             )
-            with patch("resident.runtime.asyncio.to_thread", new=closed_terminal):
+            with patch("resident.runtime.read_input", new=closed_terminal):
                 await runtime.run_interactive()
 
             self.assertEqual([True], remained_running)

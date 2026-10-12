@@ -342,7 +342,7 @@ class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
             inputs = AsyncMock(side_effect=["hello", "/quit"])
             fast_probe = lambda observers: EventLoopLagProbe(observers, interval=0.001)
-            with (patch("resident.runtime.asyncio.to_thread", inputs),
+            with (patch("resident.runtime.read_input", inputs),
                   patch("resident.runtime.EventLoopLagProbe", fast_probe)):
                 await runtime.run_interactive()
 
@@ -362,7 +362,7 @@ class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 Config(Path(temporary)), IdleProvider(), event_producers=[producer],
                 owner_output=lambda _: None, diagnostic_output=lambda _: None,
             )
-            with patch("resident.runtime.asyncio.to_thread", AsyncMock(return_value="/quit")):
+            with patch("resident.runtime.read_input", AsyncMock(return_value="/quit")):
                 await runtime.run_interactive()
 
             self.assertTrue(producer.started)
@@ -378,7 +378,7 @@ class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     ReadinessProducer("second", "Second", False),
                 ], owner_output=lambda _: None, diagnostic_output=output.append,
             )
-            with patch("resident.runtime.asyncio.to_thread", AsyncMock(return_value="/quit")):
+            with patch("resident.runtime.read_input", AsyncMock(return_value="/quit")):
                 await runtime.run_interactive()
 
             self.assertEqual("First............... OK", output[0])
@@ -395,7 +395,7 @@ class EventProducerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 event_producers=[ReadinessProducer("early", "Early")],
                 owner_output=lambda _: None, diagnostic_output=output.append,
             )
-            with patch("resident.runtime.asyncio.to_thread", AsyncMock(return_value="/quit")):
+            with patch("resident.runtime.read_input", AsyncMock(return_value="/quit")):
                 await runtime.run_interactive()
 
             self.assertEqual("Early............... FAILED", output[0])
