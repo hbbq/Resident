@@ -202,6 +202,21 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(diagnostics[0].startswith("wake.failed "))
             runtime.close()
 
+    async def test_ordinary_wake_context_keeps_default_json_serialization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = MessageOnlyProvider()
+            runtime = ResidentRuntime(
+                Config(Path(temporary)), provider,
+                owner_output=lambda _: None, diagnostic_output=lambda _: None)
+
+            await runtime.process(WakeEvent(
+                "event", "scheduler", "scheduled", utc_now(), {"value": "unchanged"}))
+
+            context = provider.requests[0]["context"]
+            self.assertEqual(json.dumps(json.loads(context), ensure_ascii=False), context)
+            self.assertIn('"pending_intentions": ', context)
+            runtime.close()
+
     async def test_scheduled_wakeup_survives_restart_and_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Config(Path(temporary))

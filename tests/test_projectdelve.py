@@ -125,6 +125,21 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         await self.connector.poll_once(queue)
         self.assertTrue(queue.empty())
 
+    async def test_model_context_uses_compact_json_without_changing_observation(self):
+        event = await self.event()
+        expected = copy.deepcopy(event.payload["observation"])
+
+        await self.runtime.process(event)
+
+        context = self.provider.requests[0]["context"]
+        decoded = json.loads(context)
+        self.assertEqual(
+            json.dumps(decoded, ensure_ascii=False, separators=(",", ":")),
+            context)
+        self.assertEqual(
+            expected,
+            decoded["wake_event"]["payload"]["observation"])
+
     async def test_exactly_one_nullable_choice_and_commentary_are_validated(self):
         event = await self.event()
         schema = self.connector.decision_schema(event)

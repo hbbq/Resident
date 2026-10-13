@@ -597,7 +597,7 @@ class ResidentRuntime:
                 document = json.loads(context)
                 document["pending_intentions"] = []
                 document["wake_event"]["payload"] = {"observation": event.payload["observation"]}
-                context = json.dumps(document, ensure_ascii=False)
+                context = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
             realm_state = await self.realm_client.read({}) if self.realm_client else None
             if realm_state is not None:
                 document = json.loads(context)
@@ -633,7 +633,7 @@ class ResidentRuntime:
                     document["wake_event"]["payload"] = {
                         "observation": event.payload["observation"],
                         "newSession": event.payload["newSession"]}
-                    context = json.dumps(document, ensure_ascii=False)
+                    context = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
                 step_id = self.store.begin_response_step(run_id, self.conversation_id, round_number, event, schema)
                 calls += 1
                 operation = 'provider.tool_result_continuation' if results else 'provider.turn'
