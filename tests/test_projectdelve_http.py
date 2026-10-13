@@ -56,6 +56,7 @@ class LegalProvider:
             selected = selected or next((c for c in candidates if c["kind"] == "Stay"), candidates[0])
         return ModelTurn(self.conversation + "-response-" + str(len(self.contexts)), json.dumps({"outputs": [{
             "type": "projectdelve_decision", "candidateKey": selected["key"],
+            "activationControl": "Direct",
             "commentary": "GAMBIT_PRIVATE_HTTP_MARKER"}]}))
 
 

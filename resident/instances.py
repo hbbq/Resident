@@ -469,7 +469,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
             raise ValueError("Unknown ProjectDelve configuration fields")
         binding_id = _string(item.get("binding_id", "gambit"), "projectdelve.binding_id")
         if binding_id != "gambit" or resident_id != "gambit":
-            raise ValueError("ProjectDelve v2 requires the dedicated gambit instance/binding")
+            raise ValueError("ProjectDelve v3 requires the dedicated gambit instance/binding")
         if (realm is not None or data.get("external_applications") or
                 any(selector != "messaging" for selector in subscriptions)):
             raise ValueError(

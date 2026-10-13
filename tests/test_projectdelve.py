@@ -19,14 +19,17 @@ from runtime_support import RecordingProvider
 
 
 def observation():
-    return {"schemaVersion": 2, "binding": {"sessionId": "session", "bindingId": "gambit",
+    return {"schemaVersion": 3, "binding": {"sessionId": "session", "bindingId": "gambit",
         "sideId": "blue", "decisionId": "decision", "revision": 7, "attemptId": "attempt",
         "cursorStart": 2, "cursorEnd": 8}, "objective": {"sideId": "blue", "objective": "EliminateEnemies"},
         "status": "waiting-external", "completion": None,
-        "request": {"typeId": "Shaman", "unitId": "shaman",
+        "request": {"kind": "Activation", "typeId": "Shaman", "unitId": "shaman",
                     "candidates": [{"key": "move-a"}, {"key": "end-turn"}], "allowsNone": True},
-        "events": [{"type": "Moved"}], "observation": {"state": {"round": 1}, "units": [
+        "defaultBehaviorPreviews": [],
+        "events": [{"type": "Moved"}], "observation": {"state": {"round": 1},
+        "activation": {"currentUnitId": "other"}, "units": [
             {"id": "shaman", "typeId": "Shaman", "sideId": "blue", "agency": "Direct"},
+            {"id": "shaman-two", "typeId": "Shaman", "sideId": "blue", "agency": "Direct"},
             {"id": "goblin", "typeId": "Goblin", "sideId": "blue", "agency": "Allied"},
             {"id": "grunt", "typeId": "Grunt", "sideId": "red", "agency": "Hostile"},
         ]}}
@@ -50,7 +53,7 @@ class FakeConnector(ProjectDelveConnector):
             raise OSError("unavailable")
         if route == "/status":
             completed = self.observation["completion"] is not None
-            return {"schemaVersion": 2, "sessionId": self.observation["binding"]["sessionId"],
+            return {"schemaVersion": 3, "sessionId": self.observation["binding"]["sessionId"],
                     "bindingId": "gambit", "sideId": self.observation["binding"]["sideId"],
                     "status": "completed" if completed else "waiting-external",
                     "completion": self.observation["completion"],
@@ -81,8 +84,9 @@ class FakeConnector(ProjectDelveConnector):
         raise AssertionError(route)
 
 
-def choice(key="move-a", commentary=None):
+def choice(key="move-a", commentary=None, activation_control="Direct"):
     return json.dumps({"outputs": [{"type": "projectdelve_decision", "candidateKey": key,
+                                   "activationControl": activation_control,
                                    "commentary": commentary}]})
 
 
@@ -131,6 +135,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("applied", self.output()["delivery_state"])
         sent = next(payload for route, payload in self.connector.requests if route == "/selection")
         self.assertEqual(original, sent["binding"])
+        self.assertEqual("Direct", sent["activationControl"])
         self.assertEqual(1, len(self.provider.requests))
         queue = asyncio.Queue()
         await self.connector.poll_once(queue)
@@ -148,7 +153,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("reflection", event.reason)
         self.assertTrue(event.id.startswith("projectdelve:reflection:"))
         self.assertEqual({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "sessionId": "session",
             "sideId": "blue",
             "objective": {"sideId": "blue", "objective": "EliminateEnemies"},
@@ -158,7 +163,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(queue.empty())
 
     async def test_human_only_completion_without_gambit_side_is_ignored(self):
-        status = {"schemaVersion": 2, "sessionId": "human-session", "bindingId": "gambit",
+        status = {"schemaVersion": 3, "sessionId": "human-session", "bindingId": "gambit",
                   "sideId": None, "status": "completed", "completion": {"achievedSideIds": ["blue"]},
                   "request": None, "objective": None}
         self.connector._http = AsyncMock(return_value=status)
@@ -227,10 +232,13 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         event = await self.event()
         schema = self.connector.decision_schema(event)
         key_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
+        control_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["activationControl"]
         self.assertEqual(["move-a", "end-turn", None], key_schema["enum"])
+        self.assertEqual(["Direct"], control_schema["enum"])
         for invalid in ({"outputs": []}, {"outputs": [json.loads(choice())["outputs"][0]] * 2},
                         json.loads(choice(123)),
-                        json.loads(choice("move-a", {})), json.loads(choice("move-a", "x" * 281))):
+                        json.loads(choice("move-a", {})), json.loads(choice("move-a", "x" * 281)),
+                        json.loads(choice("move-a", activation_control="Delegate"))):
             self.assertIsNotNone(validate_disposition(invalid, schema))
         self.assertIsNotNone(self.connector.validate_choice(event, json.loads(choice("invented"))))
         self.assertIsNone(self.connector.validate_choice(event, json.loads(choice("move-a"))))
@@ -241,6 +249,104 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["move-a", "end-turn"], required_key_schema["enum"])
         self.assertIsNotNone(validate_disposition(json.loads(choice(None)), required_schema))
         self.assertIsNone(validate_disposition(json.loads(choice("move-a", "optional note")), required_schema))
+
+    async def test_select_unit_allows_delegation_and_validates_advisory_previews(self):
+        self.connector.observation["request"] = {
+            "kind": "SelectUnit", "typeId": "Shaman", "unitId": None,
+            "candidates": [{"key": "shaman"}, {"key": "shaman-two"}], "allowsNone": False,
+        }
+        preview = {"unitId": "shaman", "advisory": True, "steps": [
+            {"decisionKind": "Activation", "candidateKey": "stay",
+             "intendedAction": "Stay in place"},
+            {"decisionKind": "Activation", "candidateKey": "attack:grunt",
+             "intendedAction": "Attack grunt"},
+        ], "stopReason": "DiceRequired"}
+        second_preview = {"unitId": "shaman-two", "advisory": True, "steps": [],
+                          "stopReason": "NoDecision"}
+        self.connector.observation["defaultBehaviorPreviews"] = [preview, second_preview]
+        event = await self.event()
+        schema = self.connector.decision_schema(event)
+        control = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["activationControl"]
+        self.assertEqual(["Direct", "Delegate"], control["enum"])
+        delegated = json.loads(choice("shaman", "I trust its instincts here.", "Delegate"))
+        self.assertIsNone(validate_disposition(delegated, schema))
+        self.assertIsNone(self.connector.validate_choice(event, delegated))
+        self.assertEqual("Delegation requires selecting a Unit", self.connector.validate_choice(
+            event, json.loads(choice(None, activation_control="Delegate"))))
+
+        valid = copy.deepcopy(self.connector.observation)
+        for mutate in (
+            lambda value: value.pop("defaultBehaviorPreviews"),
+            lambda value: value["defaultBehaviorPreviews"][0].update(advisory=False),
+            lambda value: value["defaultBehaviorPreviews"][0].update(stopReason="Invented"),
+            lambda value: value["defaultBehaviorPreviews"][0].update(stopReason=[]),
+            lambda value: value["defaultBehaviorPreviews"][0]["steps"][0].update(decisionKind={}),
+            lambda value: value["defaultBehaviorPreviews"][0]["steps"][0].update(intendedAction=""),
+            lambda value: value["defaultBehaviorPreviews"][0].update(unitId="other"),
+        ):
+            with self.subTest(mutate=mutate):
+                malformed = copy.deepcopy(valid)
+                mutate(malformed)
+                with self.assertRaisesRegex(ValueError, "Behavior previews"):
+                    self.connector.decision_schema(WakeEvent(
+                        "malformed", "projectdelve", "decision", utc_now(),
+                        {"observation": malformed}))
+
+    async def test_delegation_is_forwarded_once_with_the_trusted_binding(self):
+        self.connector.observation["request"] = {
+            "kind": "SelectUnit", "typeId": "Shaman", "unitId": None,
+            "candidates": [{"key": "shaman"}, {"key": "shaman-two"}], "allowsNone": False,
+        }
+        self.connector.observation["defaultBehaviorPreviews"] = [
+            {"unitId": unit_id, "advisory": True, "steps": [], "stopReason": "NoDecision"}
+            for unit_id in ("shaman", "shaman-two")]
+        original = copy.deepcopy(self.connector.observation["binding"])
+        self.provider.messages = [choice("shaman", "I delegate this activation.", "Delegate")]
+
+        await self.runtime.process(await self.event())
+        await self.force_dispatch()
+
+        sent = next(payload for route, payload in self.connector.requests if route == "/selection")
+        self.assertEqual("Delegate", sent["activationControl"])
+        self.assertEqual("shaman", sent["candidateKey"])
+        self.assertEqual(original, sent["binding"])
+        self.assertEqual(1, len(self.provider.requests))
+        self.assertEqual(1, sum(route == "/selection" for route, _ in self.connector.requests))
+
+    async def test_active_unit_multi_choice_allows_only_null_key_delegation(self):
+        self.connector.observation["observation"]["activation"]["currentUnitId"] = "shaman"
+        self.connector.observation["request"]["allowsNone"] = False
+        self.connector.observation["defaultBehaviorPreviews"] = [{
+            "unitId": "shaman", "advisory": True, "steps": [{
+                "decisionKind": "Activation", "candidateKey": "move-a",
+                "intendedAction": "Move toward the enemy",
+            }], "stopReason": "StepLimit",
+        }]
+        event = await self.event()
+        schema = self.connector.decision_schema(event)
+        properties = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]
+        self.assertEqual(["Direct", "Delegate"], properties["activationControl"]["enum"])
+        self.assertIn(None, properties["candidateKey"]["enum"])
+        delegated = json.loads(choice(None, "I leave the rest to its instincts.", "Delegate"))
+        self.assertIsNone(validate_disposition(delegated, schema))
+        self.assertIsNone(self.connector.validate_choice(event, delegated))
+        self.assertEqual("Mid-activation delegation requires a null candidate key",
+                         self.connector.validate_choice(
+                             event, json.loads(choice("move-a", activation_control="Delegate"))))
+        invalid_control = json.loads(choice("move-a"))
+        invalid_control["outputs"][0]["activationControl"] = []
+        self.assertEqual("Activation control is not valid",
+                         self.connector.validate_choice(event, invalid_control))
+        self.assertEqual("Decline is not legal", self.connector.validate_choice(
+            event, json.loads(choice(None, activation_control="Direct"))))
+        self.assertIsNone(self.connector.validate_choice(
+            event, json.loads(choice("move-a", activation_control="Direct"))))
+        event.payload["observation"]["request"]["candidates"] = [
+            {"key": "candidate-" + str(index)} for index in range(1500)]
+        large_schema = self.connector.decision_schema(event)
+        large_key = large_schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
+        self.assertNotIn("enum", large_key)
+        self.assertEqual(["string", "null"], large_key["type"])
 
     async def test_conversation_and_strategic_identity_survive_new_session(self):
         await self.runtime.process(await self.event())
@@ -273,7 +379,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_status_fails_closed(self):
         for malformed in (None, {}, {"schemaVersion": True, "status": "waiting-external", "request": None, "completion": None},
-                          {"schemaVersion": 2, "status": "waiting-external", "request": None}):
+                          {"schemaVersion": 3, "status": "waiting-external", "request": None}):
             with self.assertRaisesRegex(ValueError, "Malformed ProjectDelve status"):
                 self.connector.validate_status(malformed)
         self.assertEqual([], self.provider.requests)
@@ -288,12 +394,12 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "decline permission"):
             await self.event()
 
-    async def test_v2_requires_complete_and_consistent_relative_unit_agency(self):
+    async def test_v3_requires_complete_and_consistent_relative_unit_agency(self):
         for mutate, message in (
             (lambda units: units[0].pop("agency"), "unit agency"),
             (lambda units: units[0].update(agency="Human"), "unit agency"),
-            (lambda units: units[1].update(sideId="red"), "Inconsistent"),
-            (lambda units: units[2].update(agency="Allied"), "Inconsistent"),
+            (lambda units: units[2].update(sideId="red"), "Inconsistent"),
+            (lambda units: units[3].update(agency="Allied"), "Inconsistent"),
             (lambda units: units[0].update(agency="Allied"), "request agency"),
         ):
             with self.subTest(message=message):
@@ -593,6 +699,11 @@ class ProjectDelveDefinitionTests(unittest.TestCase):
         self.assertIn("Allied Units share your Side but belong", definition.personality)
         self.assertIn("cooperate with them tactically but never choose or command", definition.personality)
         self.assertIn("summoner", definition.personality)
+        self.assertIn("activationControl to Direct", definition.personality)
+        self.assertIn("Delegate", definition.personality)
+        self.assertIn("read-only advisory", definition.personality)
+        self.assertIn("recomputes legal choices", definition.personality)
+        self.assertIn("or delegate an activation", definition.personality)
         normal = load_resident_catalog(root / "residents", prompt_root=root / "prompts", default_id="watcher")
         self.assertEqual("watcher", normal.default_id)
         self.assertIn("gambit", [entry.id for entry in normal.residents])
@@ -658,7 +769,7 @@ class ProjectDelveHTTPTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.2)
         if route == "/status":
             completed = self.current["completion"] is not None
-            return self.web.json_response({"schemaVersion": 2,
+            return self.web.json_response({"schemaVersion": 3,
                 "sessionId": self.current["binding"]["sessionId"], "bindingId": "gambit",
                 "sideId": self.current["binding"]["sideId"],
                 "status": "completed" if completed else "waiting-external",

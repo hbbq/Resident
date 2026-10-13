@@ -21,6 +21,10 @@ MAX_OBSERVATION_BYTES = 8 * 1024 * 1024
 # large ProjectDelve candidate sets to use the existing local legality check.
 MAX_CANDIDATE_ENUM_VALUES = 250
 MAX_CANDIDATE_ENUM_UTF8_BYTES = 7_500
+DECISION_KINDS = frozenset({"SelectUnit", "Activation", "Move", "Act", "Cleave", "RollDice"})
+PREVIEW_STOP_REASONS = frozenset({"DiceRequired", "OtherControllerDecision",
+                                  "ActivationCompleted", "StepLimit",
+                                  "UnexpectedRandomness", "NoDecision"})
 
 
 class ProjectDelveConnector:
@@ -31,7 +35,7 @@ class ProjectDelveConnector:
                 or url.password or url.query or url.fragment):
             raise ValueError("ProjectDelve requires an absolute HTTP(S) service URL")
         if binding_id != "gambit":
-            raise ValueError("ProjectDelve v2 supports only the gambit binding")
+            raise ValueError("ProjectDelve v3 supports only the gambit binding")
         if not bearer_token:
             raise ValueError("ProjectDelve controller token is required")
         self.base_url = base_url.rstrip("/")
@@ -74,8 +78,10 @@ class ProjectDelveConnector:
             description="Choose exactly one supplied legal ProjectDelve candidate or authorized decline.",
             payload_schema={"type": "object", "properties": {
                 "candidateKey": {"type": ["string", "null"]},
+                "activationControl": {"type": "string", "enum": ["Direct", "Delegate"]},
                 "commentary": {"type": ["string", "null"], "maxLength": 280}},
-                "required": ["candidateKey", "commentary"], "additionalProperties": False},
+                "required": ["candidateKey", "activationControl", "commentary"],
+                "additionalProperties": False},
             route_identity=self.base_url + "/controllers/" + self.binding_id,
             handler=forbidden, delivery_policy=DeliveryPolicy(max_attempts=2147483647))]
 
@@ -96,7 +102,7 @@ class ProjectDelveConnector:
     def decision_schema(self, event):
         observation = event.payload["observation"]
         self.validate_binding(observation["binding"])
-        if (type(observation.get("schemaVersion")) is not int or observation["schemaVersion"] != 2
+        if (type(observation.get("schemaVersion")) is not int or observation["schemaVersion"] != 3
                 or observation.get("completion") is not None or observation.get("status") != "waiting-external"):
             raise ValueError("Unsupported or completed ProjectDelve decision")
         objective = observation.get("objective")
@@ -107,25 +113,88 @@ class ProjectDelveConnector:
             raise ValueError("Malformed ProjectDelve player observation")
         request = observation["request"]
         self._validate_unit_agency(observation["observation"], observation["binding"]["sideId"], request)
+        eligible = self._delegation_eligible(observation["observation"], request)
+        self._validate_previews(observation.get("defaultBehaviorPreviews"), request, eligible)
         candidates = request["candidates"]
         keys = [candidate["key"] for candidate in candidates]
         if not all(isinstance(key, str) and key for key in keys) or len(keys) != len(set(keys)):
             raise ValueError("Malformed ProjectDelve candidate keys")
         if not isinstance(request["allowsNone"], bool):
             raise ValueError("Malformed ProjectDelve decline permission")
-        if request["allowsNone"]:
+        if request["allowsNone"] or (eligible and request.get("kind") != "SelectUnit"):
             keys.append(None)
         if not keys:
             raise ValueError("ProjectDelve decision has no legal choice")
         schema = output_schema(self.output_capabilities)
         schema["properties"]["outputs"].update(minItems=1, maxItems=1)
         key_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
+        control_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["activationControl"]
+        if not eligible:
+            control_schema["enum"] = ["Direct"]
         enum_bytes = sum(len(key.encode("utf-8")) for key in keys if key is not None)
         if len(keys) <= MAX_CANDIDATE_ENUM_VALUES and enum_bytes <= MAX_CANDIDATE_ENUM_UTF8_BYTES:
             key_schema["enum"] = keys
-        elif not request["allowsNone"]:
+        elif (not request["allowsNone"]
+              and not (eligible and request.get("kind") != "SelectUnit")):
             key_schema["type"] = "string"
         return schema
+
+    @staticmethod
+    def _delegation_eligible(player_observation, request):
+        if not isinstance(request, dict) or request.get("kind") == "RollDice":
+            return False
+        candidates = request.get("candidates")
+        if (not isinstance(candidates, list)
+                or len(candidates) + (request.get("allowsNone") is True) <= 1):
+            return False
+        if request.get("kind") == "SelectUnit":
+            return True
+        activation = player_observation.get("activation") if isinstance(player_observation, dict) else None
+        return (isinstance(activation, dict)
+                and isinstance(request.get("unitId"), str) and bool(request["unitId"])
+                and activation.get("currentUnitId") == request["unitId"])
+
+    @staticmethod
+    def _validate_previews(previews, request, eligible):
+        if not isinstance(previews, list) or not isinstance(request, dict):
+            raise ValueError("Malformed ProjectDelve Default Behavior previews")
+        select_unit = request.get("kind") == "SelectUnit"
+        candidates = request.get("candidates")
+        if not isinstance(candidates, list):
+            raise ValueError("Malformed ProjectDelve Default Behavior previews")
+        if select_unit and eligible:
+            expected_unit_ids = {candidate.get("key") for candidate in candidates
+                                 if isinstance(candidate, dict)}
+        elif eligible:
+            expected_unit_ids = {request.get("unitId")}
+        else:
+            expected_unit_ids = set()
+        unit_ids = []
+        for preview in previews:
+            if not isinstance(preview, dict) or set(preview) != {
+                    "unitId", "advisory", "steps", "stopReason"}:
+                raise ValueError("Malformed ProjectDelve Default Behavior previews")
+            unit_id, steps = preview["unitId"], preview["steps"]
+            if (not isinstance(unit_id, str) or not unit_id or preview["advisory"] is not True
+                    or not isinstance(steps, list)
+                    or not isinstance(preview["stopReason"], str)
+                    or preview["stopReason"] not in PREVIEW_STOP_REASONS):
+                raise ValueError("Malformed ProjectDelve Default Behavior previews")
+            unit_ids.append(unit_id)
+            for step in steps:
+                if not isinstance(step, dict) or set(step) != {
+                        "decisionKind", "candidateKey", "intendedAction"}:
+                    raise ValueError("Malformed ProjectDelve Default Behavior previews")
+                if (not isinstance(step["decisionKind"], str)
+                        or step["decisionKind"] not in DECISION_KINDS
+                        or (step["candidateKey"] is not None
+                            and (not isinstance(step["candidateKey"], str)
+                                 or not step["candidateKey"]))
+                        or not isinstance(step["intendedAction"], str)
+                        or not step["intendedAction"]):
+                    raise ValueError("Malformed ProjectDelve Default Behavior previews")
+        if len(unit_ids) != len(set(unit_ids)) or set(unit_ids) != expected_unit_ids:
+            raise ValueError("Inconsistent ProjectDelve Default Behavior previews")
 
     @staticmethod
     def _validate_unit_agency(player_observation, bound_side_id, request):
@@ -163,7 +232,14 @@ class ProjectDelveConnector:
         # Legality is checked against the immutable observation without enlarging
         # the provider's schema with arbitrarily many exact candidate strings.
         request = event.payload["observation"]["request"]
+        player_observation = event.payload["observation"]["observation"]
         output = disposition["outputs"][0]
+        control = output["activationControl"]
+        if not isinstance(control, str) or control not in {"Direct", "Delegate"}:
+            return "Activation control is not valid"
+        eligible = self._delegation_eligible(player_observation, request)
+        if control == "Delegate" and not eligible:
+            return "Delegation is not legal for this decision"
         commentary = output["commentary"]
         if commentary is not None:
             try:
@@ -173,7 +249,11 @@ class ProjectDelveConnector:
             if length > 280:
                 return "Commentary exceeds ProjectDelve's UTF-16 length limit"
         key = output["candidateKey"]
+        if control == "Delegate" and request.get("kind") != "SelectUnit":
+            return None if key is None else "Mid-activation delegation requires a null candidate key"
         if key is None:
+            if control == "Delegate":
+                return "Delegation requires selecting a Unit"
             return None if request["allowsNone"] else "Decline is not legal"
         if key not in {candidate["key"] for candidate in request["candidates"]}:
             return "Candidate key is not legal"
@@ -192,7 +272,7 @@ class ProjectDelveConnector:
 
     def validate_status(self, status):
         if (not isinstance(status, dict) or type(status.get("schemaVersion")) is not int
-                or status["schemaVersion"] != 2 or "completion" not in status or "request" not in status
+                or status["schemaVersion"] != 3 or "completion" not in status or "request" not in status
                 or not isinstance(status.get("status"), str)
                 or not isinstance(status.get("sessionId"), str) or not status["sessionId"]
                 or status.get("bindingId") != self.binding_id
@@ -234,7 +314,7 @@ class ProjectDelveConnector:
             if event_id in self._queued or self.store.completed_event_run(event_id):
                 return
             event = WakeEvent(event_id, "projectdelve", "reflection", utc_now(), {
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "sessionId": status["sessionId"],
                 "sideId": status["sideId"],
                 "objective": {"sideId": status["objective"]["sideId"],

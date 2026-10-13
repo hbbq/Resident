@@ -240,7 +240,8 @@ playback. It must never contain private chain-of-thought. Opponent commentary is
 excluded by ProjectDelve before Resident receives input.
 
 Game decisions use exactly one native `projectdelve_decision` output with exact
-`candidateKey` (nullable only for authorized decline) and nullable `commentary`
+`candidateKey` (nullable only for authorized decline), required `activationControl`
+(`Direct`, or `Delegate` at an offered Unit-activation boundary), and nullable `commentary`
 (up to 280 characters). They expose no tools. Owner wakes cannot produce this
 output, scheduled wakes cannot authorize game inference, and pending intentions
 are excluded from game context. New sessions are explicit while the persistent
