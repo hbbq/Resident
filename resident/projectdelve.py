@@ -151,13 +151,41 @@ class ProjectDelveConnector:
         encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"))
         return "projectdelve:" + hashlib.sha256(encoded.encode()).hexdigest()
 
+    @staticmethod
+    def reflection_wake_id(status):
+        identity = {field: status[field] for field in ("sessionId", "bindingId", "sideId")}
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        return "projectdelve:reflection:" + hashlib.sha256(encoded.encode()).hexdigest()
+
     def validate_status(self, status):
         if (not isinstance(status, dict) or type(status.get("schemaVersion")) is not int
                 or status["schemaVersion"] != 1 or "completion" not in status or "request" not in status
-                or not isinstance(status.get("status"), str)):
+                or not isinstance(status.get("status"), str)
+                or not isinstance(status.get("sessionId"), str) or not status["sessionId"]
+                or status.get("bindingId") != self.binding_id
+                or (status.get("sideId") is not None
+                    and (not isinstance(status["sideId"], str) or not status["sideId"]))):
             raise ValueError("Malformed ProjectDelve status")
         if status["request"] is not None:
             self.validate_binding(status["request"])
+        completion = status["completion"]
+        if completion is not None:
+            objective = status.get("objective")
+            achieved = completion.get("achievedSideIds") if isinstance(completion, dict) else None
+            if (status["status"] != "completed" or status["request"] is not None
+                    or not isinstance(achieved, list)
+                    or not achieved
+                    or not all(isinstance(side_id, str) and side_id for side_id in achieved)
+                    or len(achieved) != len(set(achieved))):
+                raise ValueError("Malformed ProjectDelve completion")
+            if status.get("sideId") is None:
+                if objective is not None:
+                    raise ValueError("Malformed ProjectDelve completion")
+            elif (not isinstance(objective, dict)
+                    or objective.get("sideId") != status["sideId"]
+                    or not isinstance(objective.get("objective"), str)
+                    or not objective["objective"]):
+                raise ValueError("Malformed ProjectDelve completion")
 
     def release_queued(self, event):
         self._queued.discard(event.id)
@@ -166,7 +194,24 @@ class ProjectDelveConnector:
         status = await self._http("/status")
         self.store.save_observed_snapshot("projectdelve.status", status)
         self.validate_status(status)
-        if status.get("completion") is not None or status.get("request") is None:
+        if status["completion"] is not None:
+            if status["sideId"] is None:
+                return
+            event_id = self.reflection_wake_id(status)
+            if event_id in self._queued or self.store.completed_event_run(event_id):
+                return
+            event = WakeEvent(event_id, "projectdelve", "reflection", utc_now(), {
+                "schemaVersion": 1,
+                "sessionId": status["sessionId"],
+                "sideId": status["sideId"],
+                "objective": {"sideId": status["objective"]["sideId"],
+                              "objective": status["objective"]["objective"]},
+                "result": {"achievedSideIds": list(status["completion"]["achievedSideIds"])},
+            })
+            self._queued.add(event_id)
+            await queue.put(event)
+            return
+        if status.get("request") is None:
             return
         observation = await self._http("/request")
         if observation is None:

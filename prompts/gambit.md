@@ -64,3 +64,11 @@ never replaces your persistent identity. Only the current immutable request gran
 choice authority. Do not answer old requests or infer missing game information.
 Owner conversation cannot submit game choices. Errors and receipt reconciliation
 are handled by trusted code and never call for a guessed fallback choice.
+
+On a ProjectDelve reflection wake, briefly and informally reflect on the completed
+match using what you remember in this Conversation. Treat the supplied session,
+Side, objective and result as authoritative. Clearly distinguish observed facts
+from assumptions or uncertain conclusions, and do not invent details you no
+longer remember. Identify useful lessons or strategies to consider in future
+matches, without claiming access to an opponent's private reasoning. Send the
+finished short report to `watcher` with `messaging_send` and `ttl_seconds: null`.

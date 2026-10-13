@@ -524,14 +524,16 @@ class ResidentRuntime:
             if latest['status'] != 'returned' or not turn or turn['tool_calls']:
                 raise RuntimeError('Unfinished inference/tool loop; inspect or reset this disposable instance database')
             wake = WakeEvent(**json.loads(latest['wake_json']))
-            if wake.source == "projectdelve" and self.projectdelve_client is not None:
+            if (wake.source == "projectdelve" and wake.reason == "decision"
+                    and self.projectdelve_client is not None):
                 self.projectdelve_client.record_seen_session(wake)
             schema = json.loads(latest['schema_json'])
             try:
                 self._persist_disposition(turn['message'], latest['conversation_id'], turn['response_id'],
                                           run_id=run_id, wake=wake, schema=schema)
             except InvalidDecision:
-                if wake.source == "projectdelve" and self.projectdelve_client is not None:
+                if (wake.source == "projectdelve" and wake.reason == "decision"
+                        and self.projectdelve_client is not None):
                     await self.projectdelve_client.report_error(wake, "invalid-decision")
                 raise
             self.store.finish_run(run_id, 'completed', 0, len(run_steps),
@@ -561,7 +563,9 @@ class ResidentRuntime:
         if completed:
             return completed
         game_wake = event.source == "projectdelve" and event.reason == "decision"
-        if event.source == "projectdelve" and (not game_wake or self.projectdelve_client is None):
+        reflection_wake = event.source == "projectdelve" and event.reason == "reflection"
+        if (event.source == "projectdelve"
+                and (not (game_wake or reflection_wake) or self.projectdelve_client is None)):
             return ""
         # Dedicated game player's scheduler carries no match admission. Tactical
         # context cannot wake inference outside a live, bound decision.
@@ -721,7 +725,7 @@ class ResidentRuntime:
             self._emit('wake.failed', {'error_type': type(exc).__name__, 'error': str(exc)})
             raise
         finally:
-            if game_wake:
+            if game_wake or reflection_wake:
                 self.projectdelve_client.release_queued(event)
             duration = time.monotonic() - started
             self._emit("wake.finished", {

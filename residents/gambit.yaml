@@ -16,6 +16,6 @@ projectdelve:
   binding_id: gambit
   poll_seconds: 1
   request_timeout_seconds: 10
-capabilities: []
+capabilities: [messaging]
 outputs: [projectdelve_decision]
 subscriptions: []

@@ -4,8 +4,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from resident.capabilities import Capability
 from resident.config import Config
 from resident.domain import ModelTurn, ToolCall, WakeEvent
 from resident.instances import load_resident_definition, load_resident_catalog
@@ -43,8 +44,13 @@ class FakeConnector(ProjectDelveConnector):
         if not self.available:
             raise OSError("unavailable")
         if route == "/status":
-            return {"schemaVersion": 1, "status": "waiting-external", "completion": self.observation["completion"],
-                    "request": self.observation["binding"] if self.observation["completion"] is None else None}
+            completed = self.observation["completion"] is not None
+            return {"schemaVersion": 1, "sessionId": self.observation["binding"]["sessionId"],
+                    "bindingId": "gambit", "sideId": self.observation["binding"]["sideId"],
+                    "status": "completed" if completed else "waiting-external",
+                    "completion": self.observation["completion"],
+                    "request": None if completed else self.observation["binding"],
+                    "objective": self.observation["objective"]}
         if route == "/request":
             return copy.deepcopy(self.observation)
         if route == "/admit":
@@ -123,6 +129,78 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(self.provider.requests))
         queue = asyncio.Queue()
         await self.connector.poll_once(queue)
+        reflection = queue.get_nowait()
+        self.assertEqual("reflection", reflection.reason)
+
+    async def test_completion_queues_one_stable_reflection_with_authoritative_result(self):
+        self.connector.observation["completion"] = {"achievedSideIds": ["blue"]}
+        queue = asyncio.Queue()
+
+        await self.connector.poll_once(queue)
+        event = queue.get_nowait()
+
+        self.assertEqual("projectdelve", event.source)
+        self.assertEqual("reflection", event.reason)
+        self.assertTrue(event.id.startswith("projectdelve:reflection:"))
+        self.assertEqual({
+            "schemaVersion": 1,
+            "sessionId": "session",
+            "sideId": "blue",
+            "objective": {"sideId": "blue", "objective": "EliminateEnemies"},
+            "result": {"achievedSideIds": ["blue"]},
+        }, event.payload)
+        await self.connector.poll_once(queue)
+        self.assertTrue(queue.empty())
+
+    async def test_human_only_completion_without_gambit_side_is_ignored(self):
+        status = {"schemaVersion": 1, "sessionId": "human-session", "bindingId": "gambit",
+                  "sideId": None, "status": "completed", "completion": {"achievedSideIds": ["blue"]},
+                  "request": None, "objective": None}
+        self.connector._http = AsyncMock(return_value=status)
+        queue = asyncio.Queue()
+
+        await self.connector.poll_once(queue)
+
+        self.assertTrue(queue.empty())
+        self.connector._http.assert_awaited_once_with("/status")
+
+    async def test_reflection_is_ordinary_tool_enabled_wake_and_deduplicates_after_restart(self):
+        sent = []
+
+        async def messaging_send(arguments):
+            sent.append(arguments)
+            return {"message_id": "report", "status": "pending", "expires_at": None}
+
+        messaging = Capability(
+            "messaging", "mailbox", "messaging_send", "send", {
+                "type": "object", "properties": {
+                    "recipient": {"type": "string", "enum": ["watcher"]},
+                    "content": {"type": "string"},
+                    "ttl_seconds": {"type": ["integer", "null"]},
+                }, "required": ["recipient", "content"], "additionalProperties": False,
+            }, messaging_send)
+        self.runtime.replace_capabilities([messaging])
+        self.connector.observation["completion"] = {"achievedSideIds": ["red"]}
+        self.provider.messages = [
+            ModelTurn("reflection-tool", tool_calls=(ToolCall("send-report", "messaging_send", {
+                "recipient": "watcher", "content": "I lost; my lesson is uncertain.",
+                "ttl_seconds": None,
+            }),)),
+            '{"outputs":[]}',
+        ]
+        event = await self.event()
+
+        await self.runtime.process(event)
+
+        self.assertTrue(all("messaging_send" in tools for tools in self.provider.tool_sets))
+        self.assertEqual([{"recipient": "watcher", "content": "I lost; my lesson is uncertain.",
+                           "ttl_seconds": None}], sent)
+        self.assertEqual(0, self.provider.requests[0]["output_schema"]["properties"]["outputs"]["maxItems"])
+        replacement = FakeConnector()
+        replacement.observation["completion"] = {"achievedSideIds": ["red"]}
+        replacement.bind_store(self.runtime.store)
+        queue = asyncio.Queue()
+        await replacement.poll_once(queue)
         self.assertTrue(queue.empty())
 
     async def test_model_context_uses_compact_json_without_changing_observation(self):
@@ -474,6 +552,9 @@ class ProjectDelveDefinitionTests(unittest.TestCase):
         self.assertEqual(("gambit", "Gambit", True), (definition.id, definition.name, definition.enabled))
         self.assertEqual(("gpt-5.6-luna", "medium"), (definition.agent.model, definition.agent.reasoning_effort))
         self.assertEqual(80000, definition.agent.compact_threshold)
+        self.assertEqual(("messaging",), definition.capabilities)
+        self.assertIn("messaging_send", definition.personality)
+        self.assertIn("ttl_seconds: null", definition.personality)
         normal = load_resident_catalog(root / "residents", prompt_root=root / "prompts", default_id="watcher")
         self.assertEqual("watcher", normal.default_id)
         self.assertIn("gambit", [entry.id for entry in normal.residents])
@@ -522,8 +603,14 @@ class ProjectDelveHTTPTests(unittest.IsolatedAsyncioTestCase):
         if self.mode == "slow" and route == "/status":
             await asyncio.sleep(0.2)
         if route == "/status":
-            return self.web.json_response({"schemaVersion": 1, "status": "waiting-external", "completion": self.current["completion"],
-                "request": self.current["binding"] if self.current["completion"] is None else None})
+            completed = self.current["completion"] is not None
+            return self.web.json_response({"schemaVersion": 1,
+                "sessionId": self.current["binding"]["sessionId"], "bindingId": "gambit",
+                "sideId": self.current["binding"]["sideId"],
+                "status": "completed" if completed else "waiting-external",
+                "completion": self.current["completion"],
+                "request": None if completed else self.current["binding"],
+                "objective": self.current["objective"]})
         if route == "/request":
             return self.web.json_response(self.current)
         if route == "/admit":
@@ -547,7 +634,7 @@ class ProjectDelveHTTPTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.process(queue.get_nowait())
         await self.runtime.dispatch_outputs_once()
         await self.connector.poll_once(queue)
-        self.assertTrue(queue.empty())
+        self.assertEqual("reflection", queue.get_nowait().reason)
         self.assertEqual(1, len(self.provider.requests))
         self.assertNotIn("http-secret-marker", json.dumps(self.provider.contexts))
         self.assertTrue(all(header == "Bearer http-secret-marker" for _, header in self.hits))
