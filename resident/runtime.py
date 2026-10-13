@@ -16,7 +16,7 @@ from .projectdelve import ProjectDelveConnector
 from .config import Config
 from .context import ContextBuilder
 from .domain import ToolResult, WakeEvent
-from .provider import ModelProvider, ResponseInvalid, ResponseRejected
+from .provider import ModelProvider, ResponseInvalid, ResponseRejected, ResponseUnavailable
 from .observability import EventLoopLagProbe, ObservedQueue, emit_timeline, timeline_reporter
 from .outputs import (OutputCapability, capability_for_output, output_schema,
                       schema_fingerprint, validate_disposition)
@@ -32,6 +32,10 @@ class EventProducer(Protocol):
 
 class OwnerTransport(Protocol):
     async def send_text(self, content: str) -> None: ...
+
+
+class InvalidDecision(RuntimeError):
+    """A ProjectDelve model response cannot produce a valid legal decision."""
 
 
 class CallbackOwnerTransport:
@@ -386,7 +390,8 @@ class ResidentRuntime:
                         "target": request.get("target"),
                         "classification": request.get("failure_classification")})
         if validation_state != "valid":
-            raise RuntimeError(f"Response final disposition is {validation_state}")
+            error_type = InvalidDecision if game_wake else RuntimeError
+            raise error_type(f"Response final disposition is {validation_state}")
         return receipt
 
 
@@ -525,9 +530,9 @@ class ResidentRuntime:
             try:
                 self._persist_disposition(turn['message'], latest['conversation_id'], turn['response_id'],
                                           run_id=run_id, wake=wake, schema=schema)
-            except RuntimeError:
+            except InvalidDecision:
                 if wake.source == "projectdelve" and self.projectdelve_client is not None:
-                    await self.projectdelve_client.report_error(wake)
+                    await self.projectdelve_client.report_error(wake, "invalid-decision")
                 raise
             self.store.finish_run(run_id, 'completed', 0, len(run_steps),
                                   wake.payload.get('schedule_id') if wake.source == 'scheduler' else None,
@@ -667,7 +672,7 @@ class ResidentRuntime:
                 if game_wake and turn.tool_calls:
                     # Preserve the native interrupted-tool-loop checkpoint for
                     # operator recovery; never execute or continue a game tool call.
-                    raise RuntimeError("ProjectDelve decisions do not permit model tools")
+                    raise InvalidDecision("ProjectDelve decisions do not permit model tools")
                 if not turn.tool_calls:
                     self._persist_disposition(turn.message, self.conversation_id, turn.response_id,
                                               run_id=run_id, wake=event, schema=schema)
@@ -705,7 +710,14 @@ class ResidentRuntime:
             return run_id
         except (Exception, asyncio.CancelledError) as exc:
             if game_wake:
-                await self.projectdelve_client.report_error(event)
+                if isinstance(exc, (ResponseInvalid, InvalidDecision)):
+                    error = "invalid-decision"
+                elif (isinstance(exc, ResponseRejected) and exc.status_code == 429
+                      or isinstance(exc, ResponseUnavailable)):
+                    error = "model-unavailable"
+                else:
+                    error = "controller-failure"
+                await self.projectdelve_client.report_error(event, error)
             self._emit('wake.failed', {'error_type': type(exc).__name__, 'error': str(exc)})
             raise
         finally:

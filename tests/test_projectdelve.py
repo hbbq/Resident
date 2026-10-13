@@ -12,6 +12,7 @@ from resident.instances import load_resident_definition, load_resident_catalog
 from resident.outputs import validate_disposition
 from resident.projectdelve import ProjectDelveConnector
 from resident.runtime import ResidentRuntime
+from resident.provider import ResponseInvalid, ResponseRejected, ResponseUnavailable
 from resident.store import Store, utc_now
 from runtime_support import RecordingProvider
 
@@ -127,6 +128,8 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
     async def test_exactly_one_nullable_choice_and_commentary_are_validated(self):
         event = await self.event()
         schema = self.connector.decision_schema(event)
+        key_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
+        self.assertEqual(["move-a", "end-turn", None], key_schema["enum"])
         for invalid in ({"outputs": []}, {"outputs": [json.loads(choice())["outputs"][0]] * 2},
                         json.loads(choice(123)),
                         json.loads(choice("move-a", {})), json.loads(choice("move-a", "x" * 281))):
@@ -135,7 +138,11 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.connector.validate_choice(event, json.loads(choice("move-a"))))
         self.assertIsNone(validate_disposition(json.loads(choice(None)), schema))
         event.payload["observation"]["request"]["allowsNone"] = False
-        self.assertIsNotNone(validate_disposition(json.loads(choice(None)), self.connector.decision_schema(event)))
+        required_schema = self.connector.decision_schema(event)
+        required_key_schema = required_schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
+        self.assertEqual(["move-a", "end-turn"], required_key_schema["enum"])
+        self.assertIsNotNone(validate_disposition(json.loads(choice(None)), required_schema))
+        self.assertIsNone(validate_disposition(json.loads(choice("move-a", "optional note")), required_schema))
 
     async def test_conversation_and_strategic_identity_survive_new_session(self):
         await self.runtime.process(await self.event())
@@ -196,6 +203,14 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1500, len(observed))
         self.assertEqual("candidate-1499", json.loads(self.output()["payload_json"])["candidateKey"])
 
+    async def test_long_candidate_keys_use_narrow_schema_fallback(self):
+        self.connector.observation["request"]["candidates"] = [
+            {"key": str(index) + "-" + "x" * 100} for index in range(150)]
+        event = await self.event()
+        key_schema = self.connector.decision_schema(event)["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
+        self.assertNotIn("enum", key_schema)
+        self.assertIsNone(self.connector.validate_choice(event, json.loads(choice("149-" + "x" * 100))))
+
     async def test_commentary_matches_server_utf16_limit_before_finalization(self):
         event = await self.event()
         self.assertIsNone(self.connector.validate_choice(event, json.loads(choice(commentary="\U0001f600" * 140))))
@@ -213,7 +228,8 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "schema_invalid"):
             await self.runtime.process(event)
         self.assertIsNone(self.output())
-        self.assertTrue(any(route == "/error" for route, _ in self.connector.requests))
+        error = next(payload for route, payload in self.connector.requests if route == "/error")
+        self.assertEqual("invalid-decision", error["error"])
         await self.runtime.process(event)
         self.assertEqual(1, len(self.provider.requests))
         replacement = FakeConnector()
@@ -221,6 +237,41 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         queue = asyncio.Queue()
         await replacement.poll_once(queue)
         self.assertTrue(queue.empty())
+
+    async def test_game_failure_reports_stable_safe_error_classes(self):
+        cases = [
+            (ResponseRejected("rate limited", 429), "model-unavailable"),
+            (ResponseInvalid("private invalid detail", "response-bad"), "invalid-decision"),
+            (ResponseRejected("bad request", 400), "controller-failure"),
+            (ResponseUnavailable("private provider detail"), "model-unavailable"),
+        ]
+        for index, (failure, expected) in enumerate(cases):
+            with self.subTest(expected=expected, failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                connector = FakeConnector()
+                connector.observation["binding"].update(attemptId=f"attempt-{index}")
+                provider = RecordingProvider([failure])
+                runtime = ResidentRuntime(Config(Path(directory)), provider,
+                    projectdelve_client=connector, output_capabilities=connector.output_capabilities,
+                    owner_output_enabled=False, diagnostic_output=lambda _: None)
+                queue = asyncio.Queue()
+                await connector.poll_once(queue)
+                try:
+                    with self.assertRaises(type(failure)):
+                        await runtime.process(queue.get_nowait())
+                    payload = [payload for route, payload in connector.requests if route == "/error"][-1]
+                    self.assertEqual(expected, payload["error"])
+                    self.assertNotIn("private", json.dumps(payload))
+                finally:
+                    runtime.close()
+
+    async def test_controller_transport_failure_reports_controller_failure(self):
+        event = await self.event()
+        self.connector.available = False
+        with self.assertRaises(OSError):
+            await self.runtime.process(event)
+        self.connector.available = True
+        payload = [payload for route, payload in self.connector.requests if route == "/error"][-1]
+        self.assertEqual("controller-failure", payload["error"])
 
     async def test_live_reset_completion_unavailable_and_denied_admission_gate(self):
         event = await self.event()
@@ -326,7 +377,8 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.store.record_response(step, ModelTurn("invalid-recorded", choice("invalid")))
         with self.assertRaisesRegex(RuntimeError, "schema_invalid"):
             await self.runtime.recover_pending_responses()
-        self.assertTrue(any(route == "/error" for route, _ in self.connector.requests))
+        error = next(payload for route, payload in self.connector.requests if route == "/error")
+        self.assertEqual("invalid-decision", error["error"])
         self.assertIsNone(self.output())
         self.assertEqual([], self.provider.requests)
 
@@ -389,7 +441,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "Unfinished inference"):
             await self.runtime.recover_pending_responses()
         errors = [payload for route, payload in self.connector.requests if route == "/error"]
-        self.assertEqual("resident-decision-error", errors[0]["error"])
+        self.assertEqual("controller-failure", errors[0]["error"])
         self.assertIsNone(self.output())
 
     async def test_controller_configuration_change_rejects_persisted_output(self):
@@ -406,6 +458,7 @@ class ProjectDelveDefinitionTests(unittest.TestCase):
         definition = load_resident_definition(root / "residents/gambit.yaml", root / "prompts")
         self.assertEqual(("gambit", "Gambit", True), (definition.id, definition.name, definition.enabled))
         self.assertEqual(("gpt-5.6-luna", "medium"), (definition.agent.model, definition.agent.reasoning_effort))
+        self.assertEqual(80000, definition.agent.compact_threshold)
         normal = load_resident_catalog(root / "residents", prompt_root=root / "prompts", default_id="watcher")
         self.assertEqual("watcher", normal.default_id)
         self.assertIn("gambit", [entry.id for entry in normal.residents])

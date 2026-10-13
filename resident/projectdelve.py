@@ -16,6 +16,11 @@ from .store import utc_now
 BINDING_FIELDS = frozenset({"sessionId", "bindingId", "sideId", "decisionId", "revision",
                             "attemptId", "cursorStart", "cursorEnd"})
 MAX_OBSERVATION_BYTES = 8 * 1024 * 1024
+# OpenAI structured outputs cap enum values and impose aggregate string limits.
+# Keep exact legal choices in ordinary decisions while allowing exceptionally
+# large ProjectDelve candidate sets to use the existing local legality check.
+MAX_CANDIDATE_ENUM_VALUES = 250
+MAX_CANDIDATE_ENUM_UTF8_BYTES = 7_500
 
 
 class ProjectDelveConnector:
@@ -113,8 +118,12 @@ class ProjectDelveConnector:
             raise ValueError("ProjectDelve decision has no legal choice")
         schema = output_schema(self.output_capabilities)
         schema["properties"]["outputs"].update(minItems=1, maxItems=1)
-        if not request["allowsNone"]:
-            schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]["type"] = "string"
+        key_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
+        enum_bytes = sum(len(key.encode("utf-8")) for key in keys if key is not None)
+        if len(keys) <= MAX_CANDIDATE_ENUM_VALUES and enum_bytes <= MAX_CANDIDATE_ENUM_UTF8_BYTES:
+            key_schema["enum"] = keys
+        elif not request["allowsNone"]:
+            key_schema["type"] = "string"
         return schema
 
     def validate_choice(self, event, disposition):
@@ -210,11 +219,11 @@ class ProjectDelveConnector:
         self.store.save_observed_snapshot("projectdelve.session",
                                           event.payload["observation"]["binding"]["sessionId"])
 
-    async def report_error(self, event):
+    async def report_error(self, event, error: str = "controller-failure"):
         # Never forward model text, exception bodies or private reasoning to the game.
         try:
             await self._http("/error", {"binding": event.payload["observation"]["binding"],
-                                        "error": "resident-decision-error"})
+                                        "error": error})
         except Exception:
             pass
 

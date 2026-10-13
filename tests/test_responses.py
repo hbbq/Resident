@@ -4,7 +4,7 @@ import unittest
 import httpx
 
 from resident.domain import ImageAttachment, ToolResult, ToolSpec
-from resident.provider import OpenAIResponsesProvider, ResponseRejected
+from resident.provider import OpenAIResponsesProvider, ResponseRejected, ResponseUnavailable
 from resident.outputs import output_schema
 
 
@@ -83,10 +83,26 @@ class ResponsesTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(code)
             provider._client = httpx.Client(base_url='https://openai.test/', transport=httpx.MockTransport(handle))
             try:
-                error = ResponseRejected if code < 500 else httpx.HTTPStatusError
-                with self.assertRaises(error):
+                error = ResponseRejected if code < 500 else ResponseUnavailable
+                with self.assertRaises(error) as raised:
                     await provider.respond('wake', [], [], conversation_id='conv', instructions='i',
                                            output_schema=output_schema([]), request_id='request')
                 self.assertEqual(1, len(seen))
+                if code < 500:
+                    self.assertEqual(code, raised.exception.status_code)
             finally:
                 provider.close()
+
+    async def test_network_failure_is_provider_unavailable(self):
+        def handle(request):
+            raise httpx.ConnectError("offline", request=request)
+        provider = OpenAIResponsesProvider('test', 'model')
+        provider._client.close()
+        provider._client = httpx.Client(
+            base_url='https://openai.test/', transport=httpx.MockTransport(handle))
+        try:
+            with self.assertRaises(ResponseUnavailable):
+                await provider.respond('wake', [], [], conversation_id='conv', instructions='i',
+                                       output_schema=output_schema([]), request_id='request')
+        finally:
+            provider.close()

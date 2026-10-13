@@ -26,6 +26,10 @@ RESIDENT_INSTRUCTIONS = (
 class ResponseRejected(RuntimeError):
     """A request was definitively rejected before inference could run."""
 
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class ResponseInvalid(RuntimeError):
     """The API returned a Response that Resident cannot safely consume."""
@@ -33,6 +37,10 @@ class ResponseInvalid(RuntimeError):
     def __init__(self, message: str, response_id: str | None):
         super().__init__(message)
         self.response_id = response_id
+
+
+class ResponseUnavailable(RuntimeError):
+    """The model provider was unavailable before a usable Response returned."""
 
 
 class ModelProvider(Protocol):
@@ -140,8 +148,15 @@ class OpenAIResponsesProvider:
 
     def _request(self, method: str, path: str, body: dict) -> dict:
         # Never automatically retry an ambiguous inference POST.
-        response = self._client.request(method, path, json=body)
+        try:
+            response = self._client.request(method, path, json=body)
+        except httpx.RequestError as exc:
+            raise ResponseUnavailable(f'OpenAI request unavailable for {path}') from exc
         if response.status_code in {400, 401, 403, 404, 422, 429}:
-            raise ResponseRejected(f'OpenAI rejected {path}: HTTP {response.status_code}')
+            raise ResponseRejected(
+                f'OpenAI rejected {path}: HTTP {response.status_code}', response.status_code)
+        if response.status_code >= 500:
+            raise ResponseUnavailable(
+                f'OpenAI unavailable for {path}: HTTP {response.status_code}')
         response.raise_for_status()
         return response.json()
