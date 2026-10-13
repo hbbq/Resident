@@ -23,6 +23,7 @@ capabilities:
   - diagnostics
   - homeops
   - camera
+  - messaging
 
 outputs:
   - notify_owner

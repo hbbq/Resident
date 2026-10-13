@@ -553,6 +553,7 @@ class ProjectDelveDefinitionTests(unittest.TestCase):
         self.assertEqual(("gpt-5.6-luna", "medium"), (definition.agent.model, definition.agent.reasoning_effort))
         self.assertEqual(80000, definition.agent.compact_threshold)
         self.assertEqual(("messaging",), definition.capabilities)
+        self.assertEqual(("messaging",), definition.subscriptions)
         self.assertIn("messaging_send", definition.personality)
         self.assertIn("ttl_seconds: null", definition.personality)
         normal = load_resident_catalog(root / "residents", prompt_root=root / "prompts", default_id="watcher")
@@ -562,6 +563,22 @@ class ProjectDelveDefinitionTests(unittest.TestCase):
         standalone = load_resident_catalog(root / "examples/gambit", prompt_root=root / "prompts", default_id="gambit")
         self.assertEqual("gambit", standalone.default_id)
         self.assertEqual(["gambit"], [definition.id for definition in standalone.residents])
+
+    def test_gambit_rejects_non_messaging_subscriptions(self):
+        root = Path(__file__).resolve().parent.parent
+        source = (root / "residents/gambit.yaml").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            definition_path = Path(temporary) / "gambit.yaml"
+            for selector in ("*", "homeops", "messaging.message_received"):
+                with self.subTest(selector=selector):
+                    definition_path.write_text(
+                        source.replace("subscriptions: [messaging]",
+                                       f"subscriptions: ['{selector}']"),
+                        encoding="utf-8")
+                    with self.assertRaisesRegex(
+                            ValueError,
+                            "only the messaging subscription and no other connectors"):
+                        load_resident_definition(definition_path, root / "prompts")
 
 
 class ProjectDelveHTTPTests(unittest.IsolatedAsyncioTestCase):

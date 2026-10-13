@@ -448,6 +448,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
     body = data.get("body")
     if body is not None:
         body = _mapping(body, "body")
+    subscriptions = _subscriptions(data.get("subscriptions"), "subscriptions")
     realm = None
     if data.get("realm") is not None:
         item = _mapping(data["realm"], "realm")
@@ -469,8 +470,11 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
         binding_id = _string(item.get("binding_id", "gambit"), "projectdelve.binding_id")
         if binding_id != "gambit" or resident_id != "gambit":
             raise ValueError("ProjectDelve v1 requires the dedicated gambit instance/binding")
-        if realm is not None or data.get("external_applications") or data.get("subscriptions"):
-            raise ValueError("Gambit requires private ProjectDelve delivery without other subscriptions/connectors")
+        if (realm is not None or data.get("external_applications") or
+                any(selector != "messaging" for selector in subscriptions)):
+            raise ValueError(
+                "Gambit requires private ProjectDelve delivery with only the messaging "
+                "subscription and no other connectors")
         if "projectdelve_decision" not in _string_list(data.get("outputs"), "outputs"):
             raise ValueError("ProjectDelve requires the projectdelve_decision output grant")
         projectdelve = ProjectDelveDefinition(
@@ -493,7 +497,7 @@ def load_resident_definition(path: Path, prompt_root: Path) -> ResidentDefinitio
         agent=agent,
         capabilities=_string_list(data.get("capabilities"), "capabilities"),
         outputs=_string_list(data.get("outputs"), "outputs"),
-        subscriptions=_subscriptions(data.get("subscriptions"), "subscriptions"),
+        subscriptions=subscriptions,
         owner_transport=transport,
         external_applications=_external_applications(
             data.get("external_applications"), "external_applications"),
