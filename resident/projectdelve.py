@@ -31,7 +31,7 @@ class ProjectDelveConnector:
                 or url.password or url.query or url.fragment):
             raise ValueError("ProjectDelve requires an absolute HTTP(S) service URL")
         if binding_id != "gambit":
-            raise ValueError("ProjectDelve v1 supports only the gambit binding")
+            raise ValueError("ProjectDelve v2 supports only the gambit binding")
         if not bearer_token:
             raise ValueError("ProjectDelve controller token is required")
         self.base_url = base_url.rstrip("/")
@@ -96,7 +96,7 @@ class ProjectDelveConnector:
     def decision_schema(self, event):
         observation = event.payload["observation"]
         self.validate_binding(observation["binding"])
-        if (type(observation.get("schemaVersion")) is not int or observation["schemaVersion"] != 1
+        if (type(observation.get("schemaVersion")) is not int or observation["schemaVersion"] != 2
                 or observation.get("completion") is not None or observation.get("status") != "waiting-external"):
             raise ValueError("Unsupported or completed ProjectDelve decision")
         objective = observation.get("objective")
@@ -106,6 +106,7 @@ class ProjectDelveConnector:
                 or not isinstance(observation.get("observation"), dict)):
             raise ValueError("Malformed ProjectDelve player observation")
         request = observation["request"]
+        self._validate_unit_agency(observation["observation"], observation["binding"]["sideId"], request)
         candidates = request["candidates"]
         keys = [candidate["key"] for candidate in candidates]
         if not all(isinstance(key, str) and key for key in keys) or len(keys) != len(set(keys)):
@@ -125,6 +126,38 @@ class ProjectDelveConnector:
         elif not request["allowsNone"]:
             key_schema["type"] = "string"
         return schema
+
+    @staticmethod
+    def _validate_unit_agency(player_observation, bound_side_id, request):
+        units = player_observation.get("units")
+        request_type_id = request.get("typeId") if isinstance(request, dict) else None
+        request_unit_id = request.get("unitId") if isinstance(request, dict) else None
+        if (not isinstance(units, list) or not isinstance(request_type_id, str) or not request_type_id
+                or (request_unit_id is not None
+                    and (not isinstance(request_unit_id, str) or not request_unit_id))):
+            raise ValueError("Malformed ProjectDelve unit agency")
+        seen = set()
+        direct_request_units = []
+        for unit in units:
+            if not isinstance(unit, dict):
+                raise ValueError("Malformed ProjectDelve unit agency")
+            unit_id, type_id = unit.get("id"), unit.get("typeId")
+            side_id, agency = unit.get("sideId"), unit.get("agency")
+            if (not isinstance(unit_id, str) or not unit_id or unit_id in seen
+                    or not isinstance(type_id, str) or not type_id
+                    or not isinstance(side_id, str) or not side_id
+                    or agency not in {"Direct", "Allied", "Hostile"}):
+                raise ValueError("Malformed ProjectDelve unit agency")
+            seen.add(unit_id)
+            if ((side_id == bound_side_id) != (agency in {"Direct", "Allied"})
+                    or (side_id != bound_side_id) != (agency == "Hostile")):
+                raise ValueError("Inconsistent ProjectDelve unit agency")
+            if side_id == bound_side_id and type_id == request_type_id:
+                direct_request_units.append(unit)
+        if (not direct_request_units or any(unit["agency"] != "Direct" for unit in direct_request_units)
+                or (request_unit_id is not None
+                    and not any(unit["id"] == request_unit_id for unit in direct_request_units))):
+            raise ValueError("Inconsistent ProjectDelve request agency")
 
     def validate_choice(self, event, disposition):
         # Legality is checked against the immutable observation without enlarging
@@ -159,7 +192,7 @@ class ProjectDelveConnector:
 
     def validate_status(self, status):
         if (not isinstance(status, dict) or type(status.get("schemaVersion")) is not int
-                or status["schemaVersion"] != 1 or "completion" not in status or "request" not in status
+                or status["schemaVersion"] != 2 or "completion" not in status or "request" not in status
                 or not isinstance(status.get("status"), str)
                 or not isinstance(status.get("sessionId"), str) or not status["sessionId"]
                 or status.get("bindingId") != self.binding_id
@@ -201,7 +234,7 @@ class ProjectDelveConnector:
             if event_id in self._queued or self.store.completed_event_run(event_id):
                 return
             event = WakeEvent(event_id, "projectdelve", "reflection", utc_now(), {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "sessionId": status["sessionId"],
                 "sideId": status["sideId"],
                 "objective": {"sideId": status["objective"]["sideId"],

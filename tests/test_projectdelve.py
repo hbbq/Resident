@@ -19,12 +19,17 @@ from runtime_support import RecordingProvider
 
 
 def observation():
-    return {"schemaVersion": 1, "binding": {"sessionId": "session", "bindingId": "gambit",
+    return {"schemaVersion": 2, "binding": {"sessionId": "session", "bindingId": "gambit",
         "sideId": "blue", "decisionId": "decision", "revision": 7, "attemptId": "attempt",
         "cursorStart": 2, "cursorEnd": 8}, "objective": {"sideId": "blue", "objective": "EliminateEnemies"},
         "status": "waiting-external", "completion": None,
-        "request": {"candidates": [{"key": "move-a"}, {"key": "end-turn"}], "allowsNone": True},
-        "events": [{"type": "Moved"}], "observation": {"state": {"round": 1}}}
+        "request": {"typeId": "Shaman", "unitId": "shaman",
+                    "candidates": [{"key": "move-a"}, {"key": "end-turn"}], "allowsNone": True},
+        "events": [{"type": "Moved"}], "observation": {"state": {"round": 1}, "units": [
+            {"id": "shaman", "typeId": "Shaman", "sideId": "blue", "agency": "Direct"},
+            {"id": "goblin", "typeId": "Goblin", "sideId": "blue", "agency": "Allied"},
+            {"id": "grunt", "typeId": "Grunt", "sideId": "red", "agency": "Hostile"},
+        ]}}
 
 
 class FakeConnector(ProjectDelveConnector):
@@ -45,7 +50,7 @@ class FakeConnector(ProjectDelveConnector):
             raise OSError("unavailable")
         if route == "/status":
             completed = self.observation["completion"] is not None
-            return {"schemaVersion": 1, "sessionId": self.observation["binding"]["sessionId"],
+            return {"schemaVersion": 2, "sessionId": self.observation["binding"]["sessionId"],
                     "bindingId": "gambit", "sideId": self.observation["binding"]["sideId"],
                     "status": "completed" if completed else "waiting-external",
                     "completion": self.observation["completion"],
@@ -143,7 +148,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("reflection", event.reason)
         self.assertTrue(event.id.startswith("projectdelve:reflection:"))
         self.assertEqual({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "sessionId": "session",
             "sideId": "blue",
             "objective": {"sideId": "blue", "objective": "EliminateEnemies"},
@@ -153,7 +158,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(queue.empty())
 
     async def test_human_only_completion_without_gambit_side_is_ignored(self):
-        status = {"schemaVersion": 1, "sessionId": "human-session", "bindingId": "gambit",
+        status = {"schemaVersion": 2, "sessionId": "human-session", "bindingId": "gambit",
                   "sideId": None, "status": "completed", "completion": {"achievedSideIds": ["blue"]},
                   "request": None, "objective": None}
         self.connector._http = AsyncMock(return_value=status)
@@ -268,7 +273,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_status_fails_closed(self):
         for malformed in (None, {}, {"schemaVersion": True, "status": "waiting-external", "request": None, "completion": None},
-                          {"schemaVersion": 1, "status": "waiting-external", "request": None}):
+                          {"schemaVersion": 2, "status": "waiting-external", "request": None}):
             with self.assertRaisesRegex(ValueError, "Malformed ProjectDelve status"):
                 self.connector.validate_status(malformed)
         self.assertEqual([], self.provider.requests)
@@ -282,6 +287,31 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.connector.observation["request"]["allowsNone"] = "true"
         with self.assertRaisesRegex(ValueError, "decline permission"):
             await self.event()
+
+    async def test_v2_requires_complete_and_consistent_relative_unit_agency(self):
+        for mutate, message in (
+            (lambda units: units[0].pop("agency"), "unit agency"),
+            (lambda units: units[0].update(agency="Human"), "unit agency"),
+            (lambda units: units[1].update(sideId="red"), "Inconsistent"),
+            (lambda units: units[2].update(agency="Allied"), "Inconsistent"),
+            (lambda units: units[0].update(agency="Allied"), "request agency"),
+        ):
+            with self.subTest(message=message):
+                self.connector.observation = observation()
+                mutate(self.connector.observation["observation"]["units"])
+                with self.assertRaisesRegex(ValueError, message):
+                    await self.event()
+        self.assertEqual([], self.provider.requests)
+
+    async def test_v1_decisions_and_status_are_rejected(self):
+        self.connector.observation["schemaVersion"] = 1
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            await self.event()
+        status = {"schemaVersion": 1, "sessionId": "session", "bindingId": "gambit",
+                  "sideId": "blue", "status": "waiting-external", "completion": None,
+                  "request": self.connector.observation["binding"], "objective": self.connector.observation["objective"]}
+        with self.assertRaisesRegex(ValueError, "Malformed ProjectDelve status"):
+            self.connector.validate_status(status)
 
     async def test_large_legal_candidate_set_is_preserved_without_provider_enum_limits(self):
         self.connector.observation["request"]["candidates"] = [
@@ -501,6 +531,9 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.process(await self.event())
         self.connector.observation["binding"].update(sideId="red", attemptId="opponent")
         self.connector.observation["objective"]["sideId"] = "red"
+        self.connector.observation["request"].update(typeId="Grunt", unitId="grunt")
+        for unit in self.connector.observation["observation"]["units"]:
+            unit["agency"] = "Direct" if unit["sideId"] == "red" else "Hostile"
         event = await self.event()
         with self.assertRaises(PermissionError):
             await self.runtime.process(event)
@@ -556,6 +589,10 @@ class ProjectDelveDefinitionTests(unittest.TestCase):
         self.assertEqual(("messaging",), definition.subscriptions)
         self.assertIn("messaging_send", definition.personality)
         self.assertIn("ttl_seconds: null", definition.personality)
+        self.assertIn("Direct Units are allied Units you control", definition.personality)
+        self.assertIn("Allied Units share your Side but belong", definition.personality)
+        self.assertIn("cooperate with them tactically but never choose or command", definition.personality)
+        self.assertIn("summoner", definition.personality)
         normal = load_resident_catalog(root / "residents", prompt_root=root / "prompts", default_id="watcher")
         self.assertEqual("watcher", normal.default_id)
         self.assertIn("gambit", [entry.id for entry in normal.residents])
@@ -621,7 +658,7 @@ class ProjectDelveHTTPTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.2)
         if route == "/status":
             completed = self.current["completion"] is not None
-            return self.web.json_response({"schemaVersion": 1,
+            return self.web.json_response({"schemaVersion": 2,
                 "sessionId": self.current["binding"]["sessionId"], "bindingId": "gambit",
                 "sideId": self.current["binding"]["sideId"],
                 "status": "completed" if completed else "waiting-external",

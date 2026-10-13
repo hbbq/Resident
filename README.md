@@ -206,8 +206,8 @@ python -m unittest discover -s tests -v
 
 ## Gambit: ProjectDelve player
 
-Gambit is a persistent instance for one actual ProjectDelve Side against one
-human, hosted alongside the other configured Residents. The enabled
+Gambit is a persistent instance controlling selected Unit Type + Side groups on
+one actual ProjectDelve Side, hosted alongside the other configured Residents. The enabled
 `residents/gambit.yaml` uses `gpt-5.6-luna` with `medium` reasoning; these settings
 are independent of every other instance. From this repository, with
 `OPENAI_API_KEY` and `PROJECTDELVE_GAMBIT_TOKEN` set, run the normal catalog:
@@ -227,7 +227,10 @@ Definition changes apply at startup. `examples/gambit/` remains a standalone
 example for a separately configured environment; it must not run alongside this
 local Gambit instance.
 
-Select Gambit for either scenario Side in browser setup and Human for its opponent.
+Select Human, Default Behavior or Gambit independently for each authored Unit
+Type-and-Side group in browser setup. All groups assigned to this Gambit binding must be
+on one Side; other groups on that Side are tactical allies that Gambit can observe
+but cannot command. Simple all-Human and whole-Side Gambit setups remain available.
 ProjectDelve resolves Gambit's dice and genuinely forced choices, supplies every
 legal alternative and committed rules event, and keeps Start Next Round manual.
 The player receives a detached private observation and its own objective/status.
