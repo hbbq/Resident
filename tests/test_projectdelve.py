@@ -266,11 +266,16 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         self.connector.observation["defaultBehaviorPreviews"] = [preview, second_preview]
         event = await self.event()
         schema = self.connector.decision_schema(event)
-        control = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["activationControl"]
-        self.assertEqual(["Direct", "Delegate"], control["enum"])
+        branches = schema["properties"]["outputs"]["items"]["anyOf"]
+        self.assertEqual([["Direct"], ["Delegate"]], [
+            branch["properties"]["activationControl"]["enum"] for branch in branches])
+        self.assertEqual(["shaman", "shaman-two"],
+                         branches[1]["properties"]["candidateKey"]["enum"])
         delegated = json.loads(choice("shaman", "I trust its instincts here.", "Delegate"))
         self.assertIsNone(validate_disposition(delegated, schema))
         self.assertIsNone(self.connector.validate_choice(event, delegated))
+        self.assertIsNotNone(validate_disposition(
+            json.loads(choice(None, activation_control="Delegate")), schema))
         self.assertEqual("Delegation requires selecting a Unit", self.connector.validate_choice(
             event, json.loads(choice(None, activation_control="Delegate"))))
 
@@ -324,12 +329,19 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         }]
         event = await self.event()
         schema = self.connector.decision_schema(event)
-        properties = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]
-        self.assertEqual(["Direct", "Delegate"], properties["activationControl"]["enum"])
-        self.assertIn(None, properties["candidateKey"]["enum"])
+        branches = schema["properties"]["outputs"]["items"]["anyOf"]
+        self.assertEqual([["Direct"], ["Delegate"]], [
+            branch["properties"]["activationControl"]["enum"] for branch in branches])
+        self.assertEqual(["move-a", "end-turn"],
+                         branches[0]["properties"]["candidateKey"]["enum"])
+        self.assertEqual([None], branches[1]["properties"]["candidateKey"]["enum"])
         delegated = json.loads(choice(None, "I leave the rest to its instincts.", "Delegate"))
         self.assertIsNone(validate_disposition(delegated, schema))
         self.assertIsNone(self.connector.validate_choice(event, delegated))
+        self.assertIsNotNone(validate_disposition(
+            json.loads(choice("move-a", activation_control="Delegate")), schema))
+        self.assertIsNotNone(validate_disposition(
+            json.loads(choice(None, activation_control="Direct")), schema))
         self.assertEqual("Mid-activation delegation requires a null candidate key",
                          self.connector.validate_choice(
                              event, json.loads(choice("move-a", activation_control="Delegate"))))
@@ -346,7 +358,7 @@ class ProjectDelveTests(unittest.IsolatedAsyncioTestCase):
         large_schema = self.connector.decision_schema(event)
         large_key = large_schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
         self.assertNotIn("enum", large_key)
-        self.assertEqual(["string", "null"], large_key["type"])
+        self.assertEqual("string", large_key["type"])
 
     async def test_conversation_and_strategic_identity_survive_new_session(self):
         await self.runtime.process(await self.event())

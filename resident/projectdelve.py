@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 from typing import Any
@@ -116,27 +117,38 @@ class ProjectDelveConnector:
         eligible = self._delegation_eligible(observation["observation"], request)
         self._validate_previews(observation.get("defaultBehaviorPreviews"), request, eligible)
         candidates = request["candidates"]
-        keys = [candidate["key"] for candidate in candidates]
-        if not all(isinstance(key, str) and key for key in keys) or len(keys) != len(set(keys)):
+        candidate_keys = [candidate["key"] for candidate in candidates]
+        if (not all(isinstance(key, str) and key for key in candidate_keys)
+                or len(candidate_keys) != len(set(candidate_keys))):
             raise ValueError("Malformed ProjectDelve candidate keys")
         if not isinstance(request["allowsNone"], bool):
             raise ValueError("Malformed ProjectDelve decline permission")
-        if request["allowsNone"] or (eligible and request.get("kind") != "SelectUnit"):
-            keys.append(None)
-        if not keys:
+        direct_keys = candidate_keys + ([None] if request["allowsNone"] else [])
+        if not direct_keys and not eligible:
             raise ValueError("ProjectDelve decision has no legal choice")
         schema = output_schema(self.output_capabilities)
         schema["properties"]["outputs"].update(minItems=1, maxItems=1)
-        key_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["candidateKey"]
-        control_schema = schema["properties"]["outputs"]["items"]["anyOf"][0]["properties"]["activationControl"]
-        if not eligible:
-            control_schema["enum"] = ["Direct"]
-        enum_bytes = sum(len(key.encode("utf-8")) for key in keys if key is not None)
-        if len(keys) <= MAX_CANDIDATE_ENUM_VALUES and enum_bytes <= MAX_CANDIDATE_ENUM_UTF8_BYTES:
-            key_schema["enum"] = keys
-        elif (not request["allowsNone"]
-              and not (eligible and request.get("kind") != "SelectUnit")):
-            key_schema["type"] = "string"
+        branches = schema["properties"]["outputs"]["items"]["anyOf"]
+        base_branch = branches[0]
+
+        def decision_branch(control, keys):
+            branch = copy.deepcopy(base_branch)
+            properties = branch["properties"]
+            properties["activationControl"]["enum"] = [control]
+            key_schema = properties["candidateKey"]
+            enum_bytes = sum(len(key.encode("utf-8")) for key in keys if key is not None)
+            if (len(keys) <= MAX_CANDIDATE_ENUM_VALUES
+                    and enum_bytes <= MAX_CANDIDATE_ENUM_UTF8_BYTES):
+                key_schema["enum"] = keys
+            else:
+                key_schema["type"] = ["string", "null"] if None in keys else "string"
+            return branch
+
+        branches[:] = [decision_branch("Direct", direct_keys)] if direct_keys else []
+        if eligible:
+            delegate_keys = (candidate_keys if request.get("kind") == "SelectUnit"
+                             else [None])
+            branches.append(decision_branch("Delegate", delegate_keys))
         return schema
 
     @staticmethod
