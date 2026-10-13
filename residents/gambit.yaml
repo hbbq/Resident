@@ -18,4 +18,5 @@ projectdelve:
   request_timeout_seconds: 10
 capabilities: [messaging]
 outputs: [projectdelve_decision]
-subscriptions: []
+subscriptions: 
+  - messaging
